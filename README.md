@@ -1,5 +1,12 @@
 # 匀码输入法（yuninput）
 
+[![License](https://img.shields.io/github/license/zgxdavid/yuninput1.0)](LICENSE)
+[![Last Commit](https://img.shields.io/github/last-commit/zgxdavid/yuninput1.0)](https://github.com/zgxdavid/yuninput1.0/commits/main)
+
+- GitHub 仓库：https://github.com/zgxdavid/yuninput1.0
+- 许可证：GPL-3.0（项目采用 GPL-3.0-or-later 分发策略，详见 `NOTICE.md`）
+- 发布页：https://github.com/zgxdavid/yuninput1.0/releases
+
 匀码输入法（yuninput）是一个面向 Windows 11 TSF（Text Services Framework）的中文输入法项目。
 
 当前仓库重点提供一套可构建、可安装、可扩展的 Windows 输入法骨架，包括输入引擎、候选窗、配置工具、安装脚本以及 EXE/MSI 打包链路，并逐步补齐类似郑码输入体验所需的词库导入、学习能力和词组规则支持。
