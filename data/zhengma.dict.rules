@@ -1,0 +1,4 @@
+# yuninput:construct_phrase=^
+# yuninput:rule:e2=p11+p12+p21+p22
+# yuninput:rule:e3=p11+p21+p23+p31
+# yuninput:rule:a4=p11+p21+p31+p41

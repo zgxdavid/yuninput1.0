@@ -1,0 +1,124 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui">
+  <Package
+    Name="Yuninput 1.0"
+    Manufacturer="Intel Corporation"
+    Version="$(var.ProductVersion)"
+    UpgradeCode="9e1b9cbe-51d3-4e27-a2a8-6a4f36f28ec0"
+    Language="2052"
+    Scope="perMachine">
+
+    <SummaryInformation Description="Yuninput 1.0 installer" Manufacturer="Intel Corporation" />
+    <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
+    <MajorUpgrade DowngradeErrorMessage="已安装更新版本的 Yuninput，无法安装较旧版本。" />
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLROOT" Name="Yuninput">
+        <Directory Id="INSTALLBIN" Name="bin" />
+        <Directory Id="INSTALLDATA" Name="data" />
+        <Directory Id="INSTALLSCRIPTS" Name="scripts" />
+        <Directory Id="INSTALLTOOLS" Name="tools" />
+      </Directory>
+    </StandardDirectory>
+
+    <ui:WixUI Id="WixUI_InstallDir" InstallDirectory="INSTALLROOT" />
+    <UIRef Id="WixUI_ErrorProgressText" />
+    <Property Id="WIXUI_EXITDIALOGOPTIONALTEXT" Value="安装完成后，可通过 Ctrl+F2 打开配置程序，也可在 Windows 语言设置中启用输入法。" />
+
+    <SetProperty
+      Id="RegisterIme"
+      Value='&quot;[System64Folder]WindowsPowerShell\v1.0\powershell.exe&quot; -NoProfile -ExecutionPolicy Bypass -File &quot;[INSTALLSCRIPTS]install_enable.ps1&quot; -InstallRoot &quot;[INSTALLROOT]&quot; -SkipElevation'
+      Before="RegisterIme"
+      Sequence="execute" />
+
+    <SetProperty
+      Id="UnregisterIme"
+      Value='&quot;[System64Folder]WindowsPowerShell\v1.0\powershell.exe&quot; -NoProfile -ExecutionPolicy Bypass -File &quot;[INSTALLSCRIPTS]unregister_ime.ps1&quot; -DllPath &quot;[INSTALLBIN]yuninput.dll&quot;'
+      Before="UnregisterIme"
+      Sequence="execute" />
+
+    <CustomAction
+      Id="RegisterIme"
+      BinaryRef="Wix4UtilCA_$(sys.BUILDARCHSHORT)"
+      DllEntry="WixQuietExec"
+      Execute="deferred"
+      Impersonate="no"
+      Return="check" />
+
+    <CustomAction
+      Id="UnregisterIme"
+      BinaryRef="Wix4UtilCA_$(sys.BUILDARCHSHORT)"
+      DllEntry="WixQuietExec"
+      Execute="deferred"
+      Impersonate="no"
+      Return="ignore" />
+
+    <InstallExecuteSequence>
+      <Custom Action="RegisterIme" After="InstallFiles" Condition="NOT REMOVE=&quot;ALL&quot;" />
+      <Custom Action="UnregisterIme" Before="RemoveFiles" Condition="REMOVE=&quot;ALL&quot;" />
+    </InstallExecuteSequence>
+
+    <Feature Id="MainFeature" Title="Yuninput 1.0" Level="1">
+      <ComponentGroupRef Id="CoreFiles" />
+    </Feature>
+
+    <ComponentGroup Id="CoreFiles">
+      <Component Id="cmpDll" Directory="INSTALLBIN" Guid="*">
+        <File Id="filDll" Source="$(var.ProductSourceDir)\build\Release\yuninput.dll" KeyPath="yes" />
+      </Component>
+
+      <Component Id="cmpConfigExe" Directory="INSTALLROOT" Guid="*">
+        <File Id="filConfigExe" Source="$(var.ProductSourceDir)\tools\yuninput_config.exe" KeyPath="yes" />
+      </Component>
+
+      <Component Id="cmpReadme" Directory="INSTALLROOT" Guid="*">
+        <File Id="filReadme" Source="$(var.ProductSourceDir)\README.md" KeyPath="yes" />
+      </Component>
+
+      <Component Id="cmpLicense" Directory="INSTALLROOT" Guid="*">
+        <File Id="filLicense" Source="$(var.ProductSourceDir)\LICENSE" KeyPath="yes" />
+      </Component>
+
+      <Component Id="cmpNotice" Directory="INSTALLROOT" Guid="*">
+        <File Id="filNotice" Source="$(var.ProductSourceDir)\NOTICE.md" KeyPath="yes" />
+      </Component>
+
+      <Component Id="cmpThirdParty" Directory="INSTALLROOT" Guid="*">
+        <File Id="filThirdParty" Source="$(var.ProductSourceDir)\THIRD_PARTY_NOTICES.md" KeyPath="yes" />
+      </Component>
+
+      <Component Id="cmpInstallScript" Directory="INSTALLSCRIPTS" Guid="*">
+        <File Id="filInstallScript" Source="$(var.ProductSourceDir)\scripts\install_enable.ps1" KeyPath="yes" />
+      </Component>
+
+      <Component Id="cmpRegisterScript" Directory="INSTALLSCRIPTS" Guid="*">
+        <File Id="filRegisterScript" Source="$(var.ProductSourceDir)\scripts\register_ime.ps1" KeyPath="yes" />
+      </Component>
+
+      <Component Id="cmpUnregisterScript" Directory="INSTALLSCRIPTS" Guid="*">
+        <File Id="filUnregisterScript" Source="$(var.ProductSourceDir)\scripts\unregister_ime.ps1" KeyPath="yes" />
+      </Component>
+
+      <Component Id="cmpUninstallCleanScript" Directory="INSTALLSCRIPTS" Guid="*">
+        <File Id="filUninstallCleanScript" Source="$(var.ProductSourceDir)\scripts\uninstall_clean.ps1" KeyPath="yes" />
+      </Component>
+
+      <Component Id="cmpBasicDict" Directory="INSTALLDATA" Guid="*">
+        <File Id="filBasicDict" Source="$(var.ProductSourceDir)\data\yuninput_basic.dict" KeyPath="yes" />
+      </Component>
+
+      <Component Id="cmpZhengmaDict" Directory="INSTALLDATA" Guid="*">
+        <File Id="filZhengmaDict" Source="$(var.ProductSourceDir)\data\zhengma.dict" KeyPath="yes" />
+      </Component>
+
+      <Component Id="cmpZhengmaLargeDict" Directory="INSTALLDATA" Guid="*">
+        <File Id="filZhengmaLargeDict" Source="$(var.ProductSourceDir)\data\zhengma-large.dict" KeyPath="yes" />
+      </Component>
+
+      <Component Id="cmpZhengmaPinyinDict" Directory="INSTALLDATA" Guid="*">
+        <File Id="filZhengmaPinyinDict" Source="$(var.ProductSourceDir)\data\zhengma-pinyin.dict" KeyPath="yes" />
+      </Component>
+    </ComponentGroup>
+  </Package>
+</Wix>
