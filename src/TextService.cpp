@@ -18,6 +18,16 @@ namespace {
 constexpr const wchar_t* kBuildMarker = L"cw-r3-20260327-keytrace-v1";
 constexpr ULONGLONG kAnchorReuseWindowMs = 2500ULL;
 
+bool ShouldLogPerfSample(ULONGLONG elapsedMs, ULONGLONG slowThresholdMs, unsigned samplePeriod) {
+    static unsigned sampleCounter = 0;
+    ++sampleCounter;
+    if (elapsedMs >= slowThresholdMs) {
+        return true;
+    }
+
+    return samplePeriod > 0 && (sampleCounter % samplePeriod) == 0;
+}
+
 std::string WideToUtf8ForLog(const std::wstring& input) {
     if (input.empty()) {
         return "";
@@ -1176,6 +1186,11 @@ TextService::TextService()
             leftShiftToggleDownTick_(0),
       pageSize_(kDefaultPageSize),
       toggleHotkey_(ToggleHotkey::F9),
+            pageCandidatesCachePageIndex_(0),
+            pageCandidatesCachePageSize_(0),
+            pageCandidatesCacheRevision_(0),
+            candidatesRevision_(1),
+            pageCandidatesCacheValid_(false),
       pageIndex_(0),
     selectedIndexInPage_(0),
         emptyCandidateAlerted_(false),
@@ -1405,12 +1420,19 @@ STDMETHODIMP TextService::Deactivate() {
 }
 
 void TextService::RefreshCandidates() {
+    const ULONGLONG perfStart = GetTickCount64();
+
+    InvalidatePageCandidatesCache();
     allCandidates_.clear();
     if (compositionCode_.empty()) {
         pageIndex_ = 0;
         selectedIndexInPage_ = 0;
         emptyCandidateAlerted_ = false;
         UpdateCandidateWindow();
+        const ULONGLONG elapsedMs = GetTickCount64() - perfStart;
+        if (ShouldLogPerfSample(elapsedMs, 4, 50)) {
+            Trace(L"perf RefreshCandidates ms=" + std::to_wstring(elapsedMs) + L" codeLen=0 candidates=0");
+        }
         return;
     }
 
@@ -1431,8 +1453,10 @@ void TextService::RefreshCandidates() {
 
     const std::vector<CompositionEngine::Entry> queried = engine_.QueryCandidateEntries(compositionCode_, 200);
     allCandidates_.reserve(queried.size() + 32);
+    std::unordered_map<std::wstring, size_t> candidateIndexByText;
+    candidateIndexByText.reserve(queried.size() + 64);
 
-    auto mergeCandidate = [this](
+    auto mergeCandidate = [this, &candidateIndexByText](
                               const std::wstring& text,
                               const std::wstring& displayCode,
                               const std::wstring& commitCode,
@@ -1448,10 +1472,9 @@ void TextService::RefreshCandidates() {
             return;
         }
 
-        for (CandidateItem& existing : allCandidates_) {
-            if (existing.text != text) {
-                continue;
-            }
+        const auto existingIt = candidateIndexByText.find(text);
+        if (existingIt != candidateIndexByText.end()) {
+            CandidateItem& existing = allCandidates_[existingIt->second];
 
             existing.boostedUser = existing.boostedUser || boostedUser;
             existing.boostedLearned = existing.boostedLearned || boostedLearned;
@@ -1493,6 +1516,7 @@ void TextService::RefreshCandidates() {
         candidate.fromSystemDict = fromSystemDict;
         candidate.consumedLength = consumedLength;
         allCandidates_.push_back(std::move(candidate));
+        candidateIndexByText.emplace(allCandidates_.back().text, allCandidates_.size() - 1);
     };
 
     bool hasExactCurrentCode = false;
@@ -1521,8 +1545,9 @@ void TextService::RefreshCandidates() {
     }
 
     if (pinyinFallbackMode && allCandidates_.empty() && compositionCode_.size() > 2) {
+        std::wstring prefixCode = compositionCode_;
         for (size_t prefixLength = compositionCode_.size() - 1; prefixLength >= 2; --prefixLength) {
-            const std::wstring prefixCode = compositionCode_.substr(0, prefixLength);
+            prefixCode.resize(prefixLength);
             const std::vector<CompositionEngine::Entry> prefixMatches = engine_.QueryCandidateEntries(prefixCode, 80);
             for (const auto& item : prefixMatches) {
                 if (item.text.size() != 1 || item.code != prefixCode) {
@@ -1555,8 +1580,9 @@ void TextService::RefreshCandidates() {
     }
 
     if (!hasExactCurrentCode && compositionCode_.size() > 1 && !pinyinFallbackMode) {
+        std::wstring prefixCode = compositionCode_;
         for (size_t prefixLength = compositionCode_.size() - 1; prefixLength >= 1; --prefixLength) {
-            const std::wstring prefixCode = compositionCode_.substr(0, prefixLength);
+            prefixCode.resize(prefixLength);
             const std::vector<CompositionEngine::Entry> prefixMatches = engine_.QueryCandidateEntries(prefixCode, 24);
             for (const auto& item : prefixMatches) {
                 if (item.code != prefixCode) {
@@ -1733,6 +1759,14 @@ void TextService::RefreshCandidates() {
     }
 
     UpdateCandidateWindow();
+
+    const ULONGLONG elapsedMs = GetTickCount64() - perfStart;
+    if (ShouldLogPerfSample(elapsedMs, 4, 40)) {
+        Trace(
+            L"perf RefreshCandidates ms=" + std::to_wstring(elapsedMs) +
+            L" codeLen=" + std::to_wstring(compositionCode_.size()) +
+            L" candidates=" + std::to_wstring(allCandidates_.size()));
+    }
 }
 
 const wchar_t* TextService::GetDictionaryProfileName(DictionaryProfile profile) {
@@ -1914,12 +1948,14 @@ std::wstring TextService::GetSingleCharZhengmaCodeHint(const std::wstring& text)
 }
 
 size_t TextService::FindPreferredSelectionIndexForPage(size_t pageIndex) const {
-    const std::vector<CandidateWindow::DisplayCandidate> pageCandidates = GetCurrentPageCandidates();
-    if (pageCandidates.empty()) {
+    const size_t start = pageIndex * pageSize_;
+    if (start >= allCandidates_.size()) {
         return 0;
     }
 
-    auto scoreCandidate = [this](const CandidateWindow::DisplayCandidate& candidate) {
+    const size_t end = std::min(start + pageSize_, allCandidates_.size());
+
+    auto scoreCandidate = [this](const CandidateItem& candidate) {
         int score = 0;
         const bool exactFull = !compositionCode_.empty() && candidate.consumedLength >= compositionCode_.size();
         if (exactFull) {
@@ -1938,18 +1974,17 @@ size_t TextService::FindPreferredSelectionIndexForPage(size_t pageIndex) const {
         return score;
     };
 
-    size_t bestIndex = 0;
-    int bestScore = scoreCandidate(pageCandidates[0]);
-    for (size_t i = 1; i < pageCandidates.size(); ++i) {
-        const int score = scoreCandidate(pageCandidates[i]);
+    size_t bestGlobalIndex = start;
+    int bestScore = scoreCandidate(allCandidates_[start]);
+    for (size_t i = start + 1; i < end; ++i) {
+        const int score = scoreCandidate(allCandidates_[i]);
         if (score > bestScore) {
             bestScore = score;
-            bestIndex = i;
+            bestGlobalIndex = i;
         }
     }
 
-    (void)pageIndex;
-    return bestIndex;
+    return bestGlobalIndex - start;
 }
 
 bool TextService::TryFindExactCommitCandidateIndex(size_t& outIndex) const {
@@ -2149,8 +2184,14 @@ std::uint64_t TextService::QueryContextAssociationScore(const std::wstring& prev
 }
 
 void TextService::UpdateCandidateWindow() {
+    const ULONGLONG perfStart = GetTickCount64();
+
     if (compositionCode_.empty()) {
         candidateWindow_.Hide();
+        const ULONGLONG elapsedMs = GetTickCount64() - perfStart;
+        if (ShouldLogPerfSample(elapsedMs, 4, 60)) {
+            Trace(L"perf UpdateCandidateWindow ms=" + std::to_wstring(elapsedMs) + L" hidden=1");
+        }
         return;
     }
 
@@ -2175,6 +2216,10 @@ void TextService::UpdateCandidateWindow() {
         ClearComposition();
         candidateWindow_.Hide();
         Trace(L"UpdateCandidateWindow: no focused context, hide candidate window");
+        const ULONGLONG elapsedMs = GetTickCount64() - perfStart;
+        if (ShouldLogPerfSample(elapsedMs, 4, 40)) {
+            Trace(L"perf UpdateCandidateWindow ms=" + std::to_wstring(elapsedMs) + L" hidden=1 noFocus=1");
+        }
         return;
     }
 
@@ -2208,31 +2253,64 @@ void TextService::UpdateCandidateWindow() {
         lastAnchorTick_ = GetTickCount64();
     }
 
+    const std::vector<CandidateWindow::DisplayCandidate>& pageCandidates = GetCurrentPageCandidates();
+    const size_t totalPages = GetTotalPages();
+
     candidateWindow_.Update(
         compositionCode_,
-        GetCurrentPageCandidates(),
+        pageCandidates,
         pageIndex_,
-        GetTotalPages(),
+        totalPages,
         allCandidates_.size(),
         selectedIndexInPage_,
         pageIndex_ * pageSize_ + selectedIndexInPage_,
         chineseMode_,
         fullShapeMode_,
         anchorPtr);
+
+    const ULONGLONG elapsedMs = GetTickCount64() - perfStart;
+    if (ShouldLogPerfSample(elapsedMs, 4, 30)) {
+        Trace(
+            L"perf UpdateCandidateWindow ms=" + std::to_wstring(elapsedMs) +
+            L" page=" + std::to_wstring(pageIndex_ + 1) + L"/" + std::to_wstring(totalPages) +
+            L" visible=" + std::to_wstring(pageCandidates.size()) +
+            L" total=" + std::to_wstring(allCandidates_.size()));
+    }
 }
 
-std::vector<CandidateWindow::DisplayCandidate> TextService::GetCurrentPageCandidates() const {
-    std::vector<CandidateWindow::DisplayCandidate> page;
+const std::vector<CandidateWindow::DisplayCandidate>& TextService::GetCurrentPageCandidates() const {
+    const bool cacheHit =
+        pageCandidatesCacheValid_ &&
+        pageCandidatesCacheRevision_ == candidatesRevision_ &&
+        pageCandidatesCachePageIndex_ == pageIndex_ &&
+        pageCandidatesCachePageSize_ == pageSize_ &&
+        pageCandidatesCacheCompositionCode_ == compositionCode_;
+    if (cacheHit) {
+        return pageCandidatesCache_;
+    }
+
+    pageCandidatesCache_.clear();
     if (allCandidates_.empty()) {
-        return page;
+        pageCandidatesCacheCompositionCode_ = compositionCode_;
+        pageCandidatesCachePageIndex_ = pageIndex_;
+        pageCandidatesCachePageSize_ = pageSize_;
+        pageCandidatesCacheRevision_ = candidatesRevision_;
+        pageCandidatesCacheValid_ = true;
+        return pageCandidatesCache_;
     }
 
     const size_t start = pageIndex_ * pageSize_;
     if (start >= allCandidates_.size()) {
-        return page;
+        pageCandidatesCacheCompositionCode_ = compositionCode_;
+        pageCandidatesCachePageIndex_ = pageIndex_;
+        pageCandidatesCachePageSize_ = pageSize_;
+        pageCandidatesCacheRevision_ = candidatesRevision_;
+        pageCandidatesCacheValid_ = true;
+        return pageCandidatesCache_;
     }
 
     const size_t end = std::min(start + pageSize_, allCandidates_.size());
+    pageCandidatesCache_.reserve(end - start);
     for (size_t i = start; i < end; ++i) {
         CandidateWindow::DisplayCandidate candidate;
         candidate.text = allCandidates_[i].text;
@@ -2246,21 +2324,33 @@ std::vector<CandidateWindow::DisplayCandidate> TextService::GetCurrentPageCandid
 
         const size_t consumedLength = std::min(allCandidates_[i].consumedLength, compositionCode_.size());
         if (consumedLength < compositionCode_.size()) {
-            const std::wstring remaining = compositionCode_.substr(consumedLength);
-            if (!remaining.empty()) {
-                if (!candidate.code.empty()) {
-                    candidate.code += L"  ";
-                }
-                candidate.code += L"未完:" + remaining;
+            if (!candidate.code.empty()) {
+                candidate.code += L"  ";
             }
+            candidate.code += L"未完:";
+            candidate.code.append(compositionCode_, consumedLength, std::wstring::npos);
         }
         candidate.boostedUser = allCandidates_[i].boostedUser;
         candidate.boostedLearned = allCandidates_[i].boostedLearned;
         candidate.boostedContext = allCandidates_[i].boostedContext;
         candidate.consumedLength = allCandidates_[i].consumedLength;
-        page.push_back(std::move(candidate));
+        pageCandidatesCache_.push_back(std::move(candidate));
     }
-    return page;
+
+    pageCandidatesCacheCompositionCode_ = compositionCode_;
+    pageCandidatesCachePageIndex_ = pageIndex_;
+    pageCandidatesCachePageSize_ = pageSize_;
+    pageCandidatesCacheRevision_ = candidatesRevision_;
+    pageCandidatesCacheValid_ = true;
+    return pageCandidatesCache_;
+}
+
+void TextService::InvalidatePageCandidatesCache() {
+    pageCandidatesCacheValid_ = false;
+    ++candidatesRevision_;
+    if (candidatesRevision_ == 0) {
+        candidatesRevision_ = 1;
+    }
 }
 
 size_t TextService::GetTotalPages() const {
@@ -2274,6 +2364,7 @@ size_t TextService::GetTotalPages() const {
 void TextService::ClearComposition() {
     compositionCode_.clear();
     allCandidates_.clear();
+    InvalidatePageCandidatesCache();
     pageIndex_ = 0;
     selectedIndexInPage_ = 0;
     emptyCandidateAlerted_ = false;
@@ -3336,7 +3427,7 @@ STDMETHODIMP TextService::OnKeyDown(ITfContext* context, WPARAM wParam, LPARAM l
     }
 
     if (ctrlPressed && key == VK_DELETE && !compositionCode_.empty()) {
-        const std::vector<CandidateWindow::DisplayCandidate> pageCandidates = GetCurrentPageCandidates();
+        const std::vector<CandidateWindow::DisplayCandidate>& pageCandidates = GetCurrentPageCandidates();
         if (!pageCandidates.empty()) {
             const size_t safeIndexInPage = std::min(selectedIndexInPage_, pageCandidates.size() - 1);
             BlockCandidateByGlobalIndex(pageIndex_ * pageSize_ + safeIndexInPage);
@@ -3466,13 +3557,13 @@ STDMETHODIMP TextService::OnKeyDown(ITfContext* context, WPARAM wParam, LPARAM l
     }
 
     if (tabNavigation_ && key == VK_TAB && !compositionCode_.empty()) {
-        const std::vector<CandidateWindow::DisplayCandidate> pageCandidates = GetCurrentPageCandidates();
+        const std::vector<CandidateWindow::DisplayCandidate>& pageCandidates = GetCurrentPageCandidates();
         if (!pageCandidates.empty()) {
             if (shiftPressed) {
                 if (selectedIndexInPage_ == 0) {
                     if (pageIndex_ > 0) {
                         pageIndex_ -= 1;
-                        const std::vector<CandidateWindow::DisplayCandidate> prevPageCandidates = GetCurrentPageCandidates();
+                        const std::vector<CandidateWindow::DisplayCandidate>& prevPageCandidates = GetCurrentPageCandidates();
                         selectedIndexInPage_ = prevPageCandidates.empty() ? 0 : (prevPageCandidates.size() - 1);
                     } else {
                         selectedIndexInPage_ = pageCandidates.size() - 1;
@@ -3521,7 +3612,7 @@ STDMETHODIMP TextService::OnKeyDown(ITfContext* context, WPARAM wParam, LPARAM l
     }
 
     if ((key == VK_UP || key == VK_DOWN) && !compositionCode_.empty()) {
-        const std::vector<CandidateWindow::DisplayCandidate> pageCandidates = GetCurrentPageCandidates();
+        const std::vector<CandidateWindow::DisplayCandidate>& pageCandidates = GetCurrentPageCandidates();
         if (!pageCandidates.empty()) {
             if (key == VK_UP) {
                 if (selectedIndexInPage_ == 0) {
@@ -3557,7 +3648,7 @@ STDMETHODIMP TextService::OnKeyDown(ITfContext* context, WPARAM wParam, LPARAM l
     selectionOffset = 0;
     if (TryMapSelectionInputToIndex(key, lParam, selectionOffset) && !compositionCode_.empty()) {
         Trace(L"select: begin");
-        const std::vector<CandidateWindow::DisplayCandidate> pageCandidates = GetCurrentPageCandidates();
+        const std::vector<CandidateWindow::DisplayCandidate>& pageCandidates = GetCurrentPageCandidates();
         if (selectionOffset < pageCandidates.size()) {
             const size_t pageStart = pageIndex_ * pageSize_;
             const size_t index = pageStart + selectionOffset;
@@ -3570,7 +3661,7 @@ STDMETHODIMP TextService::OnKeyDown(ITfContext* context, WPARAM wParam, LPARAM l
     }
 
     if ((key == VK_SPACE || key == VK_RETURN) && !compositionCode_.empty()) {
-        const std::vector<CandidateWindow::DisplayCandidate> pageCandidates = GetCurrentPageCandidates();
+        const std::vector<CandidateWindow::DisplayCandidate>& pageCandidates = GetCurrentPageCandidates();
         if (pageCandidates.empty()) {
             const std::wstring rawCode = compositionCode_;
             if (CommitText(context, rawCode)) {

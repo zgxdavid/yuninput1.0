@@ -1,5 +1,16 @@
 build/
 .vs/
+dist/
+diagnostics/
+log/
+_recover_zip/
+__pycache__/
+
+**/Debug/
+**/Release/
+**/RelWithDebInfo/
+**/MinSizeRel/
+
 *.user
 *.suo
 *.VC.db
@@ -12,3 +23,9 @@ build/
 *.dll
 *.exe
 *.log
+*.wixpdb
+*.wixobj
+
+# Keep only publishable MSI in repository root.
+**/*.msi
+!/*.msi

@@ -1053,19 +1053,21 @@ std::vector<CompositionEngine::Entry> CompositionEngine::QueryCandidateEntries(c
 
     for (auto it = begin; it != end; ++it) {
         const Entry& item = entries_[*it];
-        if (blockedEntries_.find(MakeFreqKey(item.code, item.text)) != blockedEntries_.end()) {
+        const std::wstring freqKey = MakeFreqKey(item.code, item.text);
+        if (blockedEntries_.find(freqKey) != blockedEntries_.end()) {
             continue;
         }
         if (IsLikelyBrokenCandidate(item.text)) {
             continue;
         }
-        const auto freqIt = frequency_.find(MakeFreqKey(item.code, item.text));
+        const auto freqIt = frequency_.find(freqKey);
         const std::uint64_t score = (freqIt == frequency_.end()) ? 0 : freqIt->second;
         const bool exactCode = item.code == normalizedCode;
         const size_t completionDelta = item.code.size() >= normalizedCode.size()
             ? (item.code.size() - normalizedCode.size())
             : 0;
         const int lengthPreferenceScore = GetLengthPreferenceScore(normalizedCode.size(), item.text.size());
+        const int commonCharRank = GetCommonCharRank(item.text);
 
         auto scoreIt = bestScoreByText.find(item.text);
         if (scoreIt == bestScoreByText.end()) {
@@ -1085,7 +1087,7 @@ std::vector<CompositionEngine::Entry> CompositionEngine::QueryCandidateEntries(c
             candidate.hasAutoPhrase = item.isAutoPhrase;
             candidate.hasSystemSource = !item.isUser;
             candidate.hasLearned = score > 0;
-            candidate.commonCharRank = GetCommonCharRank(item.text);
+            candidate.commonCharRank = commonCharRank;
             candidate.completionDelta = completionDelta;
             candidate.lengthPreferenceScore = lengthPreferenceScore;
             candidate.preferredTwoCharPhrase = IsPreferredTwoCharPhraseCandidate(candidate, normalizedCode.size());
@@ -1113,9 +1115,8 @@ std::vector<CompositionEngine::Entry> CompositionEngine::QueryCandidateEntries(c
         if (item.loadOrder < existing.earliestLoadOrder) {
             existing.earliestLoadOrder = item.loadOrder;
         }
-        const int rank = GetCommonCharRank(item.text);
-        if (rank < existing.commonCharRank) {
-            existing.commonCharRank = rank;
+        if (commonCharRank < existing.commonCharRank) {
+            existing.commonCharRank = commonCharRank;
         }
         if (completionDelta < existing.completionDelta) {
             existing.completionDelta = completionDelta;
@@ -1206,6 +1207,8 @@ std::vector<CompositionEngine::Entry> CompositionEngine::QueryCandidateEntries(c
             }
             return left.text < right.text;
         });
+
+    result.reserve(std::min(maxCandidates, ranked.size()));
 
     for (const auto& candidate : ranked) {
         Entry entry;

@@ -89,7 +89,8 @@ private:
     bool SwitchDictionaryProfile(DictionaryProfile profile);
     static const wchar_t* GetDictionaryProfileName(DictionaryProfile profile);
     void UpdateCandidateWindow();
-    std::vector<CandidateWindow::DisplayCandidate> GetCurrentPageCandidates() const;
+    const std::vector<CandidateWindow::DisplayCandidate>& GetCurrentPageCandidates() const;
+    void InvalidatePageCandidatesCache();
     size_t GetTotalPages() const;
     void ClearComposition();
     void LoadSettings();
@@ -164,6 +165,13 @@ private:
 
     std::wstring compositionCode_;
     std::vector<CandidateItem> allCandidates_;
+    mutable std::vector<CandidateWindow::DisplayCandidate> pageCandidatesCache_;
+    mutable std::wstring pageCandidatesCacheCompositionCode_;
+    mutable size_t pageCandidatesCachePageIndex_;
+    mutable size_t pageCandidatesCachePageSize_;
+    mutable std::uint64_t pageCandidatesCacheRevision_;
+    std::uint64_t candidatesRevision_;
+    mutable bool pageCandidatesCacheValid_;
     size_t pageIndex_;
     size_t selectedIndexInPage_;
     bool emptyCandidateAlerted_;

@@ -89,6 +89,33 @@ bool GetWorkAreaForPoint(const POINT& point, RECT& outWorkArea) {
     return SystemParametersInfoW(SPI_GETWORKAREA, 0, &outWorkArea, 0) == TRUE;
 }
 
+bool IsSameDisplayCandidate(
+    const CandidateWindow::DisplayCandidate& left,
+    const CandidateWindow::DisplayCandidate& right) {
+    return left.text == right.text &&
+        left.code == right.code &&
+        left.boostedUser == right.boostedUser &&
+        left.boostedLearned == right.boostedLearned &&
+        left.boostedContext == right.boostedContext &&
+        left.consumedLength == right.consumedLength;
+}
+
+bool AreDisplayCandidatesEqual(
+    const std::vector<CandidateWindow::DisplayCandidate>& left,
+    const std::vector<CandidateWindow::DisplayCandidate>& right) {
+    if (left.size() != right.size()) {
+        return false;
+    }
+
+    for (size_t i = 0; i < left.size(); ++i) {
+        if (!IsSameDisplayCandidate(left[i], right[i])) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
 void FillVerticalGradient(HDC hdc, const RECT& rc, COLORREF topColor, COLORREF bottomColor) {
     const int height = rc.bottom - rc.top;
     if (height <= 0) {
@@ -282,15 +309,37 @@ void CandidateWindow::Update(
         return;
     }
 
-    code_ = code;
-    candidates_ = candidates;
-    pageIndex_ = pageIndex;
-    totalPages_ = totalPages;
-    totalCandidateCount_ = totalCandidateCount;
-    selectedIndex_ = selectedIndex;
-    selectedAbsoluteIndex_ = selectedAbsoluteIndex;
-    chineseMode_ = chineseMode;
-    fullShapeMode_ = fullShapeMode;
+    const bool nonCandidateChanged =
+        code_ != code ||
+        pageIndex_ != pageIndex ||
+        totalPages_ != totalPages ||
+        totalCandidateCount_ != totalCandidateCount ||
+        selectedIndex_ != selectedIndex ||
+        selectedAbsoluteIndex_ != selectedAbsoluteIndex ||
+        chineseMode_ != chineseMode ||
+        fullShapeMode_ != fullShapeMode;
+
+    // Skip expensive per-candidate string comparisons when other visible state already changed.
+    const bool candidatesChanged = nonCandidateChanged || !AreDisplayCandidatesEqual(candidates_, candidates);
+    const bool contentChanged = nonCandidateChanged || candidatesChanged;
+
+    if (contentChanged) {
+        code_ = code;
+        if (candidatesChanged) {
+            candidates_ = candidates;
+        }
+        pageIndex_ = pageIndex;
+        totalPages_ = totalPages;
+        totalCandidateCount_ = totalCandidateCount;
+        selectedIndex_ = selectedIndex;
+        selectedAbsoluteIndex_ = selectedAbsoluteIndex;
+        chineseMode_ = chineseMode;
+        fullShapeMode_ = fullShapeMode;
+    }
+
+    const bool hadLastWindowRect = hasLastWindowRect_;
+    const int previousWidth = lastWidth_;
+    const int previousHeight = lastHeight_;
 
     int x = 0;
     int y = 0;
@@ -320,33 +369,37 @@ void CandidateWindow::Update(
         y = 120;
     }
 
-    EnsureFonts();
     int width = 300;
-    HDC measureDc = GetDC(hwnd_);
-    if (measureDc != nullptr) {
-        HFONT measureTextFont = textFont_ != nullptr ? textFont_ : static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
-        HFONT measureSmallFont = smallFont_ != nullptr ? smallFont_ : measureTextFont;
-        if (measureTextFont != nullptr && measureSmallFont != nullptr) {
-            HGDIOBJ oldFont = SelectObject(measureDc, measureTextFont);
-            SIZE textSize = {};
-            SIZE codeSize = {};
+    if (!contentChanged && hasLastWindowRect_ && lastWidth_ > 0) {
+        width = lastWidth_;
+    } else {
+        EnsureFonts();
+        HDC measureDc = GetDC(hwnd_);
+        if (measureDc != nullptr) {
+            HFONT measureTextFont = textFont_ != nullptr ? textFont_ : static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
+            HFONT measureSmallFont = smallFont_ != nullptr ? smallFont_ : measureTextFont;
+            if (measureTextFont != nullptr && measureSmallFont != nullptr) {
+                HGDIOBJ oldFont = SelectObject(measureDc, measureTextFont);
+                SIZE textSize = {};
+                SIZE codeSize = {};
 
-            const size_t measureRows = std::min(candidates_.size(), kMaxVisibleRows);
-            for (size_t i = 0; i < measureRows; ++i) {
-                const std::wstring codeText = candidates_[i].code.empty() ? L"-" : candidates_[i].code;
-                GetTextExtentPoint32W(measureDc, candidates_[i].text.c_str(), static_cast<int>(candidates_[i].text.size()), &textSize);
-                SelectObject(measureDc, measureSmallFont);
-                GetTextExtentPoint32W(measureDc, codeText.c_str(), static_cast<int>(codeText.size()), &codeSize);
-                SelectObject(measureDc, measureTextFont);
+                const size_t measureRows = std::min(candidates_.size(), kMaxVisibleRows);
+                for (size_t i = 0; i < measureRows; ++i) {
+                    const std::wstring codeText = candidates_[i].code.empty() ? L"-" : candidates_[i].code;
+                    GetTextExtentPoint32W(measureDc, candidates_[i].text.c_str(), static_cast<int>(candidates_[i].text.size()), &textSize);
+                    SelectObject(measureDc, measureSmallFont);
+                    GetTextExtentPoint32W(measureDc, codeText.c_str(), static_cast<int>(codeText.size()), &codeSize);
+                    SelectObject(measureDc, measureTextFont);
 
-                const int codeBlockWidth = std::max(96, std::min(static_cast<int>(codeSize.cx) + 22, 280));
-                const int neededWidth = 36 + static_cast<int>(textSize.cx) + 16 + codeBlockWidth + 22;
-                width = std::max(width, neededWidth);
+                    const int codeBlockWidth = std::max(96, std::min(static_cast<int>(codeSize.cx) + 22, 280));
+                    const int neededWidth = 36 + static_cast<int>(textSize.cx) + 16 + codeBlockWidth + 22;
+                    width = std::max(width, neededWidth);
+                }
+
+                SelectObject(measureDc, oldFont);
             }
-
-            SelectObject(measureDc, oldFont);
+            ReleaseDC(hwnd_, measureDc);
         }
-        ReleaseDC(hwnd_, measureDc);
     }
 
     width = std::max(300, std::min(width, 960));
@@ -354,9 +407,14 @@ void CandidateWindow::Update(
     const int codeHeight = 30;
     const int rowHeight = 32;
     const int footerHeight = 44;
-    const int rowCount = std::max(1, static_cast<int>(std::min(candidates_.size(), kMaxVisibleRows)));
-    const int cappedRows = std::max(1, rowCount);
-    const int height = headerHeight + codeHeight + footerHeight + rowHeight * cappedRows + 14;
+    int height = 0;
+    if (!contentChanged && hasLastWindowRect_ && lastHeight_ > 0) {
+        height = lastHeight_;
+    } else {
+        const int rowCount = std::max(1, static_cast<int>(std::min(candidates_.size(), kMaxVisibleRows)));
+        const int cappedRows = std::max(1, rowCount);
+        height = headerHeight + codeHeight + footerHeight + rowHeight * cappedRows + 14;
+    }
 
     RECT workArea = {};
     POINT workAreaPoint = usedValidAnchor ? anchorPoint : POINT{x, y};
@@ -489,7 +547,10 @@ void CandidateWindow::Update(
     }
 
     SetWindowPos(hwnd_, HWND_TOP, smoothedX, smoothedY, smoothedWidth, smoothedHeight, SWP_SHOWWINDOW | SWP_NOACTIVATE);
-    InvalidateRect(hwnd_, nullptr, TRUE);
+    const bool sizeChanged = !hadLastWindowRect || smoothedWidth != previousWidth || smoothedHeight != previousHeight;
+    if (contentChanged || sizeChanged) {
+        InvalidateRect(hwnd_, nullptr, TRUE);
+    }
 }
 
 void CandidateWindow::Hide() {
