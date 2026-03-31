@@ -2026,6 +2026,14 @@ void TextService::EnsureSingleCharZhengmaCodeHintsLoaded(const std::filesystem::
             [](wchar_t ch) {
                 return static_cast<wchar_t>(std::towlower(static_cast<wint_t>(ch)));
             });
+        code.erase(
+            std::remove_if(
+                code.begin(),
+                code.end(),
+                [](wchar_t ch) {
+                    return ch < L'a' || ch > L'z';
+                }),
+            code.end());
         const std::wstring text = Utf8ToWideText(textUtf8);
         if (text.size() != 1 || code.empty() || code.size() > 4) {
             continue;
@@ -2583,16 +2591,29 @@ void TextService::LearnPhraseFromRecentCommits(const std::wstring& committedCode
                     continue;
                 }
 
-                std::wstring phraseCode;
-                if (!engine_.TryBuildPhraseCode(phraseText, phraseCode)) {
-                    phraseCode = fallbackCode;
+                std::vector<std::wstring> phraseCodes;
+                if (!engine_.TryBuildPhraseCodes(phraseText, phraseCodes)) {
+                    phraseCodes.push_back(fallbackCode);
                 }
-                if (phraseCode.empty()) {
+                phraseCodes.erase(
+                    std::remove_if(
+                        phraseCodes.begin(),
+                        phraseCodes.end(),
+                        [](const std::wstring& code) {
+                            return code.empty();
+                        }),
+                    phraseCodes.end());
+                if (phraseCodes.empty()) {
                     continue;
                 }
-                if (phraseCode.size() > 20) {
-                    phraseCode.resize(20);
+
+                for (std::wstring& code : phraseCodes) {
+                    if (code.size() > 20) {
+                        code.resize(20);
+                    }
                 }
+
+                const std::wstring& phraseCode = phraseCodes.front();
 
                 const std::wstring phraseKey = phraseCode + L"\t" + phraseText;
                 PendingPhraseStat& stat = pendingPhraseStats_[phraseKey];
@@ -2602,14 +2623,19 @@ void TextService::LearnPhraseFromRecentCommits(const std::wstring& committedCode
                 const std::uint32_t requiredHits = phraseText.size() <= 4 ? 1U : 2U;
 
                 if (stat.hitCount >= requiredHits) {
-                    const bool added = engine_.AddAutoPhraseEntry(phraseCode, phraseText);
-                    if (added) {
+                    bool addedAny = false;
+                    for (const std::wstring& generatedCode : phraseCodes) {
+                        const bool added = engine_.AddAutoPhraseEntry(generatedCode, phraseText);
+                        addedAny = addedAny || added;
+                    }
+                    if (addedAny) {
                         engine_.RecordCommit(phraseCode, phraseText, 2);
                         AppendPhraseReviewEntry(phraseCode, phraseText, L"auto");
                         learnedAnyPhrase = true;
                         Trace(
                             L"learn phrase(auto table contiguous)=" + phraseText +
                             L" code=" + phraseCode +
+                            L" variants=" + std::to_wstring(phraseCodes.size()) +
                             L" hits=" + std::to_wstring(stat.hitCount) +
                             L" threshold=" + std::to_wstring(requiredHits));
                     }

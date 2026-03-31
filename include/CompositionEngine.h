@@ -46,6 +46,7 @@ public:
     bool PinEntry(const std::wstring& code, const std::wstring& text);
     bool BlockEntry(const std::wstring& code, const std::wstring& text);
     bool TryBuildPhraseCode(const std::wstring& text, std::wstring& outCode) const;
+    bool TryBuildPhraseCodes(const std::wstring& text, std::vector<std::wstring>& outCodes) const;
 
     std::vector<Entry> QueryCandidateEntries(const std::wstring& code, size_t maxCandidates) const;
     std::vector<std::wstring> QueryCandidates(const std::wstring& code, size_t maxCandidates) const;
@@ -62,6 +63,7 @@ private:
     void ProcessMetadataLine(const std::string& line);
     void LoadDictionaryMetadataFromFile(const std::wstring& filePath);
     bool TryGetBestSingleCharCode(wchar_t ch, size_t minLength, std::wstring& outCode) const;
+    bool TryGetSingleCharCodeVariants(wchar_t ch, std::vector<std::wstring>& outCodes) const;
     bool TryBuildPhraseCodeFromConfiguredRules(const std::vector<std::wstring>& charCodes, std::wstring& outCode) const;
 
     bool LoadDictionaryInternal(const std::wstring& filePath, bool clearExisting, bool isUserSource, bool isAutoPhraseSource);

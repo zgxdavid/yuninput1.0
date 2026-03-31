@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <sstream>
 #include <unordered_map>
 #include <utility>
@@ -293,6 +294,37 @@ bool BuildPhraseCodeFromPattern(
     }
 
     return !outCode.empty();
+}
+
+void PushUniqueCode(std::vector<std::wstring>& outCodes, const std::wstring& code) {
+    if (code.empty()) {
+        return;
+    }
+    if (std::find(outCodes.begin(), outCodes.end(), code) == outCodes.end()) {
+        outCodes.push_back(code);
+    }
+}
+
+void ExpandCodeToleranceVariants(const std::wstring& baseCode, std::vector<std::wstring>& outCodes) {
+    if (baseCode.empty()) {
+        return;
+    }
+
+    PushUniqueCode(outCodes, baseCode);
+    if (baseCode.size() >= 2) {
+        PushUniqueCode(outCodes, baseCode.substr(0, 2));
+    }
+    if (baseCode.size() >= 3) {
+        std::wstring firstThird;
+        firstThird.push_back(baseCode[0]);
+        firstThird.push_back(baseCode[2]);
+        PushUniqueCode(outCodes, firstThird);
+    }
+    if (baseCode.size() == 1) {
+        std::wstring padded = baseCode;
+        padded.push_back(L'v');
+        PushUniqueCode(outCodes, padded);
+    }
 }
 
 }  // namespace
@@ -636,6 +668,146 @@ bool CompositionEngine::TryBuildPhraseCode(const std::wstring& text, std::wstrin
     }
 
     return BuildPhraseCodeFromPattern(charCodes, kRule4Plus, outCode);
+}
+
+bool CompositionEngine::TryBuildPhraseCodes(const std::wstring& text, std::vector<std::wstring>& outCodes) const {
+    outCodes.clear();
+    if (text.size() < 2) {
+        return false;
+    }
+
+    std::wstring primaryCode;
+    if (TryBuildPhraseCode(text, primaryCode)) {
+        PushUniqueCode(outCodes, primaryCode);
+    }
+
+    std::vector<std::vector<std::wstring>> charCodeVariants;
+    charCodeVariants.reserve(text.size());
+    for (wchar_t ch : text) {
+        std::vector<std::wstring> variants;
+        if (!TryGetSingleCharCodeVariants(ch, variants) || variants.empty()) {
+            if (!outCodes.empty()) {
+                return true;
+            }
+            return false;
+        }
+        charCodeVariants.push_back(std::move(variants));
+    }
+
+    std::vector<PhraseCodePart> pattern;
+    if (text.size() == 2) {
+        pattern = {
+            {false, 0, 0, false},
+            {false, 0, 1, false},
+            {false, 1, 0, false},
+            {false, 1, 1, false},
+        };
+    }
+    else if (text.size() == 3) {
+        pattern = {
+            {false, 0, 0, false},
+            {false, 1, 0, false},
+            {false, 2, 0, false},
+            {false, 2, 1, false},
+        };
+    }
+    else {
+        pattern = {
+            {false, 0, 0, false},
+            {false, 1, 0, false},
+            {false, 2, 0, false},
+            {false, 3, 0, false},
+        };
+    }
+
+    std::wstring building;
+    building.reserve(pattern.size());
+    constexpr size_t kMaxGeneratedCodes = 24;
+    std::function<void(size_t)> dfs = [&](size_t partIndex) {
+        if (outCodes.size() >= kMaxGeneratedCodes) {
+            return;
+        }
+        if (partIndex >= pattern.size()) {
+            PushUniqueCode(outCodes, building);
+            return;
+        }
+
+        const PhraseCodePart& part = pattern[partIndex];
+        if (part.noOp) {
+            dfs(partIndex + 1);
+            return;
+        }
+
+        const size_t textIndex = part.fromEnd ? (charCodeVariants.size() - 1) : part.charIndex;
+        if (textIndex >= charCodeVariants.size()) {
+            return;
+        }
+
+        for (const std::wstring& codeVariant : charCodeVariants[textIndex]) {
+            if (part.codeIndex >= codeVariant.size()) {
+                continue;
+            }
+
+            building.push_back(codeVariant[part.codeIndex]);
+            dfs(partIndex + 1);
+            building.pop_back();
+            if (outCodes.size() >= kMaxGeneratedCodes) {
+                return;
+            }
+        }
+    };
+
+    dfs(0);
+    return !outCodes.empty();
+}
+
+bool CompositionEngine::TryGetSingleCharCodeVariants(wchar_t ch, std::vector<std::wstring>& outCodes) const {
+    outCodes.clear();
+
+    std::vector<Entry> matchingEntries;
+    matchingEntries.reserve(16);
+    for (const Entry& entry : entries_) {
+        if (entry.text.size() != 1 || entry.text[0] != ch) {
+            continue;
+        }
+        if (entry.code.empty()) {
+            continue;
+        }
+        if (blockedEntries_.find(MakeFreqKey(entry.code, entry.text)) != blockedEntries_.end()) {
+            continue;
+        }
+        matchingEntries.push_back(entry);
+    }
+
+    std::sort(
+        matchingEntries.begin(),
+        matchingEntries.end(),
+        [](const Entry& left, const Entry& right) {
+            if (left.code.size() != right.code.size()) {
+                return left.code.size() > right.code.size();
+            }
+            if (left.staticScore != right.staticScore) {
+                return left.staticScore > right.staticScore;
+            }
+            return left.loadOrder < right.loadOrder;
+        });
+
+    constexpr size_t kMaxBaseCodes = 6;
+    size_t baseCount = 0;
+    for (const Entry& entry : matchingEntries) {
+        std::wstring normalized = NormalizeCode(entry.code);
+        if (normalized.empty()) {
+            continue;
+        }
+
+        ExpandCodeToleranceVariants(normalized, outCodes);
+        ++baseCount;
+        if (baseCount >= kMaxBaseCodes) {
+            break;
+        }
+    }
+
+    return !outCodes.empty();
 }
 
 void CompositionEngine::RebuildIndex() {
