@@ -61,6 +61,7 @@ private:
         bool sortOneCodeSingle = false;
         bool sortOneCodeSingleUsed = false;
         bool sortTwoCodeSingleOrPhrase = false;
+        std::uint8_t sortPrimaryTier = 7;
         std::uint8_t sortShortCodeTier = 3;
         size_t consumedLength = 0;
     };

@@ -11,6 +11,8 @@
 
 namespace {
 
+constexpr std::uint64_t kFrequencyScoreMax = 255;
+
 struct CandidateScore {
     std::wstring text;
     std::wstring displayCode;
@@ -586,8 +588,8 @@ bool CompositionEngine::TryBuildPhraseCode(const std::wstring& text, std::wstrin
         requiredCodeLength = 2;
     }
     else if (text.size() == 3) {
-        // Zhengma 3-char phrase rule needs each source char to come from 3..4 full code.
-        requiredCodeLength = 3;
+        // 3-char auto phrase: require full-code single-char sources (4-code preferred).
+        requiredCodeLength = 4;
     }
 
     for (wchar_t ch : text) {
@@ -623,8 +625,8 @@ bool CompositionEngine::TryBuildPhraseCode(const std::wstring& text, std::wstrin
     static const std::vector<PhraseCodePart> kRule3 = {
         {false, 0, 0, false},
         {false, 1, 0, false},
-        {false, 1, 2, false},
         {false, 2, 0, false},
+        {false, 2, 1, false},
     };
     if (text.size() == 2) {
         return BuildPhraseCodeFromPattern(charCodes, kRule2, outCode);
@@ -1274,10 +1276,33 @@ void CompositionEngine::RecordCommit(const std::wstring& code, const std::wstrin
     }
 
     const std::wstring key = MakeFreqKey(NormalizeCode(code), text);
+    auto decayFrequency = [this]() {
+        for (auto it = frequency_.begin(); it != frequency_.end();) {
+            if (it->second <= 1) {
+                it = frequency_.erase(it);
+                continue;
+            }
+            it->second = std::max<std::uint64_t>(1, it->second / 2);
+            ++it;
+        }
+    };
+
+    std::uint64_t current = 0;
     const auto it = frequency_.find(key);
-    if (it == frequency_.end()) {
-        frequency_[key] = boost;
-    } else {
-        it->second += boost;
+    if (it != frequency_.end()) {
+        current = it->second;
     }
+
+    std::uint64_t next = current + boost;
+    if (next > kFrequencyScoreMax) {
+        decayFrequency();
+        const auto refreshed = frequency_.find(key);
+        current = refreshed == frequency_.end() ? 0 : refreshed->second;
+        next = current + boost;
+        if (next > kFrequencyScoreMax) {
+            next = kFrequencyScoreMax;
+        }
+    }
+
+    frequency_[key] = next;
 }

@@ -1520,10 +1520,19 @@ void TextService::RefreshCandidates() {
 
     const std::vector<CompositionEngine::Entry> queried = engine_.QueryCandidateEntries(compositionCode_, 200);
     allCandidates_.reserve(queried.size() + 32);
-    std::unordered_map<std::wstring, size_t> candidateIndexByText;
-    candidateIndexByText.reserve(queried.size() + 64);
+    std::unordered_map<std::wstring, size_t> candidateIndexByKey;
+    candidateIndexByKey.reserve(queried.size() + 64);
 
-    auto mergeCandidate = [this, &candidateIndexByText](
+    auto makeCandidateMergeKey = [](const std::wstring& text, const std::wstring& commitCode) {
+        std::wstring key;
+        key.reserve(text.size() + 1 + commitCode.size());
+        key.append(text);
+        key.push_back(L'\t');
+        key.append(commitCode);
+        return key;
+    };
+
+    auto mergeCandidate = [this, &candidateIndexByKey, &makeCandidateMergeKey](
                               const std::wstring& text,
                               const std::wstring& displayCode,
                               const std::wstring& commitCode,
@@ -1539,8 +1548,11 @@ void TextService::RefreshCandidates() {
             return;
         }
 
-        const auto existingIt = candidateIndexByText.find(text);
-        if (existingIt != candidateIndexByText.end()) {
+        const std::wstring stableCommitCode = commitCode.empty() ? displayCode : commitCode;
+        const std::wstring candidateKey = makeCandidateMergeKey(text, stableCommitCode);
+
+        const auto existingIt = candidateIndexByKey.find(candidateKey);
+        if (existingIt != candidateIndexByKey.end()) {
             CandidateItem& existing = allCandidates_[existingIt->second];
 
             existing.boostedUser = existing.boostedUser || boostedUser;
@@ -1561,10 +1573,10 @@ void TextService::RefreshCandidates() {
                 existing.code = displayCode;
             }
 
-            if ((boostedContext && !existing.boostedContext) ||
-                consumedLength > existing.consumedLength ||
-                existing.commitCode.empty()) {
-                existing.commitCode = commitCode;
+            if (existing.commitCode.empty()) {
+                existing.commitCode = stableCommitCode;
+            }
+            if (consumedLength > existing.consumedLength) {
                 existing.consumedLength = consumedLength;
             }
             return;
@@ -1573,7 +1585,7 @@ void TextService::RefreshCandidates() {
         CandidateItem candidate;
         candidate.text = text;
         candidate.code = displayCode;
-        candidate.commitCode = commitCode;
+        candidate.commitCode = stableCommitCode;
         candidate.contextScore = contextScore;
         candidate.exactMatch = exactMatch;
         candidate.boostedUser = boostedUser;
@@ -1583,7 +1595,7 @@ void TextService::RefreshCandidates() {
         candidate.fromSystemDict = fromSystemDict;
         candidate.consumedLength = consumedLength;
         allCandidates_.push_back(std::move(candidate));
-        candidateIndexByText.emplace(text, allCandidates_.size() - 1);
+        candidateIndexByKey.emplace(candidateKey, allCandidates_.size() - 1);
     };
 
     bool hasExactCurrentCode = false;
@@ -1752,6 +1764,11 @@ void TextService::RefreshCandidates() {
         candidate.sortGB2312Text = IsTextInGB2312Cached(candidate.text);
         candidate.sortNonGB2312Single = candidate.sortSingleChar && !candidate.sortGB2312Text;
 
+        size_t sortCodeLength = candidate.code.empty() ? candidate.commitCode.size() : candidate.code.size();
+        if (sortCodeLength == 0) {
+            sortCodeLength = compositionCode_.size();
+        }
+
         const bool oneCodeSingle =
             candidate.sortSingleChar && candidate.code.size() <= 1 && candidate.commitCode.size() <= 1;
         candidate.sortOneCodeSingle = oneCodeSingle;
@@ -1776,6 +1793,26 @@ void TextService::RefreshCandidates() {
         } else {
             candidate.sortShortCodeTier = 3;
         }
+
+        std::uint8_t tier = 7;
+        if (candidate.sortNonGB2312Single) {
+            tier = 250;
+        } else if (candidate.sortSingleChar && sortCodeLength <= 1) {
+            tier = 0;
+        } else if (candidate.text.size() == 2 && sortCodeLength == 2 && !candidate.fromAutoPhrase) {
+            tier = 1;
+        } else if (candidate.sortSingleChar && sortCodeLength == 2) {
+            tier = 2;
+        } else if (candidate.sortSingleChar && sortCodeLength == 3) {
+            tier = 3;
+        } else if (candidate.fromAutoPhrase && sortCodeLength == 4) {
+            tier = 4;
+        } else if (!candidate.fromAutoPhrase && candidate.text.size() >= 2 && sortCodeLength == 4) {
+            tier = 5;
+        } else if (candidate.sortSingleChar && sortCodeLength == 4) {
+            tier = 6;
+        }
+        candidate.sortPrimaryTier = tier;
     };
 
     for (CandidateItem& candidate : allCandidates_) {
@@ -1797,6 +1834,9 @@ void TextService::RefreshCandidates() {
                 if (left.sortSingleChar != right.sortSingleChar) {
                     return left.sortSingleChar > right.sortSingleChar;
                 }
+            }
+            if (left.sortPrimaryTier != right.sortPrimaryTier) {
+                return left.sortPrimaryTier < right.sortPrimaryTier;
             }
             if (queryCodeLength <= 2) {
                 if (left.sortShortCodeTier != right.sortShortCodeTier) {
