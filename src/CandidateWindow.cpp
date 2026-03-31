@@ -10,6 +10,7 @@ namespace {
 
 constexpr wchar_t kCandidateWindowClass[] = L"yuninput_candidate_window";
 constexpr size_t kMaxVisibleRows = 6;
+constexpr const wchar_t* kIndexLabels[] = {L"1", L"2", L"3", L"4", L"5", L"6", L"7", L"8", L"9"};
 
 bool AreDisplayCandidatesEqual(
     const std::vector<CandidateWindow::DisplayCandidate>& left,
@@ -401,10 +402,12 @@ void CandidateWindow::Update(
 
                 const size_t measureRows = std::min(candidates_.size(), kMaxVisibleRows);
                 for (size_t i = 0; i < measureRows; ++i) {
-                    const std::wstring codeText = candidates_[i].code.empty() ? L"-" : candidates_[i].code;
+                    const std::wstring& candidateCode = candidates_[i].code;
+                    const wchar_t* codeTextPtr = candidateCode.empty() ? L"-" : candidateCode.c_str();
+                    const int codeTextLen = candidateCode.empty() ? 1 : static_cast<int>(candidateCode.size());
                     GetTextExtentPoint32W(measureDc, candidates_[i].text.c_str(), static_cast<int>(candidates_[i].text.size()), &textSize);
                     SelectObject(measureDc, measureSmallFont);
-                    GetTextExtentPoint32W(measureDc, codeText.c_str(), static_cast<int>(codeText.size()), &codeSize);
+                    GetTextExtentPoint32W(measureDc, codeTextPtr, codeTextLen, &codeSize);
                     SelectObject(measureDc, measureTextFont);
 
                     const int codeBlockWidth = std::max(96, std::min(static_cast<int>(codeSize.cx) + 22, 280));
@@ -825,13 +828,13 @@ void CandidateWindow::OnPaint() {
     textRc.right -= 250;
     DrawTextW(hdc, title.c_str(), static_cast<int>(title.size()), &textRc, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
 
-    const std::wstring pageText =
-        L"Page " +
-        std::to_wstring(totalPages_ == 0 ? 0 : (pageIndex_ + 1)) +
-        L"/" +
-        std::to_wstring(totalPages_) +
-        L"  Total " +
-        std::to_wstring(totalCandidateCount_);
+    wchar_t pageTextBuffer[96] = {};
+    swprintf_s(
+        pageTextBuffer,
+        L"Page %zu/%zu  Total %zu",
+        totalPages_ == 0 ? static_cast<size_t>(0) : (pageIndex_ + 1),
+        totalPages_,
+        totalCandidateCount_);
     const bool canPrevPage = (pageIndex_ > 0);
     const bool canNextPage = (totalPages_ > 0 && pageIndex_ + 1 < totalPages_);
     RECT pageRc = titleRc;
@@ -841,7 +844,7 @@ void CandidateWindow::OnPaint() {
     pageRc.bottom -= 5;
     DrawRoundedRect(hdc, pageRc, 12, 12, RGB(255, 223, 179), border);
     SetTextColor(hdc, RGB(138, 78, 24));
-    DrawTextW(hdc, pageText.c_str(), static_cast<int>(pageText.size()), &pageRc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    DrawTextW(hdc, pageTextBuffer, -1, &pageRc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
 
     // Removed top-right quality dot and pulse indicator per UI request.
 
@@ -947,25 +950,22 @@ void CandidateWindow::OnPaint() {
                 FillSolidRect(hdc, shadowRc, RGB(246, 225, 199));
             }
 
-            const COLORREF borderTone =
-                rowSelected ? activeRowBorder : (selectionDistance <= 1 ? cardBorderNear : cardBorder);
-            DrawRoundedRect(hdc, cardRc, 8, 8, cardBg, borderTone);
             if (rowSelected) {
+                DrawRoundedRect(hdc, cardRc, 8, 8, activeRowBg, activeRowBorder);
                 FillVerticalGradient(hdc, cardRc, RGB(255, 242, 223), RGB(255, 229, 198));
             }
             else if (selectionDistance <= 1) {
+                const COLORREF borderTone = cardBorderNear;
+                DrawRoundedRect(hdc, cardRc, 8, 8, cardBg, borderTone);
                 FillVerticalGradient(hdc, cardRc, RGB(255, 254, 250), RGB(252, 245, 235));
             }
             else {
+                const COLORREF borderTone = cardBorder;
+                DrawRoundedRect(hdc, cardRc, 8, 8, cardBg, borderTone);
                 FillVerticalGradient(hdc, cardRc, RGB(255, 253, 249), RGB(251, 244, 235));
             }
 
             if (rowSelected) {
-                FillSolidRect(hdc, cardRc, activeRowBg);
-                FillVerticalGradient(hdc, cardRc, RGB(255, 242, 223), RGB(255, 229, 198));
-
-                DrawRoundedRect(hdc, cardRc, 8, 8, activeRowBg, activeRowBorder);
-
                 RECT activeBarRc = cardRc;
                 activeBarRc.left += 1;
                 activeBarRc.right = activeBarRc.left + 4;
@@ -974,7 +974,7 @@ void CandidateWindow::OnPaint() {
                 FillSolidRect(hdc, activeBarRc, activeBar);
             }
 
-            const std::wstring indexText = std::to_wstring(i + 1);
+            const wchar_t* indexText = i < (sizeof(kIndexLabels) / sizeof(kIndexLabels[0])) ? kIndexLabels[i] : L"?";
             RECT idxRc = cardRc;
             idxRc.right = idxRc.left + 26;
             idxRc.top += 3;
@@ -991,15 +991,17 @@ void CandidateWindow::OnPaint() {
 
             SetTextColor(hdc, indexFg);
             SelectObject(hdc, smallFont);
-            DrawTextW(hdc, indexText.c_str(), static_cast<int>(indexText.size()), &idxRc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            DrawTextW(hdc, indexText, -1, &idxRc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
 
             RECT textRc = cardRc;
             textRc.left += 38;
-            const std::wstring codeText = candidates_[i].code.empty() ? L"-" : candidates_[i].code;
+            const std::wstring& candidateCode = candidates_[i].code;
+            const wchar_t* codeTextPtr = candidateCode.empty() ? L"-" : candidateCode.c_str();
+            const int codeTextLen = candidateCode.empty() ? 1 : static_cast<int>(candidateCode.size());
 
             SelectObject(hdc, smallFont);
             SIZE codeSize = {};
-            GetTextExtentPoint32W(hdc, codeText.c_str(), static_cast<int>(codeText.size()), &codeSize);
+            GetTextExtentPoint32W(hdc, codeTextPtr, codeTextLen, &codeSize);
             int codeTagWidth = std::max(96, std::min(static_cast<int>(codeSize.cx) + 22, 220));
 
             textRc.right = cardRc.right - codeTagWidth - 16;
@@ -1041,7 +1043,7 @@ void CandidateWindow::OnPaint() {
             RECT codeTextRc = codeTagRc;
             codeTextRc.left += 10;
             codeTextRc.right -= 8;
-            DrawTextW(hdc, codeText.c_str(), static_cast<int>(codeText.size()), &codeTextRc, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+            DrawTextW(hdc, codeTextPtr, codeTextLen, &codeTextRc, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
 
             y += 32;
         }
