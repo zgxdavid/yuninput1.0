@@ -54,6 +54,14 @@ private:
         bool fromAutoPhrase = false;
         bool fromSystemDict = false;
         bool boostedAutoRepeat = false;
+        bool sortSingleChar = false;
+        bool sortAutoOnly = false;
+        bool sortGB2312Text = false;
+        bool sortNonGB2312Single = false;
+        bool sortOneCodeSingle = false;
+        bool sortOneCodeSingleUsed = false;
+        bool sortTwoCodeSingleOrPhrase = false;
+        std::uint8_t sortShortCodeTier = 3;
         size_t consumedLength = 0;
     };
 
@@ -101,6 +109,7 @@ private:
     void AppendPhraseReviewEntry(const std::wstring& code, const std::wstring& text, const wchar_t* sourceTag) const;
     void EnsureSingleCharZhengmaCodeHintsLoaded(const std::filesystem::path& dataDir);
     std::wstring GetSingleCharZhengmaCodeHint(const std::wstring& text) const;
+    bool IsTextInGB2312Cached(const std::wstring& text) const;
     bool CommitCandidateByGlobalIndex(ITfContext* context, size_t globalIndex, std::uint64_t freqBoost);
     bool PinCandidateByGlobalIndex(size_t globalIndex);
     bool BlockCandidateByGlobalIndex(size_t globalIndex);
@@ -151,6 +160,8 @@ private:
     bool nextDoubleQuoteOpen_;
     bool leftShiftTogglePending_;
     ULONGLONG leftShiftToggleDownTick_;
+    int pageBoundaryDirection_;
+    int pageBoundaryHitCount_;
     size_t pageSize_;
     ToggleHotkey toggleHotkey_;
 
@@ -165,13 +176,7 @@ private:
 
     std::wstring compositionCode_;
     std::vector<CandidateItem> allCandidates_;
-    mutable std::vector<CandidateWindow::DisplayCandidate> pageCandidatesCache_;
-    mutable std::wstring pageCandidatesCacheCompositionCode_;
-    mutable size_t pageCandidatesCachePageIndex_;
-    mutable size_t pageCandidatesCachePageSize_;
-    mutable std::uint64_t pageCandidatesCacheRevision_;
     std::uint64_t candidatesRevision_;
-    mutable bool pageCandidatesCacheValid_;
     size_t pageIndex_;
     size_t selectedIndexInPage_;
     bool emptyCandidateAlerted_;
@@ -186,6 +191,12 @@ private:
     std::unordered_map<std::wstring, std::uint64_t> contextAssociationScores_;
     std::unordered_set<std::wstring> contextAssociationBlacklist_;
     std::unordered_map<wchar_t, std::wstring> singleCharZhengmaCodeHints_;
+    mutable std::unordered_map<std::wstring, bool> gb2312TextCache_;
+    mutable std::uint64_t pageCandidatesCacheRevision_;
+    mutable size_t pageCandidatesCachePageIndex_;
+    mutable size_t pageCandidatesCachePageSize_;
+    mutable std::wstring pageCandidatesCacheCode_;
+    mutable std::vector<CandidateWindow::DisplayCandidate> pageCandidatesCache_;
 };
 
 HRESULT CreateTextServiceClassFactory(REFIID riid, void** ppv);

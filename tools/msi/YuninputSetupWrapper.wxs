@@ -28,8 +28,14 @@
 
     <SetProperty
       Id="RegisterIme"
-      Value='&quot;[System64Folder]WindowsPowerShell\v1.0\powershell.exe&quot; -NoProfile -ExecutionPolicy Bypass -File &quot;[INSTALLSCRIPTS]install_enable.ps1&quot; -InstallRoot &quot;[INSTALLROOT]&quot; -SkipElevation'
+      Value='&quot;[System64Folder]WindowsPowerShell\v1.0\powershell.exe&quot; -NoProfile -ExecutionPolicy Bypass -File &quot;[INSTALLSCRIPTS]install_enable.ps1&quot; -InstallRoot &quot;[INSTALLROOT].&quot; -LogPath &quot;[CommonAppDataFolder]Yuninput\install.log&quot; -SkipElevation -NonInteractive'
       Before="RegisterIme"
+      Sequence="execute" />
+
+    <SetProperty
+      Id="RegisterImeCurrentUser"
+      Value='&quot;[System64Folder]WindowsPowerShell\v1.0\powershell.exe&quot; -NoProfile -ExecutionPolicy Bypass -File &quot;[INSTALLSCRIPTS]register_ime.ps1&quot; -DllPath &quot;[INSTALLBIN]yuninput.dll&quot; -SkipComRegistration -CurrentUserOnly -LogPath &quot;[LocalAppDataFolder]Yuninput\register_current_user.log&quot; -SkipElevation'
+      Before="RegisterImeCurrentUser"
       Sequence="execute" />
 
     <SetProperty
@@ -47,6 +53,14 @@
       Return="check" />
 
     <CustomAction
+      Id="RegisterImeCurrentUser"
+      BinaryRef="Wix4UtilCA_$(sys.BUILDARCHSHORT)"
+      DllEntry="WixQuietExec"
+      Execute="deferred"
+      Impersonate="yes"
+      Return="ignore" />
+
+    <CustomAction
       Id="UnregisterIme"
       BinaryRef="Wix4UtilCA_$(sys.BUILDARCHSHORT)"
       DllEntry="WixQuietExec"
@@ -56,6 +70,7 @@
 
     <InstallExecuteSequence>
       <Custom Action="RegisterIme" After="InstallFiles" Condition="NOT REMOVE=&quot;ALL&quot;" />
+      <Custom Action="RegisterImeCurrentUser" After="RegisterIme" Condition="NOT REMOVE=&quot;ALL&quot;" />
       <Custom Action="UnregisterIme" Before="RemoveFiles" Condition="REMOVE=&quot;ALL&quot;" />
     </InstallExecuteSequence>
 
@@ -66,6 +81,10 @@
     <ComponentGroup Id="CoreFiles">
       <Component Id="cmpDll" Directory="INSTALLBIN" Guid="*">
         <File Id="filDll" Source="$(var.ProductSourceDir)\build\Release\yuninput.dll" KeyPath="yes" />
+      </Component>
+
+      <Component Id="cmpIconIco" Directory="INSTALLBIN" Guid="*">
+        <File Id="filIconIco" Source="$(var.ProductSourceDir)\assets\icon_yun.ico" KeyPath="yes" />
       </Component>
 
       <Component Id="cmpConfigExe" Directory="INSTALLROOT" Guid="*">

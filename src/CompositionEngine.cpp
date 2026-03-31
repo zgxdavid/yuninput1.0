@@ -300,14 +300,44 @@ std::wstring CompositionEngine::Utf8ToWide(const std::string& input) {
         return L"";
     }
 
-    const int required = MultiByteToWideChar(CP_UTF8, 0, input.c_str(), static_cast<int>(input.size()), nullptr, 0);
-    if (required <= 0) {
-        return L"";
+    const auto decode = [&input](UINT codePage, DWORD flags) {
+        const int required = MultiByteToWideChar(
+            codePage,
+            flags,
+            input.c_str(),
+            static_cast<int>(input.size()),
+            nullptr,
+            0);
+        if (required <= 0) {
+            return std::wstring();
+        }
+
+        std::wstring output(static_cast<size_t>(required), L'\0');
+        const int converted = MultiByteToWideChar(
+            codePage,
+            flags,
+            input.c_str(),
+            static_cast<int>(input.size()),
+            output.data(),
+            required);
+        if (converted <= 0) {
+            return std::wstring();
+        }
+
+        return output;
+    };
+
+    std::wstring decoded = decode(CP_UTF8, MB_ERR_INVALID_CHARS);
+    if (!decoded.empty()) {
+        return decoded;
     }
 
-    std::wstring output(static_cast<size_t>(required), L'\0');
-    MultiByteToWideChar(CP_UTF8, 0, input.c_str(), static_cast<int>(input.size()), output.data(), required);
-    return output;
+    decoded = decode(54936, 0);  // GB18030 fallback for legacy dictionary files.
+    if (!decoded.empty()) {
+        return decoded;
+    }
+
+    return decode(CP_ACP, 0);
 }
 
 std::string CompositionEngine::WideToUtf8(const std::wstring& input) {
@@ -1067,7 +1097,6 @@ std::vector<CompositionEngine::Entry> CompositionEngine::QueryCandidateEntries(c
             ? (item.code.size() - normalizedCode.size())
             : 0;
         const int lengthPreferenceScore = GetLengthPreferenceScore(normalizedCode.size(), item.text.size());
-        const int commonCharRank = GetCommonCharRank(item.text);
 
         auto scoreIt = bestScoreByText.find(item.text);
         if (scoreIt == bestScoreByText.end()) {
@@ -1087,7 +1116,7 @@ std::vector<CompositionEngine::Entry> CompositionEngine::QueryCandidateEntries(c
             candidate.hasAutoPhrase = item.isAutoPhrase;
             candidate.hasSystemSource = !item.isUser;
             candidate.hasLearned = score > 0;
-            candidate.commonCharRank = commonCharRank;
+            candidate.commonCharRank = GetCommonCharRank(item.text);
             candidate.completionDelta = completionDelta;
             candidate.lengthPreferenceScore = lengthPreferenceScore;
             candidate.preferredTwoCharPhrase = IsPreferredTwoCharPhraseCandidate(candidate, normalizedCode.size());
@@ -1115,8 +1144,9 @@ std::vector<CompositionEngine::Entry> CompositionEngine::QueryCandidateEntries(c
         if (item.loadOrder < existing.earliestLoadOrder) {
             existing.earliestLoadOrder = item.loadOrder;
         }
-        if (commonCharRank < existing.commonCharRank) {
-            existing.commonCharRank = commonCharRank;
+        const int rank = GetCommonCharRank(item.text);
+        if (rank < existing.commonCharRank) {
+            existing.commonCharRank = rank;
         }
         if (completionDelta < existing.completionDelta) {
             existing.completionDelta = completionDelta;

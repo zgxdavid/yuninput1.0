@@ -2,7 +2,8 @@ param(
     [switch]$Build,
     [string]$InstallRoot = "$env:LOCALAPPDATA\\yuninput",
     [string]$LogPath = "",
-    [switch]$SkipElevation
+    [switch]$SkipElevation,
+    [switch]$NonInteractive
 )
 
 $ErrorActionPreference = 'Stop'
@@ -54,13 +55,32 @@ if ($InstallRoot.StartsWith('-')) {
     throw "Invalid InstallRoot '$InstallRoot'. Did you mean to use '-Build' (without a space)?"
 }
 
+$InstallRoot = $InstallRoot.Trim()
+$InstallRoot = $InstallRoot.Trim('"')
+if ($InstallRoot.Length -gt 3) {
+    # MSI directory properties often end with a trailing slash; normalize to avoid quoting edge cases.
+    $InstallRoot = $InstallRoot.TrimEnd('\\')
+}
+
 $InstallRoot = [Environment]::ExpandEnvironmentVariables($InstallRoot)
+
+try {
+    $InstallRoot = [System.IO.Path]::GetFullPath($InstallRoot)
+}
+catch {
+    throw "Invalid InstallRoot '$InstallRoot': $($_.Exception.Message)"
+}
+
+if ($InstallRoot.Length -gt 3) {
+    $InstallRoot = $InstallRoot.TrimEnd('\\')
+}
 
 if (-not [System.IO.Path]::IsPathRooted($InstallRoot)) {
     throw "InstallRoot must be an absolute path. Current value: $InstallRoot"
 }
 
 Write-InstallLog "install_enable.ps1 start. Build=$Build InstallRoot=$InstallRoot"
+Write-InstallLog "install_enable.ps1 mode. SkipElevation=$SkipElevation NonInteractive=$NonInteractive"
 
 $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
 $principal = [Security.Principal.WindowsPrincipal]::new($identity)
@@ -333,35 +353,72 @@ try {
     }
 
     Write-InstallLog "Registering DLL: $registeredDllPath"
-    & $registerScript -DllPath $registeredDllPath
-
-    ${tipGuid} = '{6DE9AB40-3BA8-4B77-8D8F-233966E1C102}'
-    $inproc = & reg.exe query "HKLM\SOFTWARE\Classes\CLSID\$tipGuid\InprocServer32" /ve 2>$null
-    if ($LASTEXITCODE -eq 0 -and $null -ne $inproc) {
-        Write-InstallLog "HKLM InprocServer32: $($inproc -join ' ')"
+    try {
+        if ($NonInteractive) {
+            & $registerScript -DllPath $registeredDllPath -MachineOnly -LogPath (Join-Path $env:ProgramData 'Yuninput\register_machine.log')
+        }
+        else {
+            & $registerScript -DllPath $registeredDllPath
+        }
+    }
+    catch {
+        $registerMessage = $_.Exception.Message
+        if ($NonInteractive) {
+            Write-InstallLog "Warning: DLL registration failed in NonInteractive mode: $registerMessage"
+            Write-InstallLog 'Warning: continuing installation without registered IME. User may need manual register_ime.ps1.'
+        }
+        else {
+            throw
+        }
     }
 
-    if (Test-Path (Join-Path $InstallRoot 'yuninput_config.exe')) {
-        $shell = New-Object -ComObject WScript.Shell
-        $shortcutPath = Join-Path ([Environment]::GetFolderPath('Desktop')) 'Yuninput Config.lnk'
-        $shortcut = $shell.CreateShortcut($shortcutPath)
-        $shortcut.TargetPath = Join-Path $InstallRoot 'yuninput_config.exe'
-        $shortcut.WorkingDirectory = $InstallRoot
-        $shortcut.Save()
-        Start-Process (Join-Path $InstallRoot 'yuninput_config.exe')
+    ${tipGuid} = '{6DE9AB40-3BA8-4B77-8D8F-233966E1C102}'
+    try {
+        $inproc = & reg.exe query "HKLM\SOFTWARE\Classes\CLSID\$tipGuid\InprocServer32" /ve 2>$null
+        if ($LASTEXITCODE -eq 0 -and $null -ne $inproc) {
+            Write-InstallLog "HKLM InprocServer32: $($inproc -join ' ')"
+        }
+        else {
+            Write-InstallLog "Warning: HKLM InprocServer32 key missing after register (exit=$LASTEXITCODE)."
+        }
+    }
+    catch {
+        Write-InstallLog "Warning: HKLM InprocServer32 query failed: $($_.Exception.Message)"
+    }
+
+    if (-not $NonInteractive -and (Test-Path (Join-Path $InstallRoot 'yuninput_config.exe'))) {
+        try {
+            $shell = New-Object -ComObject WScript.Shell
+            $shortcutPath = Join-Path ([Environment]::GetFolderPath('Desktop')) 'Yuninput Config.lnk'
+            $shortcut = $shell.CreateShortcut($shortcutPath)
+            $shortcut.TargetPath = Join-Path $InstallRoot 'yuninput_config.exe'
+            $shortcut.WorkingDirectory = $InstallRoot
+            $shortcut.Save()
+            Start-Process (Join-Path $InstallRoot 'yuninput_config.exe')
+        }
+        catch {
+            Write-InstallLog "Warning: post-install config launch failed: $($_.Exception.Message)"
+        }
     }
 
     Write-InstallLog 'Install complete.'
 
-    Write-Host ''
-    Write-Host 'Install complete.'
-    Write-Host "Install path: $InstallRoot"
-    Write-Host 'Next: Windows Settings -> Language & region -> Chinese (Simplified) -> Language options -> Add keyboard -> yuninput'
-    Write-Host ''
-    Write-Host 'Opening relevant settings pages...'
-    Start-Process 'ms-settings:regionlanguage'
-    Start-Process 'ms-settings:typing'
-    Start-Process 'ctfmon.exe'
+    if (-not $NonInteractive) {
+        Write-Host ''
+        Write-Host 'Install complete.'
+        Write-Host "Install path: $InstallRoot"
+        Write-Host 'Next: Windows Settings -> Language & region -> Chinese (Simplified) -> Language options -> Add keyboard -> yuninput'
+        Write-Host ''
+        Write-Host 'Opening relevant settings pages...'
+        try {
+            Start-Process 'ms-settings:regionlanguage'
+            Start-Process 'ms-settings:typing'
+            Start-Process 'ctfmon.exe'
+        }
+        catch {
+            Write-InstallLog "Warning: opening settings pages failed: $($_.Exception.Message)"
+        }
+    }
 }
 catch {
     $message = $_.Exception.Message

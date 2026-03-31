@@ -11,6 +11,29 @@ namespace {
 constexpr wchar_t kCandidateWindowClass[] = L"yuninput_candidate_window";
 constexpr size_t kMaxVisibleRows = 6;
 
+bool AreDisplayCandidatesEqual(
+    const std::vector<CandidateWindow::DisplayCandidate>& left,
+    const std::vector<CandidateWindow::DisplayCandidate>& right) {
+    if (left.size() != right.size()) {
+        return false;
+    }
+
+    for (size_t i = 0; i < left.size(); ++i) {
+        const auto& l = left[i];
+        const auto& r = right[i];
+        if (l.text != r.text ||
+            l.code != r.code ||
+            l.boostedUser != r.boostedUser ||
+            l.boostedLearned != r.boostedLearned ||
+            l.boostedContext != r.boostedContext ||
+            l.consumedLength != r.consumedLength) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
 int ApproachInt(int current, int target, int minStep, double ratio) {
     const int delta = target - current;
     if (delta == 0) {
@@ -89,31 +112,28 @@ bool GetWorkAreaForPoint(const POINT& point, RECT& outWorkArea) {
     return SystemParametersInfoW(SPI_GETWORKAREA, 0, &outWorkArea, 0) == TRUE;
 }
 
-bool IsSameDisplayCandidate(
-    const CandidateWindow::DisplayCandidate& left,
-    const CandidateWindow::DisplayCandidate& right) {
-    return left.text == right.text &&
-        left.code == right.code &&
-        left.boostedUser == right.boostedUser &&
-        left.boostedLearned == right.boostedLearned &&
-        left.boostedContext == right.boostedContext &&
-        left.consumedLength == right.consumedLength;
+void FillSolidRect(HDC hdc, const RECT& rc, COLORREF color) {
+    SetDCBrushColor(hdc, color);
+    FillRect(hdc, &rc, static_cast<HBRUSH>(GetStockObject(DC_BRUSH)));
 }
 
-bool AreDisplayCandidatesEqual(
-    const std::vector<CandidateWindow::DisplayCandidate>& left,
-    const std::vector<CandidateWindow::DisplayCandidate>& right) {
-    if (left.size() != right.size()) {
-        return false;
-    }
+void DrawRoundedRect(HDC hdc, const RECT& rc, int ellipseW, int ellipseH, COLORREF fillColor, COLORREF borderColor) {
+    HGDIOBJ oldPen = SelectObject(hdc, GetStockObject(DC_PEN));
+    HGDIOBJ oldBrush = SelectObject(hdc, GetStockObject(DC_BRUSH));
+    SetDCPenColor(hdc, borderColor);
+    SetDCBrushColor(hdc, fillColor);
+    RoundRect(hdc, rc.left, rc.top, rc.right, rc.bottom, ellipseW, ellipseH);
+    SelectObject(hdc, oldBrush);
+    SelectObject(hdc, oldPen);
+}
 
-    for (size_t i = 0; i < left.size(); ++i) {
-        if (!IsSameDisplayCandidate(left[i], right[i])) {
-            return false;
-        }
-    }
-
-    return true;
+void DrawRectBorder(HDC hdc, const RECT& rc, COLORREF borderColor) {
+    HGDIOBJ oldPen = SelectObject(hdc, GetStockObject(DC_PEN));
+    HGDIOBJ oldBrush = SelectObject(hdc, GetStockObject(HOLLOW_BRUSH));
+    SetDCPenColor(hdc, borderColor);
+    Rectangle(hdc, rc.left, rc.top, rc.right, rc.bottom);
+    SelectObject(hdc, oldBrush);
+    SelectObject(hdc, oldPen);
 }
 
 void FillVerticalGradient(HDC hdc, const RECT& rc, COLORREF topColor, COLORREF bottomColor) {
@@ -309,7 +329,7 @@ void CandidateWindow::Update(
         return;
     }
 
-    const bool nonCandidateChanged =
+    const bool cheapStateChanged =
         code_ != code ||
         pageIndex_ != pageIndex ||
         totalPages_ != totalPages ||
@@ -319,15 +339,16 @@ void CandidateWindow::Update(
         chineseMode_ != chineseMode ||
         fullShapeMode_ != fullShapeMode;
 
-    // Skip expensive per-candidate string comparisons when other visible state already changed.
-    const bool candidatesChanged = nonCandidateChanged || !AreDisplayCandidatesEqual(candidates_, candidates);
-    const bool contentChanged = nonCandidateChanged || candidatesChanged;
+    bool candidatesChanged = false;
+    if (!cheapStateChanged) {
+        candidatesChanged = !AreDisplayCandidatesEqual(candidates_, candidates);
+    }
+
+    const bool contentChanged = cheapStateChanged || candidatesChanged;
 
     if (contentChanged) {
         code_ = code;
-        if (candidatesChanged) {
-            candidates_ = candidates;
-        }
+        candidates_ = candidates;
         pageIndex_ = pageIndex;
         totalPages_ = totalPages;
         totalCandidateCount_ = totalCandidateCount;
@@ -336,10 +357,6 @@ void CandidateWindow::Update(
         chineseMode_ = chineseMode;
         fullShapeMode_ = fullShapeMode;
     }
-
-    const bool hadLastWindowRect = hasLastWindowRect_;
-    const int previousWidth = lastWidth_;
-    const int previousHeight = lastHeight_;
 
     int x = 0;
     int y = 0;
@@ -369,11 +386,10 @@ void CandidateWindow::Update(
         y = 120;
     }
 
-    int width = 300;
-    if (!contentChanged && hasLastWindowRect_ && lastWidth_ > 0) {
-        width = lastWidth_;
-    } else {
-        EnsureFonts();
+    EnsureFonts();
+    int width = hasLastWindowRect_ ? lastWidth_ : 300;
+    if (contentChanged || !hasLastWindowRect_) {
+        width = 300;
         HDC measureDc = GetDC(hwnd_);
         if (measureDc != nullptr) {
             HFONT measureTextFont = textFont_ != nullptr ? textFont_ : static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
@@ -400,17 +416,15 @@ void CandidateWindow::Update(
             }
             ReleaseDC(hwnd_, measureDc);
         }
+        width = std::max(300, std::min(width, 960));
     }
 
-    width = std::max(300, std::min(width, 960));
     const int headerHeight = 30;
     const int codeHeight = 30;
     const int rowHeight = 32;
     const int footerHeight = 44;
-    int height = 0;
-    if (!contentChanged && hasLastWindowRect_ && lastHeight_ > 0) {
-        height = lastHeight_;
-    } else {
+    int height = hasLastWindowRect_ ? lastHeight_ : (headerHeight + codeHeight + footerHeight + rowHeight + 14);
+    if (contentChanged || !hasLastWindowRect_) {
         const int rowCount = std::max(1, static_cast<int>(std::min(candidates_.size(), kMaxVisibleRows)));
         const int cappedRows = std::max(1, rowCount);
         height = headerHeight + codeHeight + footerHeight + rowHeight * cappedRows + 14;
@@ -546,9 +560,29 @@ void CandidateWindow::Update(
         lastHeight_ = smoothedHeight;
     }
 
-    SetWindowPos(hwnd_, HWND_TOP, smoothedX, smoothedY, smoothedWidth, smoothedHeight, SWP_SHOWWINDOW | SWP_NOACTIVATE);
-    const bool sizeChanged = !hadLastWindowRect || smoothedWidth != previousWidth || smoothedHeight != previousHeight;
-    if (contentChanged || sizeChanged) {
+    bool hadWindowRect = false;
+    RECT currentRect = {};
+    if (GetWindowRect(hwnd_, &currentRect)) {
+        hadWindowRect = true;
+    }
+    const bool wasVisible = IsWindowVisible(hwnd_) == TRUE;
+
+    const bool movedOrResized =
+        !hadWindowRect ||
+        currentRect.left != smoothedX ||
+        currentRect.top != smoothedY ||
+        (currentRect.right - currentRect.left) != smoothedWidth ||
+        (currentRect.bottom - currentRect.top) != smoothedHeight;
+    const bool sizeChanged =
+        !hadWindowRect ||
+        (currentRect.right - currentRect.left) != smoothedWidth ||
+        (currentRect.bottom - currentRect.top) != smoothedHeight;
+
+    if (movedOrResized || !wasVisible) {
+        SetWindowPos(hwnd_, HWND_TOP, smoothedX, smoothedY, smoothedWidth, smoothedHeight, SWP_SHOWWINDOW | SWP_NOACTIVATE);
+    }
+
+    if (contentChanged || sizeChanged || !wasVisible) {
         InvalidateRect(hwnd_, nullptr, TRUE);
     }
 }
@@ -750,9 +784,7 @@ void CandidateWindow::OnPaint() {
         qualityFg = RGB(106, 118, 142);
     }
 
-    HBRUSH bgBrush = CreateSolidBrush(bg);
-    FillRect(hdc, &rc, bgBrush);
-    DeleteObject(bgBrush);
+    FillSolidRect(hdc, rc, bg);
 
     RECT panelRc = rc;
     panelRc.left += 1;
@@ -760,9 +792,7 @@ void CandidateWindow::OnPaint() {
     panelRc.right -= 1;
     panelRc.bottom -= 1;
 
-    HBRUSH panelBrush = CreateSolidBrush(panelBg);
-    FillRect(hdc, &panelRc, panelBrush);
-    DeleteObject(panelBrush);
+    FillSolidRect(hdc, panelRc, panelBg);
     FillVerticalGradient(hdc, panelRc, RGB(255, 254, 252), RGB(253, 248, 241));
 
     HPEN borderPen = CreatePen(PS_SOLID, 1, border);
@@ -775,9 +805,7 @@ void CandidateWindow::OnPaint() {
 
     RECT titleRc = panelRc;
     titleRc.bottom = titleRc.top + 30;
-    HBRUSH titleBrush = CreateSolidBrush(titleBg);
-    FillRect(hdc, &titleRc, titleBrush);
-    DeleteObject(titleBrush);
+    FillSolidRect(hdc, titleRc, titleBg);
     FillVerticalGradient(hdc, titleRc, RGB(253, 239, 217), RGB(243, 218, 180));
 
     SetBkMode(hdc, TRANSPARENT);
@@ -811,16 +839,7 @@ void CandidateWindow::OnPaint() {
     pageRc.left = pageRc.right - 178;
     pageRc.top += 5;
     pageRc.bottom -= 5;
-    HBRUSH pageBrush = CreateSolidBrush(RGB(255, 223, 179));
-    FillRect(hdc, &pageRc, pageBrush);
-    DeleteObject(pageBrush);
-    HPEN pagePen = CreatePen(PS_SOLID, 1, border);
-    HGDIOBJ oldPagePen = SelectObject(hdc, pagePen);
-    HGDIOBJ oldPageBrush = SelectObject(hdc, GetStockObject(HOLLOW_BRUSH));
-    RoundRect(hdc, pageRc.left, pageRc.top, pageRc.right, pageRc.bottom, 12, 12);
-    SelectObject(hdc, oldPageBrush);
-    SelectObject(hdc, oldPagePen);
-    DeleteObject(pagePen);
+    DrawRoundedRect(hdc, pageRc, 12, 12, RGB(255, 223, 179), border);
     SetTextColor(hdc, RGB(138, 78, 24));
     DrawTextW(hdc, pageText.c_str(), static_cast<int>(pageText.size()), &pageRc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
 
@@ -842,17 +861,13 @@ void CandidateWindow::OnPaint() {
         pagerStripRc.top = titleRc.bottom - 6;
         pagerStripRc.bottom = pagerStripRc.top + 3;
 
-        HBRUSH stripBgBrush = CreateSolidBrush(RGB(206, 221, 245));
-        FillRect(hdc, &pagerStripRc, stripBgBrush);
-        DeleteObject(stripBgBrush);
+        FillSolidRect(hdc, pagerStripRc, RGB(206, 221, 245));
 
         RECT pagerFillRc = pagerStripRc;
         const int stripWidth = std::max<int>(1, static_cast<int>(pagerStripRc.right - pagerStripRc.left));
         const int fillWidth = static_cast<int>((static_cast<double>(pageIndex_ + 1) / static_cast<double>(totalPages_)) * stripWidth);
         pagerFillRc.right = pagerFillRc.left + std::max(10, fillWidth);
-        HBRUSH stripFillBrush = CreateSolidBrush(RGB(84, 128, 208));
-        FillRect(hdc, &pagerFillRc, stripFillBrush);
-        DeleteObject(stripFillBrush);
+        FillSolidRect(hdc, pagerFillRc, RGB(84, 128, 208));
     }
 
     SelectObject(hdc, textFont);
@@ -862,17 +877,8 @@ void CandidateWindow::OnPaint() {
     codeRc.right -= 12;
     codeRc.bottom = codeRc.top + 26;
 
-    HBRUSH codeBgBrush = CreateSolidBrush(RGB(255, 248, 236));
-    FillRect(hdc, &codeRc, codeBgBrush);
-    DeleteObject(codeBgBrush);
-
-    HPEN codePen = CreatePen(PS_SOLID, 1, border);
-    HGDIOBJ oldCodePen = SelectObject(hdc, codePen);
-    HGDIOBJ oldCodeBrush = SelectObject(hdc, GetStockObject(HOLLOW_BRUSH));
-    Rectangle(hdc, codeRc.left, codeRc.top, codeRc.right, codeRc.bottom);
-    SelectObject(hdc, oldCodeBrush);
-    SelectObject(hdc, oldCodePen);
-    DeleteObject(codePen);
+    FillSolidRect(hdc, codeRc, RGB(255, 248, 236));
+    DrawRectBorder(hdc, codeRc, border);
 
     SetTextColor(hdc, textMain);
     std::wstring codeLine = L"Code: " + code_;
@@ -890,9 +896,7 @@ void CandidateWindow::OnPaint() {
         codeHighlightRc.right = std::min(codeHighlightRc.left + static_cast<int>(code_.size()) * 13 + 12, codeRc.right - 6);
         codeHighlightRc.top += 4;
         codeHighlightRc.bottom -= 4;
-        HBRUSH codeHighlightBrush = CreateSolidBrush(RGB(255, 229, 190));
-        FillRect(hdc, &codeHighlightRc, codeHighlightBrush);
-        DeleteObject(codeHighlightBrush);
+        FillSolidRect(hdc, codeHighlightRc, RGB(255, 229, 190));
 
         SetTextColor(hdc, RGB(164, 86, 16));
         RECT codeOnlyRc = codeHighlightRc;
@@ -940,22 +944,12 @@ void CandidateWindow::OnPaint() {
                 shadowRc.right -= 2;
                 shadowRc.top += 2;
                 shadowRc.bottom += 2;
-                HBRUSH shadowBrush = CreateSolidBrush(RGB(246, 225, 199));
-                FillRect(hdc, &shadowRc, shadowBrush);
-                DeleteObject(shadowBrush);
+                FillSolidRect(hdc, shadowRc, RGB(246, 225, 199));
             }
 
-            HBRUSH cardBrush = CreateSolidBrush(cardBg);
-            HGDIOBJ prevRowBrush = SelectObject(hdc, cardBrush);
             const COLORREF borderTone =
                 rowSelected ? activeRowBorder : (selectionDistance <= 1 ? cardBorderNear : cardBorder);
-            HPEN cardPen = CreatePen(PS_SOLID, 1, borderTone);
-            HGDIOBJ prevRowPen = SelectObject(hdc, cardPen);
-            RoundRect(hdc, cardRc.left, cardRc.top, cardRc.right, cardRc.bottom, 8, 8);
-            SelectObject(hdc, prevRowPen);
-            SelectObject(hdc, prevRowBrush);
-            DeleteObject(cardPen);
-            DeleteObject(cardBrush);
+            DrawRoundedRect(hdc, cardRc, 8, 8, cardBg, borderTone);
             if (rowSelected) {
                 FillVerticalGradient(hdc, cardRc, RGB(255, 242, 223), RGB(255, 229, 198));
             }
@@ -967,27 +961,17 @@ void CandidateWindow::OnPaint() {
             }
 
             if (rowSelected) {
-                HBRUSH activeBrush = CreateSolidBrush(activeRowBg);
-                FillRect(hdc, &cardRc, activeBrush);
-                DeleteObject(activeBrush);
+                FillSolidRect(hdc, cardRc, activeRowBg);
                 FillVerticalGradient(hdc, cardRc, RGB(255, 242, 223), RGB(255, 229, 198));
 
-                HPEN rowPen = CreatePen(PS_SOLID, 1, activeRowBorder);
-                HGDIOBJ prevPen = SelectObject(hdc, rowPen);
-                HGDIOBJ prevBrush = SelectObject(hdc, GetStockObject(HOLLOW_BRUSH));
-                RoundRect(hdc, cardRc.left, cardRc.top, cardRc.right, cardRc.bottom, 8, 8);
-                SelectObject(hdc, prevBrush);
-                SelectObject(hdc, prevPen);
-                DeleteObject(rowPen);
+                DrawRoundedRect(hdc, cardRc, 8, 8, activeRowBg, activeRowBorder);
 
                 RECT activeBarRc = cardRc;
                 activeBarRc.left += 1;
                 activeBarRc.right = activeBarRc.left + 4;
                 activeBarRc.top += 2;
                 activeBarRc.bottom -= 2;
-                HBRUSH activeBarBrush = CreateSolidBrush(activeBar);
-                FillRect(hdc, &activeBarRc, activeBarBrush);
-                DeleteObject(activeBarBrush);
+                FillSolidRect(hdc, activeBarRc, activeBar);
             }
 
             const std::wstring indexText = std::to_wstring(i + 1);
@@ -996,24 +980,14 @@ void CandidateWindow::OnPaint() {
             idxRc.top += 3;
             idxRc.bottom -= 3;
 
-            HBRUSH indexBrush = CreateSolidBrush(indexBg);
-            HGDIOBJ oldIndexBrush = SelectObject(hdc, indexBrush);
-            HPEN indexPen = CreatePen(PS_SOLID, 1, indexBorder);
-            HGDIOBJ oldIndexPen = SelectObject(hdc, indexPen);
-            RoundRect(hdc, idxRc.left, idxRc.top, idxRc.right, idxRc.bottom, 8, 8);
-            SelectObject(hdc, oldIndexPen);
-            SelectObject(hdc, oldIndexBrush);
-            DeleteObject(indexPen);
-            DeleteObject(indexBrush);
+            DrawRoundedRect(hdc, idxRc, 8, 8, indexBg, indexBorder);
 
             RECT idxHighlightRc = idxRc;
             idxHighlightRc.left += 2;
             idxHighlightRc.right -= 2;
             idxHighlightRc.top += 2;
             idxHighlightRc.bottom = idxHighlightRc.top + 2;
-            HBRUSH idxHighlightBrush = CreateSolidBrush(RGB(246, 250, 255));
-            FillRect(hdc, &idxHighlightRc, idxHighlightBrush);
-            DeleteObject(idxHighlightBrush);
+            FillSolidRect(hdc, idxHighlightRc, RGB(246, 250, 255));
 
             SetTextColor(hdc, indexFg);
             SelectObject(hdc, smallFont);
@@ -1054,23 +1028,13 @@ void CandidateWindow::OnPaint() {
             dividerRc.right = dividerRc.left + 1;
             dividerRc.top += 5;
             dividerRc.bottom -= 5;
-            HBRUSH dividerBrush = CreateSolidBrush(rowSelected ? RGB(225, 164, 94) : RGB(232, 212, 185));
-            FillRect(hdc, &dividerRc, dividerBrush);
-            DeleteObject(dividerBrush);
+            FillSolidRect(hdc, dividerRc, rowSelected ? RGB(225, 164, 94) : RGB(232, 212, 185));
 
             const COLORREF codeTagBg = rowSelected ? RGB(207, 120, 28) : RGB(255, 240, 216);
             const COLORREF codeTagBorder = rowSelected ? RGB(170, 96, 21) : RGB(234, 201, 160);
             const COLORREF codeTagText = rowSelected ? RGB(255, 250, 240) : textMeta;
 
-            HBRUSH codeTagBrush = CreateSolidBrush(codeTagBg);
-            HGDIOBJ oldTagBrush = SelectObject(hdc, codeTagBrush);
-            HPEN codeTagPen = CreatePen(PS_SOLID, 1, codeTagBorder);
-            HGDIOBJ oldTagPen = SelectObject(hdc, codeTagPen);
-            RoundRect(hdc, codeTagRc.left, codeTagRc.top, codeTagRc.right, codeTagRc.bottom, 12, 12);
-            SelectObject(hdc, oldTagPen);
-            SelectObject(hdc, oldTagBrush);
-            DeleteObject(codeTagPen);
-            DeleteObject(codeTagBrush);
+            DrawRoundedRect(hdc, codeTagRc, 12, 12, codeTagBg, codeTagBorder);
 
             SetTextColor(hdc, codeTagText);
             SelectObject(hdc, smallFont);
@@ -1121,16 +1085,8 @@ void CandidateWindow::OnPaint() {
 
     const std::wstring learnHint = L"Learn: freq on | assoc on | continue on | Pin Ctrl+1-9 | Delete Ctrl+Del";
 
-    HBRUSH infoBrush = CreateSolidBrush(RGB(247, 251, 255));
-    FillRect(hdc, &infoRc, infoBrush);
-    DeleteObject(infoBrush);
-    HPEN infoPen = CreatePen(PS_SOLID, 1, RGB(221, 232, 248));
-    HGDIOBJ oldInfoPen = SelectObject(hdc, infoPen);
-    HGDIOBJ oldInfoBrush = SelectObject(hdc, GetStockObject(HOLLOW_BRUSH));
-    Rectangle(hdc, infoRc.left, infoRc.top, infoRc.right, infoRc.bottom);
-    SelectObject(hdc, oldInfoBrush);
-    SelectObject(hdc, oldInfoPen);
-    DeleteObject(infoPen);
+    FillSolidRect(hdc, infoRc, RGB(247, 251, 255));
+    DrawRectBorder(hdc, infoRc, RGB(221, 232, 248));
 
     RECT infoTextRc = infoRc;
     infoTextRc.left += 8;
@@ -1172,15 +1128,7 @@ void CandidateWindow::OnPaint() {
         reasonText = RGB(44, 87, 158);
     }
 
-    HBRUSH reasonBrush = CreateSolidBrush(reasonBg);
-    HGDIOBJ oldReasonBrush = SelectObject(hdc, reasonBrush);
-    HPEN reasonPen = CreatePen(PS_SOLID, 1, reasonBorder);
-    HGDIOBJ oldReasonPen = SelectObject(hdc, reasonPen);
-    RoundRect(hdc, reasonRc.left, reasonRc.top, reasonRc.right, reasonRc.bottom, 10, 10);
-    SelectObject(hdc, oldReasonPen);
-    SelectObject(hdc, oldReasonBrush);
-    DeleteObject(reasonPen);
-    DeleteObject(reasonBrush);
+    DrawRoundedRect(hdc, reasonRc, 10, 10, reasonBg, reasonBorder);
     SetTextColor(hdc, reasonText);
     DrawTextW(hdc, qualityReasonBadge.c_str(), static_cast<int>(qualityReasonBadge.size()), &reasonRc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
 
@@ -1189,15 +1137,7 @@ void CandidateWindow::OnPaint() {
     qualityRc.right = qualityRc.left + 76;
     qualityRc.top += 2;
     qualityRc.bottom -= 2;
-    HBRUSH qualityBrush = CreateSolidBrush(qualityBg);
-    HGDIOBJ oldQualityBrush = SelectObject(hdc, qualityBrush);
-    HPEN qualityPen = CreatePen(PS_SOLID, 1, qualityBorder);
-    HGDIOBJ oldQualityPen = SelectObject(hdc, qualityPen);
-    RoundRect(hdc, qualityRc.left, qualityRc.top, qualityRc.right, qualityRc.bottom, 10, 10);
-    SelectObject(hdc, oldQualityPen);
-    SelectObject(hdc, oldQualityBrush);
-    DeleteObject(qualityPen);
-    DeleteObject(qualityBrush);
+    DrawRoundedRect(hdc, qualityRc, 10, 10, qualityBg, qualityBorder);
     SetTextColor(hdc, qualityFg);
     DrawTextW(hdc, qualityText.c_str(), static_cast<int>(qualityText.size()), &qualityRc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
 
@@ -1216,16 +1156,8 @@ void CandidateWindow::OnPaint() {
     RECT boundaryRc = footerRc;
     boundaryRc.bottom = footerRc.top - 2;
     boundaryRc.top = boundaryRc.bottom - 14;
-    HBRUSH boundaryBrush = CreateSolidBrush(RGB(246, 250, 255));
-    FillRect(hdc, &boundaryRc, boundaryBrush);
-    DeleteObject(boundaryBrush);
-    HPEN boundaryPen = CreatePen(PS_SOLID, 1, RGB(221, 232, 248));
-    HGDIOBJ oldBoundaryPen = SelectObject(hdc, boundaryPen);
-    HGDIOBJ oldBoundaryBrush = SelectObject(hdc, GetStockObject(HOLLOW_BRUSH));
-    Rectangle(hdc, boundaryRc.left, boundaryRc.top, boundaryRc.right, boundaryRc.bottom);
-    SelectObject(hdc, oldBoundaryBrush);
-    SelectObject(hdc, oldBoundaryPen);
-    DeleteObject(boundaryPen);
+    FillSolidRect(hdc, boundaryRc, RGB(246, 250, 255));
+    DrawRectBorder(hdc, boundaryRc, RGB(221, 232, 248));
 
     std::wstring boundaryText = L"MID PAGE";
     COLORREF boundaryFg = RGB(108, 127, 161);

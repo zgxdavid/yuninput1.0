@@ -18,16 +18,6 @@ namespace {
 constexpr const wchar_t* kBuildMarker = L"cw-r3-20260327-keytrace-v1";
 constexpr ULONGLONG kAnchorReuseWindowMs = 2500ULL;
 
-bool ShouldLogPerfSample(ULONGLONG elapsedMs, ULONGLONG slowThresholdMs, unsigned samplePeriod) {
-    static unsigned sampleCounter = 0;
-    ++sampleCounter;
-    if (elapsedMs >= slowThresholdMs) {
-        return true;
-    }
-
-    return samplePeriod > 0 && (sampleCounter % samplePeriod) == 0;
-}
-
 std::string WideToUtf8ForLog(const std::wstring& input) {
     if (input.empty()) {
         return "";
@@ -63,14 +53,89 @@ std::wstring Utf8ToWideText(const std::string& input) {
         return L"";
     }
 
-    const int required = MultiByteToWideChar(CP_UTF8, 0, input.c_str(), static_cast<int>(input.size()), nullptr, 0);
-    if (required <= 0) {
-        return L"";
+    const auto decode = [&input](UINT codePage, DWORD flags) {
+        const int required = MultiByteToWideChar(
+            codePage,
+            flags,
+            input.c_str(),
+            static_cast<int>(input.size()),
+            nullptr,
+            0);
+        if (required <= 0) {
+            return std::wstring();
+        }
+
+        std::wstring output(static_cast<size_t>(required), L'\0');
+        const int converted = MultiByteToWideChar(
+            codePage,
+            flags,
+            input.c_str(),
+            static_cast<int>(input.size()),
+            output.data(),
+            required);
+        if (converted <= 0) {
+            return std::wstring();
+        }
+        return output;
+    };
+
+    std::wstring decoded = decode(CP_UTF8, MB_ERR_INVALID_CHARS);
+    if (!decoded.empty()) {
+        return decoded;
     }
 
-    std::wstring output(static_cast<size_t>(required), L'\0');
-    MultiByteToWideChar(CP_UTF8, 0, input.c_str(), static_cast<int>(input.size()), output.data(), required);
-    return output;
+    decoded = decode(54936, 0);  // GB18030 fallback for legacy dictionary files.
+    if (!decoded.empty()) {
+        return decoded;
+    }
+
+    return decode(CP_ACP, 0);
+}
+
+bool IsCharInGB2312(wchar_t ch) {
+    if (ch <= 0x7F) {
+        return true;
+    }
+
+    char buffer[4] = {};
+    BOOL usedDefaultChar = FALSE;
+    const int converted = WideCharToMultiByte(
+        936,
+        WC_NO_BEST_FIT_CHARS,
+        &ch,
+        1,
+        buffer,
+        static_cast<int>(sizeof(buffer)),
+        nullptr,
+        &usedDefaultChar);
+    if (converted <= 0 || usedDefaultChar) {
+        return false;
+    }
+
+    if (converted == 1) {
+        return static_cast<unsigned char>(buffer[0]) <= 0x7F;
+    }
+
+    if (converted != 2) {
+        return false;
+    }
+
+    const unsigned char lead = static_cast<unsigned char>(buffer[0]);
+    const unsigned char trail = static_cast<unsigned char>(buffer[1]);
+    return lead >= 0xA1 && lead <= 0xF7 && trail >= 0xA1 && trail <= 0xFE;
+}
+
+bool IsTextInGB2312(const std::wstring& text) {
+    if (text.empty()) {
+        return true;
+    }
+
+    for (wchar_t ch : text) {
+        if (!IsCharInGB2312(ch)) {
+            return false;
+        }
+    }
+    return true;
 }
 
 std::wstring GetRuntimeLogPath() {
@@ -456,8 +521,10 @@ bool IsPunctuationVirtualKey(WPARAM key) {
            key == VK_OEM_7 ||
            key == VK_OEM_COMMA ||
            key == VK_OEM_MINUS ||
+           key == VK_SUBTRACT ||
            key == VK_OEM_PERIOD ||
-           key == VK_OEM_PLUS;
+           key == VK_OEM_PLUS ||
+           key == VK_ADD;
 }
 
 bool TryBuildPunctuationCommitText(
@@ -822,19 +889,24 @@ std::filesystem::path ResolveDataRootFromModule(const std::wstring& modulePath) 
 }
 
 std::wstring ReadTextFile(const std::filesystem::path& path) {
-    std::wifstream input(path);
-    if (!input.is_open()) {
+    std::ifstream input(path, std::ios::in | std::ios::binary);
+    if (!input) {
         return L"";
     }
 
-    input.imbue(std::locale(".UTF-8"));
-    std::wstring content;
-    std::wstring line;
-    while (std::getline(input, line)) {
-        content.append(line);
-        content.push_back(L'\n');
+    std::string bytes((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+    if (bytes.empty()) {
+        return L"";
     }
-    return content;
+
+    if (bytes.size() >= 3 &&
+        static_cast<unsigned char>(bytes[0]) == 0xEF &&
+        static_cast<unsigned char>(bytes[1]) == 0xBB &&
+        static_cast<unsigned char>(bytes[2]) == 0xBF) {
+        bytes.erase(0, 3);
+    }
+
+    return Utf8ToWideText(bytes);
 }
 
 bool ExtractBool(const std::wstring& text, const std::wstring& key, bool& outValue) {
@@ -1184,13 +1256,11 @@ TextService::TextService()
     nextDoubleQuoteOpen_(true),
             leftShiftTogglePending_(false),
             leftShiftToggleDownTick_(0),
+        pageBoundaryDirection_(0),
+        pageBoundaryHitCount_(0),
       pageSize_(kDefaultPageSize),
       toggleHotkey_(ToggleHotkey::F9),
-            pageCandidatesCachePageIndex_(0),
-            pageCandidatesCachePageSize_(0),
-            pageCandidatesCacheRevision_(0),
-            candidatesRevision_(1),
-            pageCandidatesCacheValid_(false),
+            candidatesRevision_(0),
       pageIndex_(0),
     selectedIndexInPage_(0),
         emptyCandidateAlerted_(false),
@@ -1198,7 +1268,10 @@ TextService::TextService()
         lastAnchor_{0, 0},
                 lastAnchorTick_(0),
                 autoPhraseSelectedStreak_(0),
-                autoPhraseSelectedTick_(0) {
+                                autoPhraseSelectedTick_(0),
+                                pageCandidatesCacheRevision_(0),
+                                pageCandidatesCachePageIndex_(0),
+                                pageCandidatesCachePageSize_(0) {
     InterlockedIncrement(&g_objectCount);
 }
 
@@ -1420,19 +1493,13 @@ STDMETHODIMP TextService::Deactivate() {
 }
 
 void TextService::RefreshCandidates() {
-    const ULONGLONG perfStart = GetTickCount64();
-
-    InvalidatePageCandidatesCache();
     allCandidates_.clear();
+    InvalidatePageCandidatesCache();
     if (compositionCode_.empty()) {
         pageIndex_ = 0;
         selectedIndexInPage_ = 0;
         emptyCandidateAlerted_ = false;
         UpdateCandidateWindow();
-        const ULONGLONG elapsedMs = GetTickCount64() - perfStart;
-        if (ShouldLogPerfSample(elapsedMs, 4, 50)) {
-            Trace(L"perf RefreshCandidates ms=" + std::to_wstring(elapsedMs) + L" codeLen=0 candidates=0");
-        }
         return;
     }
 
@@ -1516,7 +1583,7 @@ void TextService::RefreshCandidates() {
         candidate.fromSystemDict = fromSystemDict;
         candidate.consumedLength = consumedLength;
         allCandidates_.push_back(std::move(candidate));
-        candidateIndexByText.emplace(allCandidates_.back().text, allCandidates_.size() - 1);
+        candidateIndexByText.emplace(text, allCandidates_.size() - 1);
     };
 
     bool hasExactCurrentCode = false;
@@ -1647,8 +1714,22 @@ void TextService::RefreshCandidates() {
     if (contextAssociationEnabled_ && !recentCommits_.empty()) {
         const CommitHistoryItem& previous = recentCommits_.back();
         if ((now - previous.tick) <= 15000ULL && !previous.text.empty()) {
+            const std::wstring associationPrefix = previous.text + L"\t";
+            std::wstring associationKey = associationPrefix;
+            associationKey.reserve(associationPrefix.size() + 32);
             for (CandidateItem& candidate : allCandidates_) {
-                const std::uint64_t contextScore = QueryContextAssociationScore(previous.text, candidate.text);
+                associationKey.resize(associationPrefix.size());
+                associationKey.append(candidate.text);
+                if (contextAssociationBlacklist_.find(associationKey) != contextAssociationBlacklist_.end()) {
+                    continue;
+                }
+
+                const auto scoreIt = contextAssociationScores_.find(associationKey);
+                if (scoreIt == contextAssociationScores_.end()) {
+                    continue;
+                }
+
+                const std::uint64_t contextScore = scoreIt->second;
                 if (contextScore == 0) {
                     continue;
                 }
@@ -1664,15 +1745,47 @@ void TextService::RefreshCandidates() {
         !lastAutoPhraseSelectedKey_.empty() &&
         now >= autoPhraseSelectedTick_ &&
         (now - autoPhraseSelectedTick_) <= 60000ULL;
+
+    auto fillSortHints = [this](CandidateItem& candidate) {
+        candidate.sortAutoOnly = candidate.fromAutoPhrase && !candidate.fromSystemDict && !candidate.boostedUser;
+        candidate.sortSingleChar = candidate.text.size() == 1;
+        candidate.sortGB2312Text = IsTextInGB2312Cached(candidate.text);
+        candidate.sortNonGB2312Single = candidate.sortSingleChar && !candidate.sortGB2312Text;
+
+        const bool oneCodeSingle =
+            candidate.sortSingleChar && candidate.code.size() <= 1 && candidate.commitCode.size() <= 1;
+        candidate.sortOneCodeSingle = oneCodeSingle;
+        candidate.sortOneCodeSingleUsed = oneCodeSingle && (candidate.boostedUser || candidate.boostedLearned);
+
+        const bool exactTwoCodePhrase =
+            candidate.text.size() == 2 &&
+            candidate.code.size() == 2 &&
+            candidate.commitCode.size() == 2 &&
+            candidate.fromSystemDict &&
+            !candidate.fromAutoPhrase;
+        const bool twoCodeSingle =
+            candidate.sortSingleChar && candidate.code.size() == 2 && candidate.commitCode.size() == 2;
+        candidate.sortTwoCodeSingleOrPhrase = twoCodeSingle || exactTwoCodePhrase;
+
+        if (candidate.sortOneCodeSingleUsed) {
+            candidate.sortShortCodeTier = 0;
+        } else if (candidate.sortOneCodeSingle) {
+            candidate.sortShortCodeTier = 1;
+        } else if (candidate.sortTwoCodeSingleOrPhrase) {
+            candidate.sortShortCodeTier = 2;
+        } else {
+            candidate.sortShortCodeTier = 3;
+        }
+    };
+
     for (CandidateItem& candidate : allCandidates_) {
         candidate.boostedAutoRepeat = false;
-        if (!repeatBoostActive || !candidate.fromAutoPhrase) {
-            continue;
+        if (repeatBoostActive && candidate.fromAutoPhrase) {
+            const std::wstring candidateKey =
+                (candidate.commitCode.empty() ? compositionCode_ : candidate.commitCode) + L"\t" + candidate.text;
+            candidate.boostedAutoRepeat = candidateKey == lastAutoPhraseSelectedKey_;
         }
-
-        const std::wstring candidateKey =
-            (candidate.commitCode.empty() ? compositionCode_ : candidate.commitCode) + L"\t" + candidate.text;
-        candidate.boostedAutoRepeat = candidateKey == lastAutoPhraseSelectedKey_;
+        fillSortHints(candidate);
     }
 
     const size_t queryCodeLength = compositionCode_.size();
@@ -1681,45 +1794,26 @@ void TextService::RefreshCandidates() {
         allCandidates_.end(),
         [pinyinFallbackMode, queryCodeLength](const CandidateItem& left, const CandidateItem& right) {
             if (pinyinFallbackMode) {
-                const bool leftSingleChar = left.text.size() == 1;
-                const bool rightSingleChar = right.text.size() == 1;
-                if (leftSingleChar != rightSingleChar) {
-                    return leftSingleChar > rightSingleChar;
+                if (left.sortSingleChar != right.sortSingleChar) {
+                    return left.sortSingleChar > right.sortSingleChar;
                 }
             }
             if (queryCodeLength <= 2) {
-                const bool leftSingleChar = left.text.size() == 1;
-                const bool rightSingleChar = right.text.size() == 1;
-                const bool leftFirstLevelSingleChar = leftSingleChar && left.code.size() <= 1 && left.commitCode.size() <= 1;
-                const bool rightFirstLevelSingleChar = rightSingleChar && right.code.size() <= 1 && right.commitCode.size() <= 1;
-                if (leftFirstLevelSingleChar != rightFirstLevelSingleChar) {
-                    return leftFirstLevelSingleChar > rightFirstLevelSingleChar;
-                }
-
-                const bool leftExactTwoCodePhrase =
-                    left.text.size() == 2 &&
-                    left.code.size() == 2 &&
-                    left.commitCode.size() == 2 &&
-                    left.fromSystemDict &&
-                    !left.fromAutoPhrase;
-                const bool rightExactTwoCodePhrase =
-                    right.text.size() == 2 &&
-                    right.code.size() == 2 &&
-                    right.commitCode.size() == 2 &&
-                    right.fromSystemDict &&
-                    !right.fromAutoPhrase;
-                if (leftExactTwoCodePhrase != rightExactTwoCodePhrase) {
-                    return leftExactTwoCodePhrase > rightExactTwoCodePhrase;
-                }
-
-                const bool leftSecondLevelSingleChar = leftSingleChar && left.code.size() == 2 && left.commitCode.size() == 2;
-                const bool rightSecondLevelSingleChar = rightSingleChar && right.code.size() == 2 && right.commitCode.size() == 2;
-                if (leftSecondLevelSingleChar != rightSecondLevelSingleChar) {
-                    return leftSecondLevelSingleChar > rightSecondLevelSingleChar;
+                if (left.sortShortCodeTier != right.sortShortCodeTier) {
+                    return left.sortShortCodeTier < right.sortShortCodeTier;
                 }
             }
             if (left.exactMatch != right.exactMatch) {
                 return left.exactMatch > right.exactMatch;
+            }
+            if (left.boostedUser != right.boostedUser) {
+                return left.boostedUser > right.boostedUser;
+            }
+            if (left.boostedLearned != right.boostedLearned) {
+                return left.boostedLearned > right.boostedLearned;
+            }
+            if (left.sortGB2312Text != right.sortGB2312Text) {
+                return left.sortGB2312Text > right.sortGB2312Text;
             }
             if (left.contextScore != right.contextScore) {
                 return left.contextScore > right.contextScore;
@@ -1730,19 +1824,14 @@ void TextService::RefreshCandidates() {
             if (left.boostedAutoRepeat != right.boostedAutoRepeat) {
                 return left.boostedAutoRepeat > right.boostedAutoRepeat;
             }
-            const bool leftAutoOnly = left.fromAutoPhrase && !left.fromSystemDict && !left.boostedUser;
-            const bool rightAutoOnly = right.fromAutoPhrase && !right.fromSystemDict && !right.boostedUser;
-            if (leftAutoOnly != rightAutoOnly) {
-                return leftAutoOnly < rightAutoOnly;
+            if (left.sortNonGB2312Single != right.sortNonGB2312Single) {
+                return left.sortNonGB2312Single < right.sortNonGB2312Single;
+            }
+            if (left.sortAutoOnly != right.sortAutoOnly) {
+                return left.sortAutoOnly < right.sortAutoOnly;
             }
             if (left.consumedLength != right.consumedLength) {
                 return left.consumedLength > right.consumedLength;
-            }
-            if (left.boostedUser != right.boostedUser) {
-                return left.boostedUser > right.boostedUser;
-            }
-            if (left.boostedLearned != right.boostedLearned) {
-                return left.boostedLearned > right.boostedLearned;
             }
             return false;
         });
@@ -1759,14 +1848,6 @@ void TextService::RefreshCandidates() {
     }
 
     UpdateCandidateWindow();
-
-    const ULONGLONG elapsedMs = GetTickCount64() - perfStart;
-    if (ShouldLogPerfSample(elapsedMs, 4, 40)) {
-        Trace(
-            L"perf RefreshCandidates ms=" + std::to_wstring(elapsedMs) +
-            L" codeLen=" + std::to_wstring(compositionCode_.size()) +
-            L" candidates=" + std::to_wstring(allCandidates_.size()));
-    }
 }
 
 const wchar_t* TextService::GetDictionaryProfileName(DictionaryProfile profile) {
@@ -1947,13 +2028,33 @@ std::wstring TextService::GetSingleCharZhengmaCodeHint(const std::wstring& text)
     return it->second;
 }
 
+bool TextService::IsTextInGB2312Cached(const std::wstring& text) const {
+    const auto cacheIt = gb2312TextCache_.find(text);
+    if (cacheIt != gb2312TextCache_.end()) {
+        return cacheIt->second;
+    }
+
+    const bool result = IsTextInGB2312(text);
+    if (gb2312TextCache_.size() > 8192) {
+        gb2312TextCache_.clear();
+    }
+    gb2312TextCache_.emplace(text, result);
+    return result;
+}
+
 size_t TextService::FindPreferredSelectionIndexForPage(size_t pageIndex) const {
+    if (allCandidates_.empty()) {
+        return 0;
+    }
+
     const size_t start = pageIndex * pageSize_;
     if (start >= allCandidates_.size()) {
         return 0;
     }
-
     const size_t end = std::min(start + pageSize_, allCandidates_.size());
+    if (end <= start) {
+        return 0;
+    }
 
     auto scoreCandidate = [this](const CandidateItem& candidate) {
         int score = 0;
@@ -1974,17 +2075,17 @@ size_t TextService::FindPreferredSelectionIndexForPage(size_t pageIndex) const {
         return score;
     };
 
-    size_t bestGlobalIndex = start;
+    size_t bestIndex = 0;
     int bestScore = scoreCandidate(allCandidates_[start]);
     for (size_t i = start + 1; i < end; ++i) {
         const int score = scoreCandidate(allCandidates_[i]);
         if (score > bestScore) {
             bestScore = score;
-            bestGlobalIndex = i;
+            bestIndex = i - start;
         }
     }
 
-    return bestGlobalIndex - start;
+    return bestIndex;
 }
 
 bool TextService::TryFindExactCommitCandidateIndex(size_t& outIndex) const {
@@ -2171,11 +2272,13 @@ std::uint64_t TextService::QueryContextAssociationScore(const std::wstring& prev
         return 0;
     }
 
-    if (contextAssociationBlacklist_.find(MakeContextAssociationKey(prevText, nextText)) != contextAssociationBlacklist_.end()) {
+    const std::wstring key = MakeContextAssociationKey(prevText, nextText);
+
+    if (contextAssociationBlacklist_.find(key) != contextAssociationBlacklist_.end()) {
         return 0;
     }
 
-    const auto it = contextAssociationScores_.find(MakeContextAssociationKey(prevText, nextText));
+    const auto it = contextAssociationScores_.find(key);
     if (it == contextAssociationScores_.end()) {
         return 0;
     }
@@ -2184,14 +2287,8 @@ std::uint64_t TextService::QueryContextAssociationScore(const std::wstring& prev
 }
 
 void TextService::UpdateCandidateWindow() {
-    const ULONGLONG perfStart = GetTickCount64();
-
     if (compositionCode_.empty()) {
         candidateWindow_.Hide();
-        const ULONGLONG elapsedMs = GetTickCount64() - perfStart;
-        if (ShouldLogPerfSample(elapsedMs, 4, 60)) {
-            Trace(L"perf UpdateCandidateWindow ms=" + std::to_wstring(elapsedMs) + L" hidden=1");
-        }
         return;
     }
 
@@ -2216,10 +2313,6 @@ void TextService::UpdateCandidateWindow() {
         ClearComposition();
         candidateWindow_.Hide();
         Trace(L"UpdateCandidateWindow: no focused context, hide candidate window");
-        const ULONGLONG elapsedMs = GetTickCount64() - perfStart;
-        if (ShouldLogPerfSample(elapsedMs, 4, 40)) {
-            Trace(L"perf UpdateCandidateWindow ms=" + std::to_wstring(elapsedMs) + L" hidden=1 noFocus=1");
-        }
         return;
     }
 
@@ -2253,63 +2346,40 @@ void TextService::UpdateCandidateWindow() {
         lastAnchorTick_ = GetTickCount64();
     }
 
-    const std::vector<CandidateWindow::DisplayCandidate>& pageCandidates = GetCurrentPageCandidates();
-    const size_t totalPages = GetTotalPages();
-
+    const auto& pageCandidates = GetCurrentPageCandidates();
     candidateWindow_.Update(
         compositionCode_,
         pageCandidates,
         pageIndex_,
-        totalPages,
+        GetTotalPages(),
         allCandidates_.size(),
         selectedIndexInPage_,
         pageIndex_ * pageSize_ + selectedIndexInPage_,
         chineseMode_,
         fullShapeMode_,
         anchorPtr);
-
-    const ULONGLONG elapsedMs = GetTickCount64() - perfStart;
-    if (ShouldLogPerfSample(elapsedMs, 4, 30)) {
-        Trace(
-            L"perf UpdateCandidateWindow ms=" + std::to_wstring(elapsedMs) +
-            L" page=" + std::to_wstring(pageIndex_ + 1) + L"/" + std::to_wstring(totalPages) +
-            L" visible=" + std::to_wstring(pageCandidates.size()) +
-            L" total=" + std::to_wstring(allCandidates_.size()));
-    }
 }
 
 const std::vector<CandidateWindow::DisplayCandidate>& TextService::GetCurrentPageCandidates() const {
-    const bool cacheHit =
-        pageCandidatesCacheValid_ &&
-        pageCandidatesCacheRevision_ == candidatesRevision_ &&
-        pageCandidatesCachePageIndex_ == pageIndex_ &&
-        pageCandidatesCachePageSize_ == pageSize_ &&
-        pageCandidatesCacheCompositionCode_ == compositionCode_;
-    if (cacheHit) {
-        return pageCandidatesCache_;
-    }
-
-    pageCandidatesCache_.clear();
+    static const std::vector<CandidateWindow::DisplayCandidate> kEmptyPage;
     if (allCandidates_.empty()) {
-        pageCandidatesCacheCompositionCode_ = compositionCode_;
-        pageCandidatesCachePageIndex_ = pageIndex_;
-        pageCandidatesCachePageSize_ = pageSize_;
-        pageCandidatesCacheRevision_ = candidatesRevision_;
-        pageCandidatesCacheValid_ = true;
-        return pageCandidatesCache_;
+        return kEmptyPage;
     }
 
     const size_t start = pageIndex_ * pageSize_;
     if (start >= allCandidates_.size()) {
-        pageCandidatesCacheCompositionCode_ = compositionCode_;
-        pageCandidatesCachePageIndex_ = pageIndex_;
-        pageCandidatesCachePageSize_ = pageSize_;
-        pageCandidatesCacheRevision_ = candidatesRevision_;
-        pageCandidatesCacheValid_ = true;
+        return kEmptyPage;
+    }
+
+    if (pageCandidatesCacheRevision_ == candidatesRevision_ &&
+        pageCandidatesCachePageIndex_ == pageIndex_ &&
+        pageCandidatesCachePageSize_ == pageSize_ &&
+        pageCandidatesCacheCode_ == compositionCode_) {
         return pageCandidatesCache_;
     }
 
     const size_t end = std::min(start + pageSize_, allCandidates_.size());
+    pageCandidatesCache_.clear();
     pageCandidatesCache_.reserve(end - start);
     for (size_t i = start; i < end; ++i) {
         CandidateWindow::DisplayCandidate candidate;
@@ -2324,11 +2394,13 @@ const std::vector<CandidateWindow::DisplayCandidate>& TextService::GetCurrentPag
 
         const size_t consumedLength = std::min(allCandidates_[i].consumedLength, compositionCode_.size());
         if (consumedLength < compositionCode_.size()) {
-            if (!candidate.code.empty()) {
-                candidate.code += L"  ";
+            const std::wstring remaining = compositionCode_.substr(consumedLength);
+            if (!remaining.empty()) {
+                if (!candidate.code.empty()) {
+                    candidate.code += L"  ";
+                }
+                candidate.code += L"未完:" + remaining;
             }
-            candidate.code += L"未完:";
-            candidate.code.append(compositionCode_, consumedLength, std::wstring::npos);
         }
         candidate.boostedUser = allCandidates_[i].boostedUser;
         candidate.boostedLearned = allCandidates_[i].boostedLearned;
@@ -2337,20 +2409,15 @@ const std::vector<CandidateWindow::DisplayCandidate>& TextService::GetCurrentPag
         pageCandidatesCache_.push_back(std::move(candidate));
     }
 
-    pageCandidatesCacheCompositionCode_ = compositionCode_;
+    pageCandidatesCacheRevision_ = candidatesRevision_;
     pageCandidatesCachePageIndex_ = pageIndex_;
     pageCandidatesCachePageSize_ = pageSize_;
-    pageCandidatesCacheRevision_ = candidatesRevision_;
-    pageCandidatesCacheValid_ = true;
+    pageCandidatesCacheCode_ = compositionCode_;
     return pageCandidatesCache_;
 }
 
 void TextService::InvalidatePageCandidatesCache() {
-    pageCandidatesCacheValid_ = false;
     ++candidatesRevision_;
-    if (candidatesRevision_ == 0) {
-        candidatesRevision_ = 1;
-    }
 }
 
 size_t TextService::GetTotalPages() const {
@@ -2368,6 +2435,8 @@ void TextService::ClearComposition() {
     pageIndex_ = 0;
     selectedIndexInPage_ = 0;
     emptyCandidateAlerted_ = false;
+    pageBoundaryDirection_ = 0;
+    pageBoundaryHitCount_ = 0;
 }
 
 void TextService::LearnPhraseFromRecentCommits(const std::wstring& committedCode, const std::wstring& committedText) {
@@ -2718,7 +2787,7 @@ bool TextService::PromoteSelectedCandidateToManualEntry() {
         return false;
     }
 
-    const std::vector<CandidateWindow::DisplayCandidate> pageCandidates = GetCurrentPageCandidates();
+    const auto& pageCandidates = GetCurrentPageCandidates();
     if (pageCandidates.empty()) {
         return false;
     }
@@ -3126,7 +3195,7 @@ STDMETHODIMP TextService::OnTestKeyDown(ITfContext*, WPARAM wParam, LPARAM lPara
                       key == VK_APPS)
                          ? TRUE
                          : FALSE;
-            if (key == VK_BACK || key == VK_DELETE || key == VK_OEM_MINUS || key == VK_OEM_PLUS || IsLeftShiftToggleKey(key, lParam)) {
+            if (key == VK_BACK || key == VK_DELETE || key == VK_OEM_MINUS || key == VK_SUBTRACT || key == VK_OEM_PLUS || key == VK_ADD || IsLeftShiftToggleKey(key, lParam)) {
                 wchar_t englishBypassLog[240] = {};
                 swprintf_s(
                     englishBypassLog,
@@ -3186,7 +3255,9 @@ STDMETHODIMP TextService::OnTestKeyDown(ITfContext*, WPARAM wParam, LPARAM lPara
                   key == VK_OEM_2 ||
                   key == VK_OEM_3 ||
               key == VK_OEM_MINUS ||
+                  key == VK_SUBTRACT ||
               key == VK_OEM_PLUS ||
+                  key == VK_ADD ||
               key == VK_OEM_COMMA ||
               key == VK_OEM_PERIOD ||
               key == VK_OEM_4 ||
@@ -3427,7 +3498,7 @@ STDMETHODIMP TextService::OnKeyDown(ITfContext* context, WPARAM wParam, LPARAM l
     }
 
     if (ctrlPressed && key == VK_DELETE && !compositionCode_.empty()) {
-        const std::vector<CandidateWindow::DisplayCandidate>& pageCandidates = GetCurrentPageCandidates();
+        const auto& pageCandidates = GetCurrentPageCandidates();
         if (!pageCandidates.empty()) {
             const size_t safeIndexInPage = std::min(selectedIndexInPage_, pageCandidates.size() - 1);
             BlockCandidateByGlobalIndex(pageIndex_ * pageSize_ + safeIndexInPage);
@@ -3436,7 +3507,84 @@ STDMETHODIMP TextService::OnKeyDown(ITfContext* context, WPARAM wParam, LPARAM l
         return S_OK;
     }
 
+    const bool minusPageUpKey = (key == VK_OEM_MINUS || key == VK_SUBTRACT);
+    const bool plusPageDownKey = (key == VK_OEM_PLUS || key == VK_ADD);
+    if (!minusPageUpKey && !plusPageDownKey) {
+        pageBoundaryDirection_ = 0;
+        pageBoundaryHitCount_ = 0;
+    }
+
     std::wstring punctuationText;
+    if (!compositionCode_.empty() && (minusPageUpKey || plusPageDownKey)) {
+        const size_t totalPages = GetTotalPages();
+        const bool canPageUp = pageIndex_ > 0;
+        const bool canPageDown = totalPages > 0 && pageIndex_ + 1 < totalPages;
+        const bool canMovePage = minusPageUpKey ? canPageUp : canPageDown;
+
+        if (canMovePage) {
+            if (minusPageUpKey) {
+                pageIndex_ -= 1;
+            } else {
+                pageIndex_ += 1;
+            }
+            selectedIndexInPage_ = FindPreferredSelectionIndexForPage(pageIndex_);
+            UpdateCandidateWindow();
+            pageBoundaryDirection_ = 0;
+            pageBoundaryHitCount_ = 0;
+            *eaten = TRUE;
+            return S_OK;
+        }
+
+        const int boundaryDirection = minusPageUpKey ? -1 : 1;
+        if (pageBoundaryDirection_ != boundaryDirection) {
+            pageBoundaryDirection_ = boundaryDirection;
+            pageBoundaryHitCount_ = 1;
+            *eaten = TRUE;
+            return S_OK;
+        }
+
+        pageBoundaryHitCount_ += 1;
+        if (pageBoundaryHitCount_ < 2) {
+            *eaten = TRUE;
+            return S_OK;
+        }
+
+        pageBoundaryDirection_ = 0;
+        pageBoundaryHitCount_ = 0;
+
+        std::wstring boundaryPunctuation;
+        const bool hasBoundaryPunctuation = TryBuildPunctuationCommitText(
+            wParam,
+            lParam,
+            chinesePunctuation_,
+            smartSymbolPairs_,
+            nextSingleQuoteOpen_,
+            nextDoubleQuoteOpen_,
+            boundaryPunctuation);
+
+        bool committed = false;
+        const auto& pageCandidates = GetCurrentPageCandidates();
+        if (!pageCandidates.empty()) {
+            const size_t safeIndexInPage = std::min(selectedIndexInPage_, pageCandidates.size() - 1);
+            const size_t globalIndex = pageIndex_ * pageSize_ + safeIndexInPage;
+            committed = CommitCandidateByGlobalIndex(context, globalIndex, 1);
+        } else {
+            const std::wstring rawCode = compositionCode_;
+            if (CommitText(context, rawCode)) {
+                ClearComposition();
+                candidateWindow_.Hide();
+                committed = true;
+            }
+        }
+
+        if (committed && hasBoundaryPunctuation) {
+            CommitText(context, boundaryPunctuation);
+        }
+
+        *eaten = TRUE;
+        return S_OK;
+    }
+
     const bool digitProducesSymbol =
         (key >= L'0' && key <= L'9') &&
         [&]() {
@@ -3557,13 +3705,13 @@ STDMETHODIMP TextService::OnKeyDown(ITfContext* context, WPARAM wParam, LPARAM l
     }
 
     if (tabNavigation_ && key == VK_TAB && !compositionCode_.empty()) {
-        const std::vector<CandidateWindow::DisplayCandidate>& pageCandidates = GetCurrentPageCandidates();
+        const auto& pageCandidates = GetCurrentPageCandidates();
         if (!pageCandidates.empty()) {
             if (shiftPressed) {
                 if (selectedIndexInPage_ == 0) {
                     if (pageIndex_ > 0) {
                         pageIndex_ -= 1;
-                        const std::vector<CandidateWindow::DisplayCandidate>& prevPageCandidates = GetCurrentPageCandidates();
+                        const auto& prevPageCandidates = GetCurrentPageCandidates();
                         selectedIndexInPage_ = prevPageCandidates.empty() ? 0 : (prevPageCandidates.size() - 1);
                     } else {
                         selectedIndexInPage_ = pageCandidates.size() - 1;
@@ -3590,7 +3738,7 @@ STDMETHODIMP TextService::OnKeyDown(ITfContext* context, WPARAM wParam, LPARAM l
         return S_OK;
     }
 
-    if ((key == VK_OEM_MINUS || key == VK_OEM_4 || key == VK_OEM_COMMA || key == VK_PRIOR) && !compositionCode_.empty()) {
+    if ((key == VK_OEM_4 || key == VK_OEM_COMMA || key == VK_PRIOR) && !compositionCode_.empty()) {
         if (pageIndex_ > 0) {
             pageIndex_ -= 1;
             selectedIndexInPage_ = FindPreferredSelectionIndexForPage(pageIndex_);
@@ -3600,7 +3748,7 @@ STDMETHODIMP TextService::OnKeyDown(ITfContext* context, WPARAM wParam, LPARAM l
         return S_OK;
     }
 
-    if ((key == VK_OEM_PLUS || key == VK_OEM_6 || key == VK_OEM_PERIOD || key == VK_NEXT) && !compositionCode_.empty()) {
+    if ((key == VK_OEM_6 || key == VK_OEM_PERIOD || key == VK_NEXT) && !compositionCode_.empty()) {
         const size_t totalPages = GetTotalPages();
         if (totalPages > 0 && pageIndex_ + 1 < totalPages) {
             pageIndex_ += 1;
@@ -3612,7 +3760,7 @@ STDMETHODIMP TextService::OnKeyDown(ITfContext* context, WPARAM wParam, LPARAM l
     }
 
     if ((key == VK_UP || key == VK_DOWN) && !compositionCode_.empty()) {
-        const std::vector<CandidateWindow::DisplayCandidate>& pageCandidates = GetCurrentPageCandidates();
+        const auto& pageCandidates = GetCurrentPageCandidates();
         if (!pageCandidates.empty()) {
             if (key == VK_UP) {
                 if (selectedIndexInPage_ == 0) {
@@ -3648,7 +3796,7 @@ STDMETHODIMP TextService::OnKeyDown(ITfContext* context, WPARAM wParam, LPARAM l
     selectionOffset = 0;
     if (TryMapSelectionInputToIndex(key, lParam, selectionOffset) && !compositionCode_.empty()) {
         Trace(L"select: begin");
-        const std::vector<CandidateWindow::DisplayCandidate>& pageCandidates = GetCurrentPageCandidates();
+        const auto& pageCandidates = GetCurrentPageCandidates();
         if (selectionOffset < pageCandidates.size()) {
             const size_t pageStart = pageIndex_ * pageSize_;
             const size_t index = pageStart + selectionOffset;
@@ -3661,7 +3809,7 @@ STDMETHODIMP TextService::OnKeyDown(ITfContext* context, WPARAM wParam, LPARAM l
     }
 
     if ((key == VK_SPACE || key == VK_RETURN) && !compositionCode_.empty()) {
-        const std::vector<CandidateWindow::DisplayCandidate>& pageCandidates = GetCurrentPageCandidates();
+        const auto& pageCandidates = GetCurrentPageCandidates();
         if (pageCandidates.empty()) {
             const std::wstring rawCode = compositionCode_;
             if (CommitText(context, rawCode)) {

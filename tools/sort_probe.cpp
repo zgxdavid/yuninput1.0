@@ -2,11 +2,10 @@
 
 #include <Windows.h>
 
-#include <fcntl.h>
 #include <iostream>
-#include <io.h>
 #include <string>
 #include <vector>
+#include <clocale>
 
 namespace {
 
@@ -25,6 +24,21 @@ std::wstring Utf8ToWide(const std::string& input) {
     return output;
 }
 
+std::string WideToUtf8(const std::wstring& input) {
+    if (input.empty()) {
+        return "";
+    }
+
+    const int required = WideCharToMultiByte(CP_UTF8, 0, input.c_str(), static_cast<int>(input.size()), nullptr, 0, nullptr, nullptr);
+    if (required <= 0) {
+        return "";
+    }
+
+    std::string output(static_cast<size_t>(required), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, input.c_str(), static_cast<int>(input.size()), output.data(), required, nullptr, nullptr);
+    return output;
+}
+
 }  // namespace
 
 int main(int argc, char* argv[]) {
@@ -40,7 +54,9 @@ int main(int argc, char* argv[]) {
         maxCandidates = static_cast<size_t>(std::stoul(argv[3]));
     }
 
-    _setmode(_fileno(stdout), _O_U16TEXT);
+    SetConsoleOutputCP(CP_UTF8);
+    SetConsoleCP(CP_UTF8);
+    std::setlocale(LC_ALL, ".UTF-8");
 
     CompositionEngine engine;
     if (!engine.LoadDictionaryFromFile(dictPath)) {
@@ -50,7 +66,7 @@ int main(int argc, char* argv[]) {
 
     const std::vector<CompositionEngine::Entry> candidates = engine.QueryCandidateEntries(code, maxCandidates);
     for (const auto& entry : candidates) {
-        std::wcout << entry.code << L'\t' << entry.text << L'\n';
+        std::cout << WideToUtf8(entry.code) << '\t' << WideToUtf8(entry.text) << '\n';
     }
 
     return 0;

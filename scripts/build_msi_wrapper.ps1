@@ -19,6 +19,7 @@ $outMsi = Join-Path (Split-Path -Parent $projectRoot) $OutputName
 
 $requiredFiles = @(
     (Join-Path $projectRoot 'build\Release\yuninput.dll'),
+    (Join-Path $projectRoot 'assets\icon_yun.ico'),
     (Join-Path $projectRoot 'scripts\install_enable.ps1'),
     (Join-Path $projectRoot 'scripts\register_ime.ps1'),
     (Join-Path $projectRoot 'scripts\unregister_ime.ps1'),
