@@ -2416,6 +2416,19 @@ const std::vector<CandidateWindow::DisplayCandidate>& TextService::GetCurrentPag
     return pageCandidatesCache_;
 }
 
+size_t TextService::GetCurrentPageCandidateCount() const {
+    if (allCandidates_.empty()) {
+        return 0;
+    }
+
+    const size_t start = pageIndex_ * pageSize_;
+    if (start >= allCandidates_.size()) {
+        return 0;
+    }
+
+    return std::min(pageSize_, allCandidates_.size() - start);
+}
+
 void TextService::InvalidatePageCandidatesCache() {
     ++candidatesRevision_;
 }
@@ -2787,12 +2800,12 @@ bool TextService::PromoteSelectedCandidateToManualEntry() {
         return false;
     }
 
-    const auto& pageCandidates = GetCurrentPageCandidates();
-    if (pageCandidates.empty()) {
+    const size_t pageCandidateCount = GetCurrentPageCandidateCount();
+    if (pageCandidateCount == 0) {
         return false;
     }
 
-    const size_t safeIndexInPage = std::min(selectedIndexInPage_, pageCandidates.size() - 1);
+    const size_t safeIndexInPage = std::min(selectedIndexInPage_, pageCandidateCount - 1);
     const size_t globalIndex = pageIndex_ * pageSize_ + safeIndexInPage;
     if (globalIndex >= allCandidates_.size()) {
         return false;
@@ -3498,9 +3511,9 @@ STDMETHODIMP TextService::OnKeyDown(ITfContext* context, WPARAM wParam, LPARAM l
     }
 
     if (ctrlPressed && key == VK_DELETE && !compositionCode_.empty()) {
-        const auto& pageCandidates = GetCurrentPageCandidates();
-        if (!pageCandidates.empty()) {
-            const size_t safeIndexInPage = std::min(selectedIndexInPage_, pageCandidates.size() - 1);
+        const size_t pageCandidateCount = GetCurrentPageCandidateCount();
+        if (pageCandidateCount > 0) {
+            const size_t safeIndexInPage = std::min(selectedIndexInPage_, pageCandidateCount - 1);
             BlockCandidateByGlobalIndex(pageIndex_ * pageSize_ + safeIndexInPage);
         }
         *eaten = TRUE;
@@ -3563,9 +3576,9 @@ STDMETHODIMP TextService::OnKeyDown(ITfContext* context, WPARAM wParam, LPARAM l
             boundaryPunctuation);
 
         bool committed = false;
-        const auto& pageCandidates = GetCurrentPageCandidates();
-        if (!pageCandidates.empty()) {
-            const size_t safeIndexInPage = std::min(selectedIndexInPage_, pageCandidates.size() - 1);
+        const size_t pageCandidateCount = GetCurrentPageCandidateCount();
+        if (pageCandidateCount > 0) {
+            const size_t safeIndexInPage = std::min(selectedIndexInPage_, pageCandidateCount - 1);
             const size_t globalIndex = pageIndex_ * pageSize_ + safeIndexInPage;
             committed = CommitCandidateByGlobalIndex(context, globalIndex, 1);
         } else {
@@ -3705,22 +3718,22 @@ STDMETHODIMP TextService::OnKeyDown(ITfContext* context, WPARAM wParam, LPARAM l
     }
 
     if (tabNavigation_ && key == VK_TAB && !compositionCode_.empty()) {
-        const auto& pageCandidates = GetCurrentPageCandidates();
-        if (!pageCandidates.empty()) {
+        const size_t pageCandidateCount = GetCurrentPageCandidateCount();
+        if (pageCandidateCount > 0) {
             if (shiftPressed) {
                 if (selectedIndexInPage_ == 0) {
                     if (pageIndex_ > 0) {
                         pageIndex_ -= 1;
-                        const auto& prevPageCandidates = GetCurrentPageCandidates();
-                        selectedIndexInPage_ = prevPageCandidates.empty() ? 0 : (prevPageCandidates.size() - 1);
+                        const size_t prevPageCandidateCount = GetCurrentPageCandidateCount();
+                        selectedIndexInPage_ = prevPageCandidateCount == 0 ? 0 : (prevPageCandidateCount - 1);
                     } else {
-                        selectedIndexInPage_ = pageCandidates.size() - 1;
+                        selectedIndexInPage_ = pageCandidateCount - 1;
                     }
                 } else {
                     selectedIndexInPage_ -= 1;
                 }
             } else {
-                if (selectedIndexInPage_ + 1 < pageCandidates.size()) {
+                if (selectedIndexInPage_ + 1 < pageCandidateCount) {
                     selectedIndexInPage_ += 1;
                 } else {
                     const size_t totalPages = GetTotalPages();
@@ -3760,16 +3773,16 @@ STDMETHODIMP TextService::OnKeyDown(ITfContext* context, WPARAM wParam, LPARAM l
     }
 
     if ((key == VK_UP || key == VK_DOWN) && !compositionCode_.empty()) {
-        const auto& pageCandidates = GetCurrentPageCandidates();
-        if (!pageCandidates.empty()) {
+        const size_t pageCandidateCount = GetCurrentPageCandidateCount();
+        if (pageCandidateCount > 0) {
             if (key == VK_UP) {
                 if (selectedIndexInPage_ == 0) {
-                    selectedIndexInPage_ = pageCandidates.size() - 1;
+                    selectedIndexInPage_ = pageCandidateCount - 1;
                 } else {
                     selectedIndexInPage_ -= 1;
                 }
             } else {
-                selectedIndexInPage_ = (selectedIndexInPage_ + 1) % pageCandidates.size();
+                selectedIndexInPage_ = (selectedIndexInPage_ + 1) % pageCandidateCount;
             }
             UpdateCandidateWindow();
         }
@@ -3796,8 +3809,8 @@ STDMETHODIMP TextService::OnKeyDown(ITfContext* context, WPARAM wParam, LPARAM l
     selectionOffset = 0;
     if (TryMapSelectionInputToIndex(key, lParam, selectionOffset) && !compositionCode_.empty()) {
         Trace(L"select: begin");
-        const auto& pageCandidates = GetCurrentPageCandidates();
-        if (selectionOffset < pageCandidates.size()) {
+        const size_t pageCandidateCount = GetCurrentPageCandidateCount();
+        if (selectionOffset < pageCandidateCount) {
             const size_t pageStart = pageIndex_ * pageSize_;
             const size_t index = pageStart + selectionOffset;
             CommitCandidateByGlobalIndex(context, index, 3);
@@ -3809,8 +3822,8 @@ STDMETHODIMP TextService::OnKeyDown(ITfContext* context, WPARAM wParam, LPARAM l
     }
 
     if ((key == VK_SPACE || key == VK_RETURN) && !compositionCode_.empty()) {
-        const auto& pageCandidates = GetCurrentPageCandidates();
-        if (pageCandidates.empty()) {
+        const size_t pageCandidateCount = GetCurrentPageCandidateCount();
+        if (pageCandidateCount == 0) {
             const std::wstring rawCode = compositionCode_;
             if (CommitText(context, rawCode)) {
                 ClearComposition();
@@ -3840,14 +3853,14 @@ STDMETHODIMP TextService::OnKeyDown(ITfContext* context, WPARAM wParam, LPARAM l
                         }
                     }
                 } else {
-                    const size_t safeIndexInPage = std::min(selectedIndexInPage_, pageCandidates.size() - 1);
+                    const size_t safeIndexInPage = std::min(selectedIndexInPage_, pageCandidateCount - 1);
                     const size_t globalIndex = pageIndex_ * pageSize_ + safeIndexInPage;
                     if (CommitCandidateByGlobalIndex(context, globalIndex, 2)) {
                         *eaten = TRUE;
                     }
                 }
             } else {
-                const size_t safeIndexInPage = std::min(selectedIndexInPage_, pageCandidates.size() - 1);
+                const size_t safeIndexInPage = std::min(selectedIndexInPage_, pageCandidateCount - 1);
                 const size_t globalIndex = pageIndex_ * pageSize_ + safeIndexInPage;
                 if (CommitCandidateByGlobalIndex(context, globalIndex, 1)) {
                     *eaten = TRUE;

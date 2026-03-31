@@ -98,6 +98,7 @@ private:
     static const wchar_t* GetDictionaryProfileName(DictionaryProfile profile);
     void UpdateCandidateWindow();
     const std::vector<CandidateWindow::DisplayCandidate>& GetCurrentPageCandidates() const;
+    size_t GetCurrentPageCandidateCount() const;
     void InvalidatePageCandidatesCache();
     size_t GetTotalPages() const;
     void ClearComposition();
