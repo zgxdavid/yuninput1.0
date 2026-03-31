@@ -764,45 +764,84 @@ bool CompositionEngine::TryBuildPhraseCodes(const std::wstring& text, std::vecto
 bool CompositionEngine::TryGetSingleCharCodeVariants(wchar_t ch, std::vector<std::wstring>& outCodes) const {
     outCodes.clear();
 
-    std::vector<Entry> matchingEntries;
-    matchingEntries.reserve(16);
+    std::vector<std::wstring> matchingCodes;
+    matchingCodes.reserve(32);
     for (const Entry& entry : entries_) {
         if (entry.text.size() != 1 || entry.text[0] != ch) {
             continue;
         }
-        if (entry.code.empty()) {
+        std::wstring normalized = NormalizeCode(entry.code);
+        if (normalized.empty()) {
             continue;
         }
         if (blockedEntries_.find(MakeFreqKey(entry.code, entry.text)) != blockedEntries_.end()) {
             continue;
         }
-        matchingEntries.push_back(entry);
+        if (std::find(matchingCodes.begin(), matchingCodes.end(), normalized) == matchingCodes.end()) {
+            matchingCodes.push_back(std::move(normalized));
+        }
     }
 
     std::sort(
-        matchingEntries.begin(),
-        matchingEntries.end(),
-        [](const Entry& left, const Entry& right) {
-            if (left.code.size() != right.code.size()) {
-                return left.code.size() > right.code.size();
+        matchingCodes.begin(),
+        matchingCodes.end(),
+        [](const std::wstring& left, const std::wstring& right) {
+            if (left.size() != right.size()) {
+                return left.size() > right.size();
             }
-            if (left.staticScore != right.staticScore) {
-                return left.staticScore > right.staticScore;
-            }
-            return left.loadOrder < right.loadOrder;
+            return left < right;
         });
 
-    constexpr size_t kMaxBaseCodes = 6;
-    size_t baseCount = 0;
-    for (const Entry& entry : matchingEntries) {
-        std::wstring normalized = NormalizeCode(entry.code);
-        if (normalized.empty()) {
+    // Keep representation diversity: full-code and short-code sources should all be able to participate.
+    std::wstring bestFull;
+    std::wstring bestThree;
+    std::wstring bestTwo;
+    std::wstring bestOne;
+    for (const std::wstring& code : matchingCodes) {
+        if (code.size() >= 4) {
+            if (bestFull.empty()) {
+                bestFull = code;
+            }
             continue;
         }
+        if (code.size() == 3) {
+            if (bestThree.empty()) {
+                bestThree = code;
+            }
+            continue;
+        }
+        if (code.size() == 2) {
+            if (bestTwo.empty()) {
+                bestTwo = code;
+            }
+            continue;
+        }
+        if (code.size() == 1) {
+            if (bestOne.empty()) {
+                bestOne = code;
+            }
+        }
+    }
 
-        ExpandCodeToleranceVariants(normalized, outCodes);
+    if (!bestFull.empty()) {
+        ExpandCodeToleranceVariants(bestFull, outCodes);
+    }
+    if (!bestTwo.empty()) {
+        ExpandCodeToleranceVariants(bestTwo, outCodes);
+    }
+    if (!bestOne.empty()) {
+        ExpandCodeToleranceVariants(bestOne, outCodes);
+    }
+    if (!bestThree.empty()) {
+        ExpandCodeToleranceVariants(bestThree, outCodes);
+    }
+
+    constexpr size_t kMaxBaseCodes = 8;
+    size_t baseCount = 0;
+    for (const std::wstring& code : matchingCodes) {
+        ExpandCodeToleranceVariants(code, outCodes);
         ++baseCount;
-        if (baseCount >= kMaxBaseCodes) {
+        if (baseCount >= kMaxBaseCodes || outCodes.size() >= 32) {
             break;
         }
     }
