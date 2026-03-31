@@ -1,0 +1,7 @@
+Yuninput 安装器许可证中文说明（参考）
+
+本安装器所展示的许可证条款以 tools/msi/license.rtf 为准。
+该许可证对应 GPL-3.0-or-later 许可策略。
+
+中文说明仅用于阅读参考，不构成对 license.rtf 原文的替代。
+如有歧义，请以英文原文及 GPL 官方文本为准。
