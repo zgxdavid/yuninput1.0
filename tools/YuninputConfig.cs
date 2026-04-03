@@ -9,7 +9,7 @@ using System.Windows.Forms;
 
 internal static class ConfigDefaults
 {
-    public const string DefaultDictionaryProfile = "zhengma-large";
+    public const string DefaultDictionaryProfile = "zhengma-all";
     public const decimal MinPageSize = 1;
     public const decimal MaxPageSize = 6;
     public const decimal DefaultPageSize = 6;
@@ -33,6 +33,7 @@ internal sealed class CandidateEntryItem
     public string Code;
     public string Text;
     public string RawLine;
+    public bool IsAutoPhrase;
 
     public override string ToString()
     {
@@ -117,8 +118,8 @@ public class ConfigForm : Form
         Directory.CreateDirectory(roamingRoot);
 
         cfgPath = Path.Combine(localRoot, "settings.json");
-        userDictPath = Path.Combine(roamingRoot, "user_dict.txt");
-        autoPhraseDictPath = Path.Combine(localRoot, "auto_phrase_dict.txt");
+        userDictPath = Path.Combine(roamingRoot, "yuninput_user.dict");
+        autoPhraseDictPath = userDictPath;
         userFreqPath = Path.Combine(roamingRoot, "user_freq.txt");
         blockedPath = Path.Combine(roamingRoot, "blocked_entries.txt");
         contextAssocPath = Path.Combine(roamingRoot, "context_assoc.txt");
@@ -209,7 +210,7 @@ public class ConfigForm : Form
 
         tab.Controls.Add(new Label { Left = 420, Top = 124, Width = 170, Text = "\u7801\u8868\u6a21\u5f0f" });
         cmbDictionaryProfile = new ComboBox { Left = 598, Top = 120, Width = 170, DropDownStyle = ComboBoxStyle.DropDownList };
-        cmbDictionaryProfile.Items.Add("zhengma-large");
+        cmbDictionaryProfile.Items.Add("zhengma-all");
         cmbDictionaryProfile.Items.Add("zhengma-large-pinyin");
         cmbDictionaryProfile.SelectedItem = ConfigDefaults.DefaultDictionaryProfile;
         tab.Controls.Add(cmbDictionaryProfile);
@@ -245,7 +246,7 @@ public class ConfigForm : Form
             Top = 232,
             Width = 300,
             Height = 30,
-            Text = "\u7ba1\u7406\u81ea\u542f\u9020\u8bcd\uff08\u81ea\u52a8\u9020\u8bcd\uff09"
+            Text = "\u7ba1\u7406\u81ea\u9020\u8bcd\uff08yuninput_user.dict\uff09"
         };
         btnOpenAutoPhraseFromGeneral.Click += (s, e) => OpenAutoPhraseManagerDialog();
         tab.Controls.Add(btnOpenAutoPhraseFromGeneral);
@@ -303,7 +304,7 @@ public class ConfigForm : Form
         btnRefreshBlocked.Click += (s, e) => RefreshDataLists();
 
         var btnManageAutoPhrase = new Button { Left = 20, Top = 458, Width = 180, Text = "\u7ba1\u7406\u81ea\u542f\u9020\u8bcd\uff08\u81ea\u52a8\u9020\u8bcd\uff09" };
-        var btnOpenAutoPhraseFolder = new Button { Left = 208, Top = 458, Width = 164, Text = "\u6253\u5f00\u81ea\u52a8\u9020\u8bcd\u76ee\u5f55" };
+        var btnOpenAutoPhraseFolder = new Button { Left = 208, Top = 458, Width = 164, Text = "\u6253\u5f00\u7528\u6237\u8bcd\u5178\u76ee\u5f55" };
         var btnOpenPhraseReview = new Button { Left = 380, Top = 458, Width = 130, Text = "\u9020\u8bcd\u96c6\u4e2d\u5ba1\u9605" };
         btnManageAutoPhrase.Click += (s, e) => OpenAutoPhraseManagerDialog();
         btnOpenAutoPhraseFolder.Click += (s, e) =>
@@ -322,7 +323,7 @@ public class ConfigForm : Form
             Top = 432,
             Width = 740,
             Height = 24,
-            Text = "\u8fd9\u91cc\u7ba1\u7406\u7684\u662f\u7528\u6237\u76ee\u5f55\u4e0b\u7684\u663e\u5f0f\u7f6e\u9876\u8bcd\u548c\u5c4f\u853d\u8bcd\u3002\u201c\u7ba1\u7406\u81ea\u542f\u9020\u8bcd\uff08\u81ea\u52a8\u9020\u8bcd\uff09\u201d\u53ef\u8fdb\u5165\u81ea\u52a8\u9020\u8bcd\u589e\u5220\u6539\u67e5\u9762\u677f\u3002"
+            Text = "\u8fd9\u91cc\u53ea\u7ba1\u7406 yuninput_user.dict \u91cc\u7684\u7528\u6237\u8bcd\u6761\uff1a\u624b\u5de5\u7f6e\u9876\u8bcd\u3001\u81ea\u52a8\u9020\u8bcd\u548c\u5c4f\u853d\u8bcd\u3002\u914d\u7f6e\u5de5\u5177\u4e0d\u5bf9\u7cfb\u7edf\u8bcd\u5e93 zhengma-all.dict \u6216 yuninput_user-extend.dict \u63d0\u4f9b\u589e\u5220\u6539\u67e5\u3002"
         });
 
         tab.Controls.Add(new Label
@@ -331,22 +332,34 @@ public class ConfigForm : Form
             Top = 462,
             Width = 320,
             Height = 20,
-            Text = "\u81ea\u9020\u8bcd\u6587\u4ef6: " + ResolveAutoPhrasePath()
+            Text = "\u7528\u6237\u8bcd\u5178\u6587\u4ef6: " + userDictPath
         });
+    }
+
+    private string ResolveProductDataRoot()
+    {
+        string baseDir = AppDomain.CurrentDomain.BaseDirectory;
+        string[] candidates = new[]
+        {
+            Path.Combine(baseDir, "data"),
+            Path.GetFullPath(Path.Combine(baseDir, "..", "data")),
+            Path.Combine(localRoot, "data")
+        };
+
+        foreach (string candidate in candidates)
+        {
+            if (Directory.Exists(candidate))
+            {
+                return candidate;
+            }
+        }
+
+        return candidates[0];
     }
 
     private string ResolveAutoPhrasePath()
     {
-        string roamingAutoPhrase = Path.Combine(roamingRoot, "auto_phrase_dict.txt");
-        if (File.Exists(autoPhraseDictPath))
-        {
-            return autoPhraseDictPath;
-        }
-        if (File.Exists(roamingAutoPhrase))
-        {
-            return roamingAutoPhrase;
-        }
-        return autoPhraseDictPath;
+        return userDictPath;
     }
 
     private void OpenAutoPhraseManagerDialog()
@@ -362,8 +375,8 @@ public class ConfigForm : Form
         {
             var initLines = new[]
             {
-                "# auto_phrase_dict.txt",
-                "# format: code phrase [optional_score]",
+                "# yuninput_user.dict",
+                "# format: code phrase [optional_score] [optional_source_tag:auto]",
                 "# delete unwanted lines and save"
             };
             File.WriteAllLines(path, initLines, Encoding.UTF8);
@@ -371,7 +384,7 @@ public class ConfigForm : Form
 
         var dialog = new Form
         {
-            Text = "自造词管理",
+            Text = "自造词管理（yuninput_user.dict）",
             Width = 760,
             Height = 560,
             StartPosition = FormStartPosition.CenterParent,
@@ -383,7 +396,7 @@ public class ConfigForm : Form
         var txtFilter = new TextBox { Left = 72, Top = 14, Width = 488 };
         var btnRefresh = new Button { Left = 568, Top = 12, Width = 80, Text = "刷新" };
         var btnOpenFile = new Button { Left = 654, Top = 12, Width = 88, Text = "打开文件" };
-        var lstAuto = new ListBox { Left = 16, Top = 44, Width = 726, Height = 338 };
+        var lstAuto = new ListBox { Left = 16, Top = 44, Width = 726, Height = 338, SelectionMode = SelectionMode.MultiExtended };
 
         var lblCode = new Label { Left = 16, Top = 392, Width = 58, Height = 22, Text = "编码:" };
         var txtCode = new TextBox { Left = 72, Top = 388, Width = 224 };
@@ -419,6 +432,11 @@ public class ConfigForm : Form
             lstAuto.Items.Clear();
             foreach (CandidateEntryItem item in ReadEntryFile(path))
             {
+                if (!item.IsAutoPhrase)
+                {
+                    continue;
+                }
+
                 if (!string.IsNullOrEmpty(keyword) &&
                     item.Code.IndexOf(keyword, StringComparison.OrdinalIgnoreCase) < 0 &&
                     item.Text.IndexOf(keyword, StringComparison.OrdinalIgnoreCase) < 0)
@@ -450,6 +468,13 @@ public class ConfigForm : Form
 
         lstAuto.SelectedIndexChanged += (s, e) =>
         {
+            if (lstAuto.SelectedItems.Count != 1)
+            {
+                txtCode.Text = string.Empty;
+                txtText.Text = string.Empty;
+                return;
+            }
+
             CandidateEntryItem item = lstAuto.SelectedItem as CandidateEntryItem;
             if (item == null)
             {
@@ -481,7 +506,7 @@ public class ConfigForm : Form
 
             if (!exists)
             {
-                File.AppendAllText(path, code + " " + text + Environment.NewLine, Encoding.UTF8);
+                File.AppendAllText(path, code + " " + text + " 1 auto" + Environment.NewLine, Encoding.UTF8);
             }
 
             refresh();
@@ -489,6 +514,12 @@ public class ConfigForm : Form
 
         btnUpdate.Click += (s, e) =>
         {
+            if (lstAuto.SelectedItems.Count != 1)
+            {
+                MessageBox.Show("请先单选一条要修改的词条", "匀码输入法", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+
             CandidateEntryItem selected = lstAuto.SelectedItem as CandidateEntryItem;
             if (selected == null)
             {
@@ -503,7 +534,7 @@ public class ConfigForm : Form
                 return;
             }
 
-            string newLine = newCode + " " + newText;
+            string newLine = newCode + " " + newText + " 1 auto";
             var lines = new List<string>();
             bool replaced = false;
             foreach (string line in File.ReadAllLines(path, Encoding.UTF8))
@@ -535,13 +566,22 @@ public class ConfigForm : Form
 
         btnDelete.Click += (s, e) =>
         {
-            CandidateEntryItem item = lstAuto.SelectedItem as CandidateEntryItem;
-            if (item == null)
+            var selectedItems = new List<CandidateEntryItem>();
+            foreach (object selectedItem in lstAuto.SelectedItems)
+            {
+                CandidateEntryItem item = selectedItem as CandidateEntryItem;
+                if (item != null)
+                {
+                    selectedItems.Add(item);
+                }
+            }
+
+            if (selectedItems.Count == 0)
             {
                 return;
             }
 
-            WriteFilteredFile(path, item);
+            RemoveEntryItemsFromFile(path, selectedItems);
             refresh();
         };
 
@@ -590,15 +630,33 @@ public class ConfigForm : Form
 
     private static void RemoveLineFromFile(string path, string rawLine)
     {
+        RemoveLinesFromFile(path, new[] { rawLine });
+    }
+
+    private static void RemoveLinesFromFile(string path, IEnumerable<string> rawLines)
+    {
+        var removalCounts = new Dictionary<string, int>(StringComparer.Ordinal);
+        foreach (string rawLine in rawLines)
+        {
+            if (string.IsNullOrEmpty(rawLine))
+            {
+                continue;
+            }
+
+            int count;
+            removalCounts.TryGetValue(rawLine, out count);
+            removalCounts[rawLine] = count + 1;
+        }
+
         var remaining = new List<string>();
-        bool removed = false;
         if (File.Exists(path))
         {
             foreach (string line in File.ReadAllLines(path, Encoding.UTF8))
             {
-                if (!removed && string.Equals(line, rawLine, StringComparison.Ordinal))
+                int count;
+                if (removalCounts.TryGetValue(line, out count) && count > 0)
                 {
-                    removed = true;
+                    removalCounts[line] = count - 1;
                     continue;
                 }
 
@@ -658,13 +716,13 @@ public class ConfigForm : Form
             MaximizeBox = false
         };
 
-        var grpAuto = new GroupBox { Left = 14, Top = 12, Width = 430, Height = 458, Text = "\u81ea\u52a8\u9020\u8bcd\uff08auto_phrase_dict.txt\uff09" };
+        var grpAuto = new GroupBox { Left = 14, Top = 12, Width = 430, Height = 458, Text = "\u81ea\u52a8\u9020\u8bcd\uff08\u5b58\u4e8e yuninput_user.dict\uff09" };
         var grpManual = new GroupBox { Left = 456, Top = 12, Width = 430, Height = 458, Text = "\u624b\u5de5\u9020\u8bcd\u65e5\u5fd7\uff08manual_phrase_review.txt\uff09" };
         dialog.Controls.Add(grpAuto);
         dialog.Controls.Add(grpManual);
 
-        var lstAuto = new ListBox { Left = 12, Top = 24, Width = 404, Height = 300 };
-        var lstManual = new ListBox { Left = 12, Top = 56, Width = 404, Height = 328 };
+        var lstAuto = new ListBox { Left = 12, Top = 24, Width = 404, Height = 300, SelectionMode = SelectionMode.MultiExtended };
+        var lstManual = new ListBox { Left = 12, Top = 56, Width = 404, Height = 328, SelectionMode = SelectionMode.MultiExtended };
         var lblAutoCode = new Label { Left = 12, Top = 332, Width = 36, Height = 22, Text = "\u7801:" };
         var txtAutoCode = new TextBox { Left = 52, Top = 328, Width = 120 };
         var lblAutoText = new Label { Left = 180, Top = 332, Width = 36, Height = 22, Text = "\u8bcd:" };
@@ -697,7 +755,7 @@ public class ConfigForm : Form
         var btnAutoDelete = new Button { Left = 12, Top = 422, Width = 110, Text = "\u5220\u9664\u9009\u4e2d\u81ea\u52a8\u8bcd" };
         var btnManualDelete = new Button { Left = 12, Top = 422, Width = 110, Text = "\u5220\u9664\u9009\u4e2d\u65e5\u5fd7" };
         var btnRefresh = new Button { Left = 680, Top = 482, Width = 86, Text = "\u5237\u65b0" };
-        var btnOpenFiles = new Button { Left = 772, Top = 482, Width = 114, Text = "\u6253\u5f00\u4e24\u4e2a\u6587\u4ef6" };
+        var btnOpenFiles = new Button { Left = 736, Top = 482, Width = 150, Text = "\u6253\u5f00\u7528\u6237\u8bcd\u5178\u4e0e\u65e5\u5fd7" };
         var btnClose = new Button { Left = 588, Top = 482, Width = 86, Text = "\u5173\u95ed" };
         grpAuto.Controls.Add(btnAutoDelete);
         grpManual.Controls.Add(btnManualDelete);
@@ -711,6 +769,11 @@ public class ConfigForm : Form
             lstAuto.Items.Clear();
             foreach (CandidateEntryItem item in ReadEntryFile(autoPhrasePath))
             {
+                if (!item.IsAutoPhrase)
+                {
+                    continue;
+                }
+
                 lstAuto.Items.Add(item);
             }
             lstAuto.EndUpdate();
@@ -754,18 +817,34 @@ public class ConfigForm : Form
 
         btnAutoDelete.Click += (s, e) =>
         {
-            CandidateEntryItem item = lstAuto.SelectedItem as CandidateEntryItem;
-            if (item == null)
+            var selectedItems = new List<CandidateEntryItem>();
+            foreach (object selectedItem in lstAuto.SelectedItems)
+            {
+                CandidateEntryItem item = selectedItem as CandidateEntryItem;
+                if (item != null)
+                {
+                    selectedItems.Add(item);
+                }
+            }
+
+            if (selectedItems.Count == 0)
             {
                 return;
             }
 
-            WriteFilteredFile(autoPhrasePath, item);
+            RemoveEntryItemsFromFile(autoPhrasePath, selectedItems);
             refresh();
         };
 
         lstAuto.SelectedIndexChanged += (s, e) =>
         {
+            if (lstAuto.SelectedItems.Count != 1)
+            {
+                txtAutoCode.Text = string.Empty;
+                txtAutoText.Text = string.Empty;
+                return;
+            }
+
             CandidateEntryItem item = lstAuto.SelectedItem as CandidateEntryItem;
             if (item == null)
             {
@@ -794,6 +873,11 @@ public class ConfigForm : Form
             bool exists = false;
             foreach (CandidateEntryItem item in ReadEntryFile(autoPhrasePath))
             {
+                if (!item.IsAutoPhrase)
+                {
+                    continue;
+                }
+
                 if (string.Equals(item.Code, code, StringComparison.OrdinalIgnoreCase) && string.Equals(item.Text, text, StringComparison.Ordinal))
                 {
                     exists = true;
@@ -802,7 +886,7 @@ public class ConfigForm : Form
             }
             if (!exists)
             {
-                File.AppendAllText(autoPhrasePath, code + " " + text + Environment.NewLine, Encoding.UTF8);
+                File.AppendAllText(autoPhrasePath, code + " " + text + " 1 auto" + Environment.NewLine, Encoding.UTF8);
             }
 
             refresh();
@@ -810,13 +894,22 @@ public class ConfigForm : Form
 
         btnManualDelete.Click += (s, e) =>
         {
-            PhraseReviewLogItem item = lstManual.SelectedItem as PhraseReviewLogItem;
-            if (item == null)
+            var selectedLines = new List<string>();
+            foreach (object selectedItem in lstManual.SelectedItems)
+            {
+                PhraseReviewLogItem item = selectedItem as PhraseReviewLogItem;
+                if (item != null && !string.IsNullOrEmpty(item.RawLine))
+                {
+                    selectedLines.Add(item.RawLine);
+                }
+            }
+
+            if (selectedLines.Count == 0)
             {
                 return;
             }
 
-            RemoveLineFromFile(manualPhraseReviewPath, item.RawLine);
+            RemoveLinesFromFile(manualPhraseReviewPath, selectedLines);
             refresh();
         };
 
@@ -1049,6 +1142,7 @@ public class ConfigForm : Form
 
         string dictionaryProfile = ParseString(text, "dictionary_profile", ConfigDefaults.DefaultDictionaryProfile);
         if (dictionaryProfile == "zhengma-large-pinyin" || dictionaryProfile == "pinyin") cmbDictionaryProfile.SelectedItem = "zhengma-large-pinyin";
+        else if (dictionaryProfile == "zhengma-all" || dictionaryProfile == "zhengma-large") cmbDictionaryProfile.SelectedItem = ConfigDefaults.DefaultDictionaryProfile;
         else cmbDictionaryProfile.SelectedItem = ConfigDefaults.DefaultDictionaryProfile;
     }
 
@@ -1104,11 +1198,25 @@ public class ConfigForm : Form
             {
                 Code = parts[0],
                 Text = parts[1],
-                RawLine = line
+                RawLine = line,
+                IsAutoPhrase = HasAutoPhraseTag(parts)
             });
         }
 
         return result;
+    }
+
+    private static bool HasAutoPhraseTag(string[] parts)
+    {
+        for (int i = 2; i < parts.Length; i++)
+        {
+            if (string.Equals(parts[i], "auto", StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     private static List<ContextAssocItem> ReadContextAssocFile(string path)
@@ -1196,6 +1304,11 @@ public class ConfigForm : Form
 
         foreach (CandidateEntryItem item in ReadEntryFile(userDictPath))
         {
+            if (item.IsAutoPhrase)
+            {
+                continue;
+            }
+
             lstPinned.Items.Add(item);
         }
 
@@ -1428,7 +1541,7 @@ public class ConfigForm : Form
             previewLines.Add("generated_at=" + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"));
             previewLines.Add("entries=" + ranked.Count);
             previewLines.Add("max_entries=" + maxEntries);
-            previewLines.Add("source_files=user_dict.txt,user_freq.txt");
+            previewLines.Add("source_files=yuninput_user.dict,user_freq.txt");
             previewLines.Add("skipped_invalid_pairs=" + localSkippedInvalidPairs);
             previewLines.Add("skipped_blacklisted_pairs=" + localSkippedBlacklistedPairs);
             previewLines.Add("preview_top=30");
@@ -1536,6 +1649,25 @@ public class ConfigForm : Form
 
         Directory.CreateDirectory(Path.GetDirectoryName(path));
         File.WriteAllLines(path, remaining.ToArray(), Encoding.UTF8);
+    }
+
+    private static void RemoveEntryItemsFromFile(string path, IEnumerable<CandidateEntryItem> removedItems)
+    {
+        var rawLines = new List<string>();
+        foreach (CandidateEntryItem item in removedItems)
+        {
+            if (item != null && !string.IsNullOrEmpty(item.RawLine))
+            {
+                rawLines.Add(item.RawLine);
+            }
+        }
+
+        if (rawLines.Count == 0)
+        {
+            return;
+        }
+
+        RemoveLinesFromFile(path, rawLines);
     }
 }
 

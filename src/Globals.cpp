@@ -61,9 +61,9 @@ bool GetModulePath(std::wstring& outPath) {
 
 bool EnsureUserDataDirectory(std::wstring& outDir) {
     wchar_t dataRoot[MAX_PATH] = {};
-    DWORD len = GetEnvironmentVariableW(L"LOCALAPPDATA", dataRoot, MAX_PATH);
+    DWORD len = GetEnvironmentVariableW(L"APPDATA", dataRoot, MAX_PATH);
     if (len == 0 || len >= MAX_PATH) {
-        len = GetEnvironmentVariableW(L"APPDATA", dataRoot, MAX_PATH);
+        len = GetEnvironmentVariableW(L"LOCALAPPDATA", dataRoot, MAX_PATH);
         if (len == 0 || len >= MAX_PATH) {
             return false;
         }

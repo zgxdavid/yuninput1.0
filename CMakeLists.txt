@@ -50,3 +50,17 @@ target_compile_definitions(yuninput_sort_probe PRIVATE
     WIN32_LEAN_AND_MEAN
 )
 
+add_executable(yuninput_user_dict_builder
+    src/CompositionEngine.cpp
+    tools/user_dict_builder.cpp
+)
+
+target_include_directories(yuninput_user_dict_builder PRIVATE include)
+
+target_compile_definitions(yuninput_user_dict_builder PRIVATE
+    UNICODE
+    _UNICODE
+    NOMINMAX
+    WIN32_LEAN_AND_MEAN
+)
+

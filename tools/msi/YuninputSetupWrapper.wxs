@@ -3,15 +3,16 @@
      xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui">
   <Package
     Name="Yuninput 1.0"
-    Manufacturer="Intel Corporation"
+    Manufacturer="David Chang of Intel"
     Version="$(var.ProductVersion)"
     UpgradeCode="9e1b9cbe-51d3-4e27-a2a8-6a4f36f28ec0"
     Language="2052"
     Scope="perMachine">
 
-    <SummaryInformation Description="Yuninput 1.0 installer" Manufacturer="Intel Corporation" />
+    <SummaryInformation Description="Yuninput 1.0 installer" Manufacturer="David Chang of Intel" />
     <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
     <MajorUpgrade DowngradeErrorMessage="已安装更新版本的 Yuninput，无法安装较旧版本。" />
+    <Property Id="ARPCONTACT" Value="inteldavid@189.cn" />
 
     <StandardDirectory Id="ProgramFiles64Folder">
       <Directory Id="INSTALLROOT" Name="Yuninput">
@@ -127,12 +128,44 @@
         <File Id="filBasicDict" Source="$(var.ProductSourceDir)\data\yuninput_basic.dict" KeyPath="yes" />
       </Component>
 
+      <Component Id="cmpUserDict" Directory="INSTALLDATA" Guid="*">
+        <File Id="filUserDict" Source="$(var.ProductSourceDir)\data\yuninput_user.dict" KeyPath="yes" />
+      </Component>
+
+      <Component Id="cmpUserDictRules" Directory="INSTALLDATA" Guid="*">
+        <File Id="filUserDictRules" Source="$(var.ProductSourceDir)\data\yuninput_user.dict.rules" KeyPath="yes" />
+      </Component>
+
+      <Component Id="cmpUserExtendDict" Directory="INSTALLDATA" Guid="*">
+        <File Id="filUserExtendDict" Source="$(var.ProductSourceDir)\data\yuninput_user-extend.dict" KeyPath="yes" />
+      </Component>
+
+      <Component Id="cmpZhengmaAllDict" Directory="INSTALLDATA" Guid="*">
+        <File Id="filZhengmaAllDict" Source="$(var.ProductSourceDir)\data\zhengma-all.dict" KeyPath="yes" />
+      </Component>
+
+      <Component Id="cmpZhengmaAllDictRules" Directory="INSTALLDATA" Guid="*">
+        <File Id="filZhengmaAllDictRules" Source="$(var.ProductSourceDir)\data\zhengma-all.dict.rules" KeyPath="yes" />
+      </Component>
+
+      <Component Id="cmpZhengmaSingleDict" Directory="INSTALLDATA" Guid="*">
+        <File Id="filZhengmaSingleDict" Source="$(var.ProductSourceDir)\data\zhengma-single.dict" KeyPath="yes" />
+      </Component>
+
       <Component Id="cmpZhengmaDict" Directory="INSTALLDATA" Guid="*">
         <File Id="filZhengmaDict" Source="$(var.ProductSourceDir)\data\zhengma.dict" KeyPath="yes" />
       </Component>
 
+      <Component Id="cmpZhengmaDictRules" Directory="INSTALLDATA" Guid="*">
+        <File Id="filZhengmaDictRules" Source="$(var.ProductSourceDir)\data\zhengma.dict.rules" KeyPath="yes" />
+      </Component>
+
       <Component Id="cmpZhengmaLargeDict" Directory="INSTALLDATA" Guid="*">
         <File Id="filZhengmaLargeDict" Source="$(var.ProductSourceDir)\data\zhengma-large.dict" KeyPath="yes" />
+      </Component>
+
+      <Component Id="cmpZhengmaLargeDictRules" Directory="INSTALLDATA" Guid="*">
+        <File Id="filZhengmaLargeDictRules" Source="$(var.ProductSourceDir)\data\zhengma-large.dict.rules" KeyPath="yes" />
       </Component>
 
       <Component Id="cmpZhengmaPinyinDict" Directory="INSTALLDATA" Guid="*">

@@ -3,7 +3,8 @@ param(
     [string]$InstallRoot = "$env:LOCALAPPDATA\\yuninput",
     [string]$LogPath = "",
     [switch]$SkipElevation,
-    [switch]$NonInteractive
+    [switch]$NonInteractive,
+    [switch]$ForceElevation
 )
 
 $ErrorActionPreference = 'Stop'
@@ -85,6 +86,28 @@ Write-InstallLog "install_enable.ps1 mode. SkipElevation=$SkipElevation NonInter
 $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
 $principal = [Security.Principal.WindowsPrincipal]::new($identity)
 $isAdmin = $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+$inVsCodeHost = -not [string]::IsNullOrWhiteSpace($env:VSCODE_PID)
+
+if (-not $isAdmin -and -not $SkipElevation -and $inVsCodeHost) {
+    $SkipElevation = $true
+    Write-Warning 'Detected non-admin VS Code terminal. Auto-enabling -SkipElevation to avoid hidden UAC prompt blocking.'
+    Write-InstallLog 'VS Code non-admin session detected. Auto-enabled SkipElevation to avoid hidden UAC prompt.'
+}
+
+# In headless/non-interactive runs (e.g., CI or integrated terminals without UAC surface),
+# attempting -Verb RunAs can block waiting for a dialog that never appears.
+if (-not $isAdmin -and $NonInteractive -and -not $SkipElevation) {
+    $SkipElevation = $true
+    Write-Warning 'NonInteractive mode without admin rights: auto-enabling -SkipElevation to avoid waiting on UAC prompt.'
+    Write-InstallLog 'NonInteractive+non-admin detected. Auto-enabled SkipElevation to avoid UAC blocking.'
+}
+
+if (-not $isAdmin -and -not $SkipElevation -and -not $ForceElevation) {
+    $SkipElevation = $true
+    Write-Warning 'Non-admin session detected. Auto-enabling -SkipElevation to avoid hidden UAC prompt blocking.'
+    Write-InstallLog 'Non-admin session detected. Auto-enabled SkipElevation by default.'
+}
+
 if (-not $isAdmin -and -not $SkipElevation) {
     $quotedScript = '"' + $PSCommandPath + '"'
     $quotedInstallRoot = '"' + $InstallRoot + '"'
@@ -154,6 +177,7 @@ $buildScript = Join-Path $PSScriptRoot 'build_release.ps1'
 $configBuildScript = Join-Path $PSScriptRoot 'build_config_app.ps1'
 $registerScript = Join-Path $PSScriptRoot 'register_ime.ps1'
 $unregisterScript = Join-Path $PSScriptRoot 'unregister_ime.ps1'
+$inspectScript = Join-Path $PSScriptRoot 'inspect_ime_state.ps1'
 
 $srcDll = Join-Path $projectRoot 'build\Release\yuninput.dll'
 $fallbackSrcDll = Join-Path $projectRoot 'bin\yuninput.dll'
@@ -234,6 +258,48 @@ function New-StagedDllPath {
     return (Join-Path $Directory ("yuninput_" + $stamp + ".dll"))
 }
 
+function Remove-StaleDllPayloads {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Directory,
+        [Parameter(Mandatory = $true)]
+        [string[]]$KeepPaths
+    )
+
+    if (-not (Test-Path $Directory)) {
+        return
+    }
+
+    $keepSet = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($keepPath in $KeepPaths) {
+        if ([string]::IsNullOrWhiteSpace($keepPath)) {
+            continue
+        }
+
+        try {
+            $resolvedKeepPath = (Resolve-Path -Path $keepPath -ErrorAction Stop).Path
+            [void]$keepSet.Add($resolvedKeepPath)
+        }
+        catch {
+        }
+    }
+
+    Get-ChildItem -Path $Directory -Filter 'yuninput_*.dll' -File -ErrorAction SilentlyContinue | ForEach-Object {
+        $stalePath = $_.FullName
+        if ($keepSet.Contains($_.FullName)) {
+            return
+        }
+
+        try {
+            Remove-Item -LiteralPath $stalePath -Force -ErrorAction Stop
+            Write-InstallLog "Removed stale staged DLL: $stalePath"
+        }
+        catch {
+            Write-InstallLog "Warning: stale staged DLL still locked: ${stalePath} :: $($_.Exception.Message)"
+        }
+    }
+}
+
 Write-Host "Install root: $InstallRoot"
 Write-Host "Install log: $LogPath"
 Write-InstallLog 'Running in elevated context.'
@@ -295,7 +361,26 @@ try {
 
     Stop-InputProcesses
     $registeredDllPath = $dllPath
-    if (-not (Test-SameResolvedPath -Left $srcDll -Right $dllPath)) {
+    $preferFreshStagedDll = -not $isAdmin
+    if ($preferFreshStagedDll) {
+        # Non-admin installs cannot reliably replace a loaded in-use DLL in-place.
+        # Always register a fresh staged DLL path so each install is guaranteed to switch binaries.
+        $registeredDllPath = New-StagedDllPath -Directory $binDir
+
+        try {
+            if (-not (Test-SameResolvedPath -Left $srcDll -Right $dllPath)) {
+                Copy-WithRetry -Source $srcDll -Destination $dllPath
+                Write-InstallLog "Copied canonical DLL to: $dllPath"
+            }
+        }
+        catch {
+            Write-InstallLog "Warning: canonical DLL copy failed (can continue with staged path): $($_.Exception.Message)"
+        }
+
+        Copy-WithRetry -Source $srcDll -Destination $registeredDllPath
+        Write-InstallLog "Prepared fresh staged DLL for registration: $registeredDllPath"
+    }
+    elseif (-not (Test-SameResolvedPath -Left $srcDll -Right $dllPath)) {
         try {
             Copy-WithRetry -Source $srcDll -Destination $dllPath
             Write-InstallLog "Copied DLL to: $dllPath"
@@ -312,11 +397,9 @@ try {
     }
 
     if (Test-Path $srcDataDir) {
-        Get-ChildItem -Path $srcDataDir -Filter '*.dict' -File | ForEach-Object {
-            if ($_.Name -ieq 'yuninput_user.dict') {
-                return
-            }
-
+        Get-ChildItem -Path $srcDataDir -File | Where-Object {
+            $_.Name -match '\.dict(\.rules)?$'
+        } | ForEach-Object {
             $destination = Join-Path $dataDir $_.Name
             if (-not (Test-SameResolvedPath -Left $_.FullName -Right $destination)) {
                 Copy-Item $_.FullName $destination -Force
@@ -326,7 +409,12 @@ try {
     if (Test-Path $srcConfigExe) {
         $installedConfigExe = Join-Path $InstallRoot 'yuninput_config.exe'
         if (-not (Test-SameResolvedPath -Left $srcConfigExe -Right $installedConfigExe)) {
-            Copy-Item $srcConfigExe $installedConfigExe -Force
+            try {
+                Copy-WithRetry -Source $srcConfigExe -Destination $installedConfigExe
+            }
+            catch {
+                Write-InstallLog "Warning: config executable copy failed and will be skipped: $($_.Exception.Message)"
+            }
         }
     }
 
@@ -346,7 +434,7 @@ try {
     "context_association_enabled": true,
     "context_association_max_entries": 6000,
     "candidate_page_size": 6,
-        "dictionary_profile": "zhengma-large",
+        "dictionary_profile": "zhengma-all",
   "toggle_hotkey": "F9"
 }
 "@ | Set-Content -Encoding utf8 $settingsPath
@@ -354,12 +442,29 @@ try {
 
     Write-InstallLog "Registering DLL: $registeredDllPath"
     try {
+        $registerArgs = @{
+            DllPath = $registeredDllPath
+        }
+        if (-not $isAdmin) {
+            $registerArgs.SkipComRegistration = $true
+            $registerArgs.CurrentUserOnly = $true
+            Write-InstallLog 'Non-admin install detected. Using current-user registration mode.'
+        }
+        if ($SkipElevation) {
+            $registerArgs.SkipElevation = $true
+        }
         if ($NonInteractive) {
-            & $registerScript -DllPath $registeredDllPath -MachineOnly -LogPath (Join-Path $env:ProgramData 'Yuninput\register_machine.log')
+            $registerArgs.MachineOnly = $true
+            $registerArgs.LogPath = (Join-Path $env:ProgramData 'Yuninput\register_machine.log')
         }
-        else {
-            & $registerScript -DllPath $registeredDllPath
+
+        if ($NonInteractive -and -not $isAdmin) {
+            $registerArgs.Remove('CurrentUserOnly') | Out-Null
+            $registerArgs.Remove('SkipComRegistration') | Out-Null
+            Write-InstallLog 'Warning: NonInteractive non-admin install cannot perform machine registration.'
         }
+
+        & $registerScript @registerArgs
     }
     catch {
         $registerMessage = $_.Exception.Message
@@ -369,6 +474,18 @@ try {
         }
         else {
             throw
+        }
+    }
+
+    Remove-StaleDllPayloads -Directory $binDir -KeepPaths @($registeredDllPath, $dllPath)
+
+    if (-not $isAdmin -and -not $NonInteractive -and (Test-Path $inspectScript)) {
+        try {
+            Write-InstallLog 'Repairing current-user TIP profile metadata after non-admin install.'
+            & $inspectScript -RepairCurrentUserProfile -RestartCtfmon | Out-Null
+        }
+        catch {
+            Write-InstallLog "Warning: current-user TIP profile repair failed: $($_.Exception.Message)"
         }
     }
 

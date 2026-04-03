@@ -6,9 +6,12 @@
 #include "CandidateWindow.h"
 #include "CompositionEngine.h"
 
+#include <condition_variable>
 #include <deque>
 #include <filesystem>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -47,15 +50,18 @@ private:
         std::wstring code;
         std::wstring commitCode;
         std::uint64_t contextScore = 0;
+        std::uint64_t learnedScore = 0;
         bool exactMatch = false;
         bool boostedUser = false;
         bool boostedLearned = false;
         bool boostedContext = false;
         bool fromAutoPhrase = false;
+        bool fromSessionAutoPhrase = false;
         bool fromSystemDict = false;
         bool boostedAutoRepeat = false;
         bool sortSingleChar = false;
         bool sortAutoOnly = false;
+        bool sortSystemFiveCodePhrase = false;
         bool sortGB2312Text = false;
         bool sortNonGB2312Single = false;
         bool sortOneCodeSingle = false;
@@ -64,6 +70,12 @@ private:
         std::uint8_t sortPrimaryTier = 7;
         std::uint8_t sortShortCodeTier = 3;
         size_t consumedLength = 0;
+    };
+
+    struct SessionAutoPhraseEntry {
+        std::wstring text;
+        std::vector<std::wstring> codes;
+        ULONGLONG lastTick = 0;
     };
 
     struct CommitHistoryItem {
@@ -75,6 +87,15 @@ private:
     struct PendingPhraseStat {
         int hitCount = 0;
         ULONGLONG lastTick = 0;
+    };
+
+    struct PendingAsyncFileWrite {
+        std::wstring path;
+        std::string content;
+        bool deleteIfEmpty = false;
+        bool append = false;
+        std::uint64_t generation = 0;
+        std::uint64_t completedGeneration = 0;
     };
 
     enum class ToggleHotkey {
@@ -108,9 +129,31 @@ private:
     void NotifyDictionaryProfileSwitch(DictionaryProfile profile, bool success) const;
     bool IsToggleHotkeyPressed(WPARAM wParam) const;
     bool PromoteSelectedCandidateToManualEntry();
-    void AppendPhraseReviewEntry(const std::wstring& code, const std::wstring& text, const wchar_t* sourceTag) const;
+    void AppendPhraseReviewEntry(const std::wstring& code, const std::wstring& text, const wchar_t* sourceTag);
     void EnsureSingleCharZhengmaCodeHintsLoaded(const std::filesystem::path& dataDir);
     std::wstring GetSingleCharZhengmaCodeHint(const std::wstring& text) const;
+    void SyncUserDataFilesStamp();
+    bool ReloadUserDataIfChanged(bool force);
+    void MarkAutoPhraseDictionaryDirty();
+    void MarkFrequencyDataDirty();
+    void FlushPendingUserDataIfNeeded(bool force);
+    void StartUserDataWriteWorker();
+    void StopUserDataWriteWorker(bool waitForPending);
+    void UserDataWriteWorkerMain();
+    void QueueAutoPhraseSessionWrite();
+    void QueueManualPhraseReviewAppend(const std::string& line);
+    bool WaitForUserDataWrites(bool includeSessionWrite);
+    static bool WriteUtf8FileSnapshot(const std::wstring& filePath, const std::string& content, bool deleteIfEmpty, bool append);
+    std::string BuildAutoPhraseSessionStateSnapshot(bool& deleteFile) const;
+    std::string BuildContextAssociationFileContent() const;
+    bool SaveAutoPhraseSessionState() const;
+    bool LoadAutoPhraseSessionState();
+    void UpdateSessionAutoPhraseHistory(const std::wstring& committedText, ULONGLONG now);
+    void RecordSessionAutoPhraseBreak();
+    void CollectSessionAutoPhraseCandidatesForTail(ULONGLONG now);
+    void MergeSessionAutoPhraseCandidates();
+    bool PromoteSessionAutoPhrase(const std::wstring& text);
+    static bool IsHanCharacter(wchar_t ch);
     bool IsTextInGB2312Cached(const std::wstring& text) const;
     bool CommitCandidateByGlobalIndex(ITfContext* context, size_t globalIndex, std::uint64_t freqBoost);
     bool PinCandidateByGlobalIndex(size_t globalIndex);
@@ -144,6 +187,7 @@ private:
     DWORD threadMgrEventSinkCookie_;
 
     CompositionEngine engine_;
+    CompositionEngine phraseBuildEngine_;
     CandidateWindow candidateWindow_;
 
     bool chineseMode_;
@@ -171,10 +215,12 @@ private:
     std::wstring userFreqPath_;
     std::wstring userDictPath_;
     std::wstring autoPhraseDictPath_;
+    std::wstring autoPhraseSessionPath_;
     std::wstring blockedEntriesPath_;
     std::wstring contextAssocPath_;
     std::wstring contextAssocBlacklistPath_;
     std::wstring manualPhraseReviewPath_;
+    std::wstring userDataFilesStamp_;
 
     std::wstring compositionCode_;
     std::vector<CandidateItem> allCandidates_;
@@ -187,9 +233,26 @@ private:
     ULONGLONG lastAnchorTick_;
     std::deque<CommitHistoryItem> recentCommits_;
     std::unordered_map<std::wstring, PendingPhraseStat> pendingPhraseStats_;
+    std::wstring autoPhraseHistoryText_;
+    std::unordered_map<std::wstring, SessionAutoPhraseEntry> sessionAutoPhraseEntries_;
     std::wstring lastAutoPhraseSelectedKey_;
     int autoPhraseSelectedStreak_;
     ULONGLONG autoPhraseSelectedTick_;
+    bool autoPhraseDictionaryDirty_;
+    bool userFrequencyDirty_;
+    ULONGLONG userDataFirstDirtyTick_;
+    ULONGLONG userDataLastFlushTick_;
+    std::thread userDataWriteThread_;
+    std::mutex userDataWriteMutex_;
+    std::condition_variable userDataWriteCv_;
+    bool userDataWriteStopRequested_;
+    std::uint64_t nextUserDataWriteGeneration_;
+    PendingAsyncFileWrite pendingUserDictWrite_;
+    PendingAsyncFileWrite pendingUserFreqWrite_;
+    PendingAsyncFileWrite pendingContextAssocWrite_;
+    PendingAsyncFileWrite pendingBlockedEntriesWrite_;
+    PendingAsyncFileWrite pendingAutoPhraseSessionWrite_;
+    PendingAsyncFileWrite pendingManualPhraseReviewWrite_;
     std::unordered_map<std::wstring, std::uint64_t> contextAssociationScores_;
     std::unordered_set<std::wstring> contextAssociationBlacklist_;
     std::unordered_map<wchar_t, std::wstring> singleCharZhengmaCodeHints_;

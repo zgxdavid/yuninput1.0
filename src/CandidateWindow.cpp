@@ -506,8 +506,8 @@ void CandidateWindow::Update(
     } else if (preferCaretFollow) {
         smoothedX = x;
         smoothedY = y;
-        smoothedWidth = ApproachIntElastic(lastWidth_, width, 8, 0.56, 0.30, 6);
-        smoothedHeight = ApproachIntElastic(lastHeight_, height, 8, 0.56, 0.30, 6);
+        smoothedWidth = width;
+        smoothedHeight = height;
 
         POINT clampPoint = usedValidAnchor ? anchorPoint : POINT{x, y};
         if (GetWorkAreaForPoint(clampPoint, workArea)) {

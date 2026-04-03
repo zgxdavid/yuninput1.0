@@ -6,17 +6,279 @@
 #include <shellapi.h>
 
 #include <algorithm>
+#include <condition_variable>
 #include <cwctype>
 #include <filesystem>
 #include <fstream>
+#include <mutex>
 #include <new>
 #include <regex>
 #include <sstream>
+#include <thread>
 
 namespace {
 
-constexpr const wchar_t* kBuildMarker = L"cw-r3-20260327-keytrace-v1";
+constexpr const wchar_t* kBuildMarker = L"cw-r4-20260403-yuninput1-userdict-slim-v1";
 constexpr ULONGLONG kAnchorReuseWindowMs = 2500ULL;
+constexpr ULONGLONG kAutoPhraseFlushIntervalMs = 3000ULL;
+constexpr ULONGLONG kUserFrequencyFlushIntervalMs = 3000ULL;
+constexpr size_t kSessionAutoPhraseHistoryCharLimit = 2000;
+constexpr size_t kSessionAutoPhraseMaxLength = 12;
+constexpr wchar_t kSessionAutoPhraseBreak = static_cast<wchar_t>(0xE000);
+
+std::wstring BuildUserDataFilePath(const std::wstring& userDataDir, const wchar_t* fileName) {
+    if (userDataDir.empty() || fileName == nullptr || *fileName == L'\0') {
+        return L"";
+    }
+
+    return userDataDir + L"\\" + fileName;
+}
+
+bool CopyFileIfMissing(const std::filesystem::path& sourcePath, const std::filesystem::path& targetPath) {
+    if (sourcePath.empty() || targetPath.empty()) {
+        return false;
+    }
+
+    std::error_code ec;
+    if (!std::filesystem::exists(sourcePath, ec) || std::filesystem::exists(targetPath, ec)) {
+        return false;
+    }
+
+    if (targetPath.has_parent_path()) {
+        std::filesystem::create_directories(targetPath.parent_path(), ec);
+        ec.clear();
+    }
+
+    return std::filesystem::copy_file(sourcePath, targetPath, std::filesystem::copy_options::skip_existing, ec);
+}
+
+bool FileContainsAutoPhraseTag(const std::wstring& filePath) {
+    if (filePath.empty()) {
+        return false;
+    }
+
+    std::ifstream input(filePath, std::ios::in | std::ios::binary);
+    if (!input) {
+        return false;
+    }
+
+    std::string line;
+    while (std::getline(input, line)) {
+        if (line.empty() || line[0] == '#') {
+            continue;
+        }
+
+        if (line.find(" auto") != std::string::npos || line.find("\tauto") != std::string::npos) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+bool FileContainsLegacyFrequencyNoise(const std::wstring& filePath) {
+    if (filePath.empty()) {
+        return false;
+    }
+
+    const auto utf8ToWide = [](const std::string& input) {
+        if (input.empty()) {
+            return std::wstring();
+        }
+
+        const auto decode = [&input](UINT codePage, DWORD flags) {
+            const int required = MultiByteToWideChar(
+                codePage,
+                flags,
+                input.c_str(),
+                static_cast<int>(input.size()),
+                nullptr,
+                0);
+            if (required <= 0) {
+                return std::wstring();
+            }
+
+            std::wstring output(static_cast<size_t>(required), L'\0');
+            const int converted = MultiByteToWideChar(
+                codePage,
+                flags,
+                input.c_str(),
+                static_cast<int>(input.size()),
+                output.data(),
+                required);
+            if (converted <= 0) {
+                return std::wstring();
+            }
+
+            return output;
+        };
+
+        std::wstring decoded = decode(CP_UTF8, MB_ERR_INVALID_CHARS);
+        if (!decoded.empty()) {
+            return decoded;
+        }
+
+        decoded = decode(54936, 0);
+        if (!decoded.empty()) {
+            return decoded;
+        }
+
+        return decode(CP_ACP, 0);
+    };
+
+    const auto isTextInGb2312 = [](const std::wstring& text) {
+        if (text.empty()) {
+            return true;
+        }
+
+        for (wchar_t ch : text) {
+            if (ch <= 0x7F) {
+                continue;
+            }
+
+            char buffer[4] = {};
+            BOOL usedDefaultChar = FALSE;
+            const int converted = WideCharToMultiByte(
+                936,
+                WC_NO_BEST_FIT_CHARS,
+                &ch,
+                1,
+                buffer,
+                static_cast<int>(sizeof(buffer)),
+                nullptr,
+                &usedDefaultChar);
+            if (converted <= 0 || usedDefaultChar) {
+                return false;
+            }
+
+            if (converted == 1) {
+                if (static_cast<unsigned char>(buffer[0]) > 0x7F) {
+                    return false;
+                }
+                continue;
+            }
+
+            if (converted != 2) {
+                return false;
+            }
+
+            const unsigned char lead = static_cast<unsigned char>(buffer[0]);
+            const unsigned char trail = static_cast<unsigned char>(buffer[1]);
+            if (!(lead >= 0xA1 && lead <= 0xF7 && trail >= 0xA1 && trail <= 0xFE)) {
+                return false;
+            }
+        }
+
+        return true;
+    };
+
+    const auto isHanText = [](const std::wstring& text) {
+        return !text.empty() && std::all_of(text.begin(), text.end(), [](wchar_t ch) {
+            return (ch >= 0x3400 && ch <= 0x4DBF) ||
+                   (ch >= 0x4E00 && ch <= 0x9FFF) ||
+                   (ch >= 0xF900 && ch <= 0xFAFF);
+        });
+    };
+
+    std::ifstream input(filePath, std::ios::in | std::ios::binary);
+    if (!input) {
+        return false;
+    }
+
+    std::string line;
+    while (std::getline(input, line)) {
+        if (line.empty() || line[0] == '#') {
+            continue;
+        }
+
+        std::istringstream iss(line);
+        std::string codeUtf8;
+        std::string textUtf8;
+        std::uint64_t score = 0;
+        if (!(iss >> codeUtf8 >> textUtf8 >> score)) {
+            return true;
+        }
+
+        const std::wstring code = utf8ToWide(codeUtf8);
+        const std::wstring text = utf8ToWide(textUtf8);
+        if (text.empty()) {
+            return true;
+        }
+
+        const bool eligibleSingle = text.size() == 1 && isTextInGb2312(text);
+        const bool eligiblePhrase = text.size() >= 2 && code.size() == 4 && isHanText(text);
+        if (!eligibleSingle && !eligiblePhrase) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+std::wstring QueryFileStampToken(const std::wstring& filePath) {
+    if (filePath.empty()) {
+        return L"-";
+    }
+
+    std::error_code ec;
+    const std::filesystem::path path(filePath);
+    const bool exists = std::filesystem::exists(path, ec);
+    if (ec || !exists) {
+        return L"0";
+    }
+
+    ec.clear();
+    const auto writeTime = std::filesystem::last_write_time(path, ec);
+    if (ec) {
+        return L"1";
+    }
+
+    return L"1:" + std::to_wstring(static_cast<long long>(writeTime.time_since_epoch().count()));
+}
+
+std::wstring BuildUserDataFilesStamp(
+    const std::wstring& userDictPath,
+    const std::wstring& autoPhraseDictPath,
+    const std::wstring& userFreqPath,
+    const std::wstring& blockedEntriesPath,
+    const std::wstring& contextAssocPath,
+    const std::wstring& contextAssocBlacklistPath) {
+    return QueryFileStampToken(userDictPath) + L"|" +
+        QueryFileStampToken(autoPhraseDictPath) + L"|" +
+        QueryFileStampToken(userFreqPath) + L"|" +
+        QueryFileStampToken(blockedEntriesPath) + L"|" +
+        QueryFileStampToken(contextAssocPath) + L"|" +
+        QueryFileStampToken(contextAssocBlacklistPath);
+}
+
+void MigrateLegacyUserDataFiles(const std::wstring& userDataDir) {
+    wchar_t localAppData[MAX_PATH] = {};
+    const DWORD localLen = GetEnvironmentVariableW(L"LOCALAPPDATA", localAppData, MAX_PATH);
+    if (localLen == 0 || localLen >= MAX_PATH) {
+        return;
+    }
+
+    std::error_code ec;
+    const std::filesystem::path targetDir(userDataDir);
+    const std::filesystem::path legacyDir = std::filesystem::path(std::wstring(localAppData, localLen)) / L"yuninput";
+    if (!std::filesystem::exists(legacyDir, ec)) {
+        return;
+    }
+
+    ec.clear();
+    if (std::filesystem::equivalent(legacyDir, targetDir, ec)) {
+        return;
+    }
+
+    CopyFileIfMissing(legacyDir / L"yuninput_user.dict", targetDir / L"yuninput_user.dict");
+    CopyFileIfMissing(legacyDir / L"user_dict.txt", targetDir / L"yuninput_user.dict");
+    CopyFileIfMissing(legacyDir / L"user_freq.txt", targetDir / L"user_freq.txt");
+    CopyFileIfMissing(legacyDir / L"blocked_entries.txt", targetDir / L"blocked_entries.txt");
+    CopyFileIfMissing(legacyDir / L"context_assoc.txt", targetDir / L"context_assoc.txt");
+    CopyFileIfMissing(legacyDir / L"context_assoc_blacklist.txt", targetDir / L"context_assoc_blacklist.txt");
+    CopyFileIfMissing(legacyDir / L"manual_phrase_review.txt", targetDir / L"manual_phrase_review.txt");
+    CopyFileIfMissing(legacyDir / L"auto_phrase_session.txt", targetDir / L"auto_phrase_session.txt");
+}
 
 std::string WideToUtf8ForLog(const std::wstring& input) {
     if (input.empty()) {
@@ -1269,6 +1531,12 @@ TextService::TextService()
                 lastAnchorTick_(0),
                 autoPhraseSelectedStreak_(0),
                                 autoPhraseSelectedTick_(0),
+                    autoPhraseDictionaryDirty_(false),
+                    userFrequencyDirty_(false),
+                    userDataFirstDirtyTick_(0),
+                    userDataLastFlushTick_(0),
+                                    userDataWriteStopRequested_(false),
+                                    nextUserDataWriteGeneration_(0),
                                 pageCandidatesCacheRevision_(0),
                                 pageCandidatesCachePageIndex_(0),
                                 pageCandidatesCachePageSize_(0) {
@@ -1276,6 +1544,8 @@ TextService::TextService()
 }
 
 TextService::~TextService() {
+                    StopUserDataWriteWorker(true);
+
     if (langBarItemMgr_ != nullptr && configLangBarItem_ != nullptr) {
         langBarItemMgr_->RemoveItem(configLangBarItem_);
     }
@@ -1422,22 +1692,31 @@ STDMETHODIMP TextService::Activate(ITfThreadMgr* threadMgr, TfClientId clientId)
 
     LoadSettings();
 
+    if (EnsureUserDataDirectory(userDataDir_)) {
+        MigrateLegacyUserDataFiles(userDataDir_);
+        userDictPath_ = BuildUserDataFilePath(userDataDir_, L"yuninput_user.dict");
+        userFreqPath_ = BuildUserDataFilePath(userDataDir_, L"user_freq.txt");
+        blockedEntriesPath_ = BuildUserDataFilePath(userDataDir_, L"blocked_entries.txt");
+        contextAssocPath_ = BuildUserDataFilePath(userDataDir_, L"context_assoc.txt");
+        contextAssocBlacklistPath_ = BuildUserDataFilePath(userDataDir_, L"context_assoc_blacklist.txt");
+        manualPhraseReviewPath_ = BuildUserDataFilePath(userDataDir_, L"manual_phrase_review.txt");
+        autoPhraseSessionPath_ = BuildUserDataFilePath(userDataDir_, L"auto_phrase_session.txt");
+    }
+
+    StartUserDataWriteWorker();
+
     LoadConfiguredDictionaries();
 
-    if (EnsureUserDataDirectory(userDataDir_)) {
-        userDictPath_ = userDataDir_ + L"\\user_dict.txt";
-        autoPhraseDictPath_ = userDataDir_ + L"\\auto_phrase_dict.txt";
-        userFreqPath_ = userDataDir_ + L"\\user_freq.txt";
-        blockedEntriesPath_ = userDataDir_ + L"\\blocked_entries.txt";
-        contextAssocPath_ = userDataDir_ + L"\\context_assoc.txt";
-        contextAssocBlacklistPath_ = userDataDir_ + L"\\context_assoc_blacklist.txt";
-        manualPhraseReviewPath_ = userDataDir_ + L"\\manual_phrase_review.txt";
-        engine_.LoadUserDictionaryFromFile(userDictPath_);
-        engine_.LoadAutoPhraseDictionaryFromFile(autoPhraseDictPath_);
+    if (!userDataDir_.empty()) {
         engine_.LoadFrequencyFromFile(userFreqPath_);
         engine_.LoadBlockedEntriesFromFile(blockedEntriesPath_);
         LoadContextAssociationFromFile(contextAssocPath_);
         LoadContextAssociationBlacklistFromFile(contextAssocBlacklistPath_);
+        LoadAutoPhraseSessionState();
+        if (FileContainsLegacyFrequencyNoise(userFreqPath_)) {
+            engine_.SaveFrequencyToFile(userFreqPath_);
+        }
+        SyncUserDataFilesStamp();
     }
 
     candidateWindow_.EnsureCreated();
@@ -1448,6 +1727,10 @@ STDMETHODIMP TextService::Activate(ITfThreadMgr* threadMgr, TfClientId clientId)
 }
 
 STDMETHODIMP TextService::Deactivate() {
+    FlushPendingUserDataIfNeeded(true);
+    QueueAutoPhraseSessionWrite();
+    StopUserDataWriteWorker(true);
+
     if (langBarItemMgr_ != nullptr && configLangBarItem_ != nullptr) {
         langBarItemMgr_->RemoveItem(configLangBarItem_);
     }
@@ -1490,6 +1773,653 @@ STDMETHODIMP TextService::Deactivate() {
     candidateWindow_.Destroy();
     Trace(L"TextService deactivated");
     return S_OK;
+}
+
+void TextService::MarkAutoPhraseDictionaryDirty() {
+    if (!autoPhraseDictionaryDirty_ && !userFrequencyDirty_) {
+        userDataFirstDirtyTick_ = GetTickCount64();
+    }
+    autoPhraseDictionaryDirty_ = true;
+}
+
+void TextService::MarkFrequencyDataDirty() {
+    if (!userFrequencyDirty_ && !autoPhraseDictionaryDirty_) {
+        userDataFirstDirtyTick_ = GetTickCount64();
+    }
+    userFrequencyDirty_ = true;
+}
+
+void TextService::SyncUserDataFilesStamp() {
+    userDataFilesStamp_ = BuildUserDataFilesStamp(
+        userDictPath_,
+        autoPhraseDictPath_,
+        userFreqPath_,
+        blockedEntriesPath_,
+        contextAssocPath_,
+        contextAssocBlacklistPath_);
+}
+
+bool TextService::ReloadUserDataIfChanged(bool force) {
+    if (userDataDir_.empty()) {
+        return false;
+    }
+
+    const std::wstring currentStamp = BuildUserDataFilesStamp(
+        userDictPath_,
+        autoPhraseDictPath_,
+        userFreqPath_,
+        blockedEntriesPath_,
+        contextAssocPath_,
+        contextAssocBlacklistPath_);
+    if (!force && currentStamp == userDataFilesStamp_) {
+        return false;
+    }
+
+    const bool reloaded = ReloadActiveDictionaries();
+    Trace(L"user data reloaded changed=" + std::to_wstring(force ? 1 : 0) + L" success=" + std::to_wstring(reloaded ? 1 : 0));
+    return reloaded;
+}
+
+void TextService::FlushPendingUserDataIfNeeded(bool force) {
+    if (!autoPhraseDictionaryDirty_ && !userFrequencyDirty_) {
+        if (force) {
+            WaitForUserDataWrites(false);
+            SyncUserDataFilesStamp();
+        }
+        return;
+    }
+
+    const ULONGLONG now = GetTickCount64();
+    const ULONGLONG requiredInterval =
+        autoPhraseDictionaryDirty_ && userFrequencyDirty_
+            ? std::min(kAutoPhraseFlushIntervalMs, kUserFrequencyFlushIntervalMs)
+            : (autoPhraseDictionaryDirty_ ? kAutoPhraseFlushIntervalMs : kUserFrequencyFlushIntervalMs);
+    if (!force) {
+        if (userDataFirstDirtyTick_ == 0) {
+            userDataFirstDirtyTick_ = now;
+        }
+
+        const ULONGLONG elapsed = now - userDataFirstDirtyTick_;
+        if (elapsed < requiredInterval) {
+            return;
+        }
+    }
+
+    bool queuedAny = false;
+    if (autoPhraseDictionaryDirty_ && !userDictPath_.empty()) {
+        const std::string snapshot = engine_.BuildUserDictionaryFileContent();
+        {
+            std::lock_guard<std::mutex> lock(userDataWriteMutex_);
+            pendingUserDictWrite_.path = userDictPath_;
+            pendingUserDictWrite_.content = snapshot;
+            pendingUserDictWrite_.deleteIfEmpty = false;
+            pendingUserDictWrite_.generation = ++nextUserDataWriteGeneration_;
+        }
+        userDataWriteCv_.notify_all();
+        autoPhraseDictionaryDirty_ = false;
+        queuedAny = true;
+    }
+
+    if (userFrequencyDirty_ && !userFreqPath_.empty()) {
+        const std::string snapshot = engine_.BuildFrequencyFileContent();
+        {
+            std::lock_guard<std::mutex> lock(userDataWriteMutex_);
+            pendingUserFreqWrite_.path = userFreqPath_;
+            pendingUserFreqWrite_.content = snapshot;
+            pendingUserFreqWrite_.deleteIfEmpty = false;
+            pendingUserFreqWrite_.generation = ++nextUserDataWriteGeneration_;
+        }
+        userDataWriteCv_.notify_all();
+        userFrequencyDirty_ = false;
+        queuedAny = true;
+    }
+
+    if (queuedAny) {
+        userDataFirstDirtyTick_ = 0;
+        userDataLastFlushTick_ = now;
+    }
+
+    if (force) {
+        WaitForUserDataWrites(false);
+        if (queuedAny) {
+            SyncUserDataFilesStamp();
+        }
+    }
+}
+
+void TextService::StartUserDataWriteWorker() {
+    if (userDataWriteThread_.joinable()) {
+        return;
+    }
+
+    userDataWriteStopRequested_ = false;
+    userDataWriteThread_ = std::thread(&TextService::UserDataWriteWorkerMain, this);
+}
+
+void TextService::StopUserDataWriteWorker(bool waitForPending) {
+    if (!userDataWriteThread_.joinable()) {
+        return;
+    }
+
+    if (waitForPending) {
+        WaitForUserDataWrites(true);
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(userDataWriteMutex_);
+        userDataWriteStopRequested_ = true;
+    }
+    userDataWriteCv_.notify_all();
+    userDataWriteThread_.join();
+}
+
+void TextService::UserDataWriteWorkerMain() {
+    for (;;) {
+        PendingAsyncFileWrite userDictWrite;
+        PendingAsyncFileWrite userFreqWrite;
+        PendingAsyncFileWrite contextAssocWrite;
+        PendingAsyncFileWrite blockedEntriesWrite;
+        PendingAsyncFileWrite autoPhraseSessionWrite;
+        PendingAsyncFileWrite manualPhraseReviewWrite;
+
+        {
+            std::unique_lock<std::mutex> lock(userDataWriteMutex_);
+            userDataWriteCv_.wait(lock, [this]() {
+                return userDataWriteStopRequested_ ||
+                    pendingUserDictWrite_.generation > pendingUserDictWrite_.completedGeneration ||
+                    pendingUserFreqWrite_.generation > pendingUserFreqWrite_.completedGeneration ||
+                    pendingContextAssocWrite_.generation > pendingContextAssocWrite_.completedGeneration ||
+                    pendingBlockedEntriesWrite_.generation > pendingBlockedEntriesWrite_.completedGeneration ||
+                    pendingAutoPhraseSessionWrite_.generation > pendingAutoPhraseSessionWrite_.completedGeneration ||
+                    pendingManualPhraseReviewWrite_.generation > pendingManualPhraseReviewWrite_.completedGeneration;
+            });
+
+            if (userDataWriteStopRequested_ &&
+                pendingUserDictWrite_.generation == pendingUserDictWrite_.completedGeneration &&
+                pendingUserFreqWrite_.generation == pendingUserFreqWrite_.completedGeneration &&
+                pendingContextAssocWrite_.generation == pendingContextAssocWrite_.completedGeneration &&
+                pendingBlockedEntriesWrite_.generation == pendingBlockedEntriesWrite_.completedGeneration &&
+                pendingAutoPhraseSessionWrite_.generation == pendingAutoPhraseSessionWrite_.completedGeneration &&
+                pendingManualPhraseReviewWrite_.generation == pendingManualPhraseReviewWrite_.completedGeneration) {
+                break;
+            }
+
+            if (pendingUserDictWrite_.generation > pendingUserDictWrite_.completedGeneration) {
+                userDictWrite = pendingUserDictWrite_;
+            }
+            if (pendingUserFreqWrite_.generation > pendingUserFreqWrite_.completedGeneration) {
+                userFreqWrite = pendingUserFreqWrite_;
+            }
+            if (pendingContextAssocWrite_.generation > pendingContextAssocWrite_.completedGeneration) {
+                contextAssocWrite = pendingContextAssocWrite_;
+            }
+            if (pendingBlockedEntriesWrite_.generation > pendingBlockedEntriesWrite_.completedGeneration) {
+                blockedEntriesWrite = pendingBlockedEntriesWrite_;
+            }
+            if (pendingAutoPhraseSessionWrite_.generation > pendingAutoPhraseSessionWrite_.completedGeneration) {
+                autoPhraseSessionWrite = pendingAutoPhraseSessionWrite_;
+            }
+            if (pendingManualPhraseReviewWrite_.generation > pendingManualPhraseReviewWrite_.completedGeneration) {
+                manualPhraseReviewWrite = pendingManualPhraseReviewWrite_;
+                pendingManualPhraseReviewWrite_.content.clear();
+            }
+        }
+
+        if (userDictWrite.generation != 0) {
+            WriteUtf8FileSnapshot(userDictWrite.path, userDictWrite.content, userDictWrite.deleteIfEmpty, userDictWrite.append);
+            std::lock_guard<std::mutex> lock(userDataWriteMutex_);
+            pendingUserDictWrite_.completedGeneration = std::max(pendingUserDictWrite_.completedGeneration, userDictWrite.generation);
+            userDataWriteCv_.notify_all();
+        }
+
+        if (userFreqWrite.generation != 0) {
+            WriteUtf8FileSnapshot(userFreqWrite.path, userFreqWrite.content, userFreqWrite.deleteIfEmpty, userFreqWrite.append);
+            std::lock_guard<std::mutex> lock(userDataWriteMutex_);
+            pendingUserFreqWrite_.completedGeneration = std::max(pendingUserFreqWrite_.completedGeneration, userFreqWrite.generation);
+            userDataWriteCv_.notify_all();
+        }
+
+        if (contextAssocWrite.generation != 0) {
+            WriteUtf8FileSnapshot(contextAssocWrite.path, contextAssocWrite.content, contextAssocWrite.deleteIfEmpty, contextAssocWrite.append);
+            std::lock_guard<std::mutex> lock(userDataWriteMutex_);
+            pendingContextAssocWrite_.completedGeneration = std::max(pendingContextAssocWrite_.completedGeneration, contextAssocWrite.generation);
+            userDataWriteCv_.notify_all();
+        }
+
+        if (blockedEntriesWrite.generation != 0) {
+            WriteUtf8FileSnapshot(blockedEntriesWrite.path, blockedEntriesWrite.content, blockedEntriesWrite.deleteIfEmpty, blockedEntriesWrite.append);
+            std::lock_guard<std::mutex> lock(userDataWriteMutex_);
+            pendingBlockedEntriesWrite_.completedGeneration = std::max(pendingBlockedEntriesWrite_.completedGeneration, blockedEntriesWrite.generation);
+            userDataWriteCv_.notify_all();
+        }
+
+        if (autoPhraseSessionWrite.generation != 0) {
+            WriteUtf8FileSnapshot(autoPhraseSessionWrite.path, autoPhraseSessionWrite.content, autoPhraseSessionWrite.deleteIfEmpty, autoPhraseSessionWrite.append);
+            std::lock_guard<std::mutex> lock(userDataWriteMutex_);
+            pendingAutoPhraseSessionWrite_.completedGeneration = std::max(pendingAutoPhraseSessionWrite_.completedGeneration, autoPhraseSessionWrite.generation);
+            userDataWriteCv_.notify_all();
+        }
+
+        if (manualPhraseReviewWrite.generation != 0) {
+            WriteUtf8FileSnapshot(manualPhraseReviewWrite.path, manualPhraseReviewWrite.content, manualPhraseReviewWrite.deleteIfEmpty, manualPhraseReviewWrite.append);
+            std::lock_guard<std::mutex> lock(userDataWriteMutex_);
+            pendingManualPhraseReviewWrite_.completedGeneration = std::max(pendingManualPhraseReviewWrite_.completedGeneration, manualPhraseReviewWrite.generation);
+            userDataWriteCv_.notify_all();
+        }
+    }
+}
+
+void TextService::QueueAutoPhraseSessionWrite() {
+    if (autoPhraseSessionPath_.empty()) {
+        return;
+    }
+
+    bool deleteFile = false;
+    const std::string snapshot = BuildAutoPhraseSessionStateSnapshot(deleteFile);
+    {
+        std::lock_guard<std::mutex> lock(userDataWriteMutex_);
+        pendingAutoPhraseSessionWrite_.path = autoPhraseSessionPath_;
+        pendingAutoPhraseSessionWrite_.content = snapshot;
+        pendingAutoPhraseSessionWrite_.deleteIfEmpty = deleteFile;
+        pendingAutoPhraseSessionWrite_.generation = ++nextUserDataWriteGeneration_;
+    }
+    userDataWriteCv_.notify_all();
+}
+
+void TextService::QueueManualPhraseReviewAppend(const std::string& line) {
+    if (manualPhraseReviewPath_.empty() || line.empty()) {
+        return;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(userDataWriteMutex_);
+        pendingManualPhraseReviewWrite_.path = manualPhraseReviewPath_;
+        pendingManualPhraseReviewWrite_.content.append(line);
+        pendingManualPhraseReviewWrite_.deleteIfEmpty = false;
+        pendingManualPhraseReviewWrite_.append = true;
+        pendingManualPhraseReviewWrite_.generation = ++nextUserDataWriteGeneration_;
+    }
+    userDataWriteCv_.notify_all();
+}
+
+bool TextService::WaitForUserDataWrites(bool includeSessionWrite) {
+    if (!userDataWriteThread_.joinable()) {
+        return true;
+    }
+
+    std::unique_lock<std::mutex> lock(userDataWriteMutex_);
+    const std::uint64_t targetUserDictGeneration = pendingUserDictWrite_.generation;
+    const std::uint64_t targetUserFreqGeneration = pendingUserFreqWrite_.generation;
+    const std::uint64_t targetContextAssocGeneration = pendingContextAssocWrite_.generation;
+    const std::uint64_t targetBlockedEntriesGeneration = pendingBlockedEntriesWrite_.generation;
+    const std::uint64_t targetSessionGeneration = pendingAutoPhraseSessionWrite_.generation;
+    const std::uint64_t targetManualPhraseReviewGeneration = pendingManualPhraseReviewWrite_.generation;
+
+    userDataWriteCv_.wait(lock, [this, includeSessionWrite, targetUserDictGeneration, targetUserFreqGeneration, targetContextAssocGeneration, targetBlockedEntriesGeneration, targetSessionGeneration, targetManualPhraseReviewGeneration]() {
+        const bool userDictDone = pendingUserDictWrite_.completedGeneration >= targetUserDictGeneration;
+        const bool userFreqDone = pendingUserFreqWrite_.completedGeneration >= targetUserFreqGeneration;
+        const bool contextAssocDone = pendingContextAssocWrite_.completedGeneration >= targetContextAssocGeneration;
+        const bool blockedEntriesDone = pendingBlockedEntriesWrite_.completedGeneration >= targetBlockedEntriesGeneration;
+        const bool sessionDone = pendingAutoPhraseSessionWrite_.completedGeneration >= targetSessionGeneration;
+        const bool manualPhraseReviewDone = pendingManualPhraseReviewWrite_.completedGeneration >= targetManualPhraseReviewGeneration;
+        return userDictDone && userFreqDone && contextAssocDone && blockedEntriesDone && manualPhraseReviewDone && (!includeSessionWrite || sessionDone);
+    });
+
+    return true;
+}
+
+bool TextService::WriteUtf8FileSnapshot(const std::wstring& filePath, const std::string& content, bool deleteIfEmpty, bool append) {
+    if (filePath.empty()) {
+        return false;
+    }
+
+    const std::filesystem::path path(filePath);
+    std::error_code ec;
+    if (deleteIfEmpty && content.empty()) {
+        std::filesystem::remove(path, ec);
+        return !ec;
+    }
+
+    if (path.has_parent_path()) {
+        std::filesystem::create_directories(path.parent_path(), ec);
+        ec.clear();
+    }
+
+    const std::ios::openmode mode = std::ios::out | std::ios::binary | (append ? std::ios::app : std::ios::trunc);
+    std::ofstream output(path, mode);
+    if (!output) {
+        return false;
+    }
+
+    output.write(content.data(), static_cast<std::streamsize>(content.size()));
+    return output.good();
+}
+
+std::string TextService::BuildAutoPhraseSessionStateSnapshot(bool& deleteFile) const {
+    deleteFile = autoPhraseHistoryText_.empty() && sessionAutoPhraseEntries_.empty();
+    if (deleteFile) {
+        return std::string();
+    }
+
+    std::ostringstream output;
+    output << "boot_tick\t" << GetTickCount64() << '\n';
+    output << "history\t" << WideToUtf8Text(autoPhraseHistoryText_) << '\n';
+    for (const auto& pair : sessionAutoPhraseEntries_) {
+        const SessionAutoPhraseEntry& entry = pair.second;
+        if (entry.text.empty() || entry.codes.empty()) {
+            continue;
+        }
+
+        std::ostringstream codeStream;
+        for (size_t index = 0; index < entry.codes.size(); ++index) {
+            if (index != 0) {
+                codeStream << ',';
+            }
+            codeStream << WideToUtf8Text(entry.codes[index]);
+        }
+
+        output << "entry\t"
+               << WideToUtf8Text(entry.text) << '\t'
+               << codeStream.str() << '\t'
+               << entry.lastTick << '\n';
+    }
+
+    return output.str();
+}
+
+std::string TextService::BuildContextAssociationFileContent() const {
+    std::ostringstream output;
+
+    for (const auto& pair : contextAssociationScores_) {
+        const size_t split = pair.first.find(L'\t');
+        if (split == std::wstring::npos) {
+            continue;
+        }
+
+        const std::wstring prevText = pair.first.substr(0, split);
+        const std::wstring nextText = pair.first.substr(split + 1);
+        output << WideToUtf8Text(prevText) << ' ' << WideToUtf8Text(nextText) << ' ' << pair.second << '\n';
+    }
+
+    return output.str();
+}
+
+bool TextService::SaveAutoPhraseSessionState() const {
+    if (autoPhraseSessionPath_.empty()) {
+        return false;
+    }
+
+    bool deleteFile = false;
+    const std::string snapshot = BuildAutoPhraseSessionStateSnapshot(deleteFile);
+    return WriteUtf8FileSnapshot(autoPhraseSessionPath_, snapshot, deleteFile, false);
+}
+
+bool TextService::LoadAutoPhraseSessionState() {
+    autoPhraseHistoryText_.clear();
+    sessionAutoPhraseEntries_.clear();
+
+    if (autoPhraseSessionPath_.empty()) {
+        return false;
+    }
+
+    std::ifstream input(autoPhraseSessionPath_, std::ios::in | std::ios::binary);
+    if (!input) {
+        return false;
+    }
+
+    const ULONGLONG currentBootTick = GetTickCount64();
+    bool rebootInvalidated = false;
+    std::string line;
+    while (std::getline(input, line)) {
+        if (line.empty()) {
+            continue;
+        }
+
+        std::istringstream iss(line);
+        std::string tag;
+        if (!std::getline(iss, tag, '\t')) {
+            continue;
+        }
+
+        if (tag == "boot_tick") {
+            std::string tickText;
+            if (std::getline(iss, tickText, '\t')) {
+                const ULONGLONG savedBootTick = static_cast<ULONGLONG>(_strtoui64(tickText.c_str(), nullptr, 10));
+                if (savedBootTick > currentBootTick) {
+                    rebootInvalidated = true;
+                    break;
+                }
+            }
+            continue;
+        }
+
+        if (tag == "history") {
+            std::string historyUtf8;
+            if (std::getline(iss, historyUtf8, '\t')) {
+                autoPhraseHistoryText_ = Utf8ToWideText(historyUtf8);
+                if (autoPhraseHistoryText_.size() > kSessionAutoPhraseHistoryCharLimit) {
+                    autoPhraseHistoryText_.erase(0, autoPhraseHistoryText_.size() - kSessionAutoPhraseHistoryCharLimit);
+                }
+            }
+            continue;
+        }
+
+        if (tag == "entry") {
+            std::string textUtf8;
+            std::string codesCsv;
+            std::string tickText;
+            if (!std::getline(iss, textUtf8, '\t') ||
+                !std::getline(iss, codesCsv, '\t') ||
+                !std::getline(iss, tickText, '\t')) {
+                continue;
+            }
+
+            SessionAutoPhraseEntry entry;
+            entry.text = Utf8ToWideText(textUtf8);
+            entry.lastTick = static_cast<ULONGLONG>(_strtoui64(tickText.c_str(), nullptr, 10));
+            std::istringstream codeStream(codesCsv);
+            std::string codeUtf8;
+            while (std::getline(codeStream, codeUtf8, ',')) {
+                const std::wstring code = Utf8ToWideText(codeUtf8);
+                if (code.empty()) {
+                    continue;
+                }
+                if (!engine_.HasEntry(code, entry.text)) {
+                    entry.codes.push_back(code);
+                }
+            }
+
+            if (!entry.text.empty() && !entry.codes.empty()) {
+                sessionAutoPhraseEntries_[entry.text] = std::move(entry);
+            }
+        }
+    }
+
+    if (rebootInvalidated) {
+        autoPhraseHistoryText_.clear();
+        sessionAutoPhraseEntries_.clear();
+        QueueAutoPhraseSessionWrite();
+        return false;
+    }
+
+    return !autoPhraseHistoryText_.empty() || !sessionAutoPhraseEntries_.empty();
+}
+
+bool TextService::IsHanCharacter(wchar_t ch) {
+    return (ch >= 0x3400 && ch <= 0x4DBF) ||
+           (ch >= 0x4E00 && ch <= 0x9FFF) ||
+           (ch >= 0xF900 && ch <= 0xFAFF);
+}
+
+void TextService::RecordSessionAutoPhraseBreak() {
+    if (!autoPhraseHistoryText_.empty() && autoPhraseHistoryText_.back() != kSessionAutoPhraseBreak) {
+        autoPhraseHistoryText_.push_back(kSessionAutoPhraseBreak);
+        if (autoPhraseHistoryText_.size() > kSessionAutoPhraseHistoryCharLimit) {
+            autoPhraseHistoryText_.erase(0, autoPhraseHistoryText_.size() - kSessionAutoPhraseHistoryCharLimit);
+        }
+        QueueAutoPhraseSessionWrite();
+    }
+}
+
+void TextService::CollectSessionAutoPhraseCandidatesForTail(ULONGLONG now) {
+    if (autoPhraseHistoryText_.size() < 2) {
+        return;
+    }
+
+    const auto sanitizePhraseCode = [](std::wstring code) {
+        code.erase(
+            std::remove_if(
+                code.begin(),
+                code.end(),
+                [](wchar_t ch) {
+                    return ch < L'a' || ch > L'z';
+                }),
+            code.end());
+        if (code.size() > 20) {
+            code.resize(20);
+        }
+        return code;
+    };
+
+    size_t tailStart = autoPhraseHistoryText_.find_last_of(kSessionAutoPhraseBreak);
+    if (tailStart == std::wstring::npos) {
+        tailStart = 0;
+    } else {
+        tailStart += 1;
+    }
+
+    if (tailStart >= autoPhraseHistoryText_.size()) {
+        return;
+    }
+
+    const std::wstring tailText = autoPhraseHistoryText_.substr(tailStart);
+    if (tailText.size() < 2) {
+        return;
+    }
+
+    const size_t maxPhraseLength = std::min(kSessionAutoPhraseMaxLength, tailText.size());
+    for (size_t phraseLength = 2; phraseLength <= maxPhraseLength; ++phraseLength) {
+        const std::wstring phraseText = tailText.substr(tailText.size() - phraseLength, phraseLength);
+        if (sessionAutoPhraseEntries_.find(phraseText) != sessionAutoPhraseEntries_.end()) {
+            sessionAutoPhraseEntries_[phraseText].lastTick = now;
+            continue;
+        }
+
+        std::vector<std::wstring> phraseCodes;
+        if (!phraseBuildEngine_.TryBuildPhraseCodes(phraseText, phraseCodes) || phraseCodes.empty()) {
+            continue;
+        }
+
+        std::vector<std::wstring> sanitizedCodes;
+        sanitizedCodes.reserve(phraseCodes.size());
+        for (std::wstring& phraseCode : phraseCodes) {
+            phraseCode = sanitizePhraseCode(std::move(phraseCode));
+            if (phraseCode.empty()) {
+                continue;
+            }
+            if (std::find(sanitizedCodes.begin(), sanitizedCodes.end(), phraseCode) != sanitizedCodes.end()) {
+                continue;
+            }
+            if (engine_.HasEntry(phraseCode, phraseText)) {
+                    continue;
+            }
+            sanitizedCodes.push_back(std::move(phraseCode));
+        }
+
+            if (sanitizedCodes.empty()) {
+            continue;
+        }
+
+        SessionAutoPhraseEntry entry;
+        entry.text = phraseText;
+        entry.codes = std::move(sanitizedCodes);
+        entry.lastTick = now;
+        sessionAutoPhraseEntries_.emplace(entry.text, std::move(entry));
+    }
+}
+
+void TextService::UpdateSessionAutoPhraseHistory(const std::wstring& committedText, ULONGLONG now) {
+    bool changed = false;
+    for (wchar_t ch : committedText) {
+        if (IsHanCharacter(ch)) {
+            autoPhraseHistoryText_.push_back(ch);
+            if (autoPhraseHistoryText_.size() > kSessionAutoPhraseHistoryCharLimit) {
+                autoPhraseHistoryText_.erase(0, autoPhraseHistoryText_.size() - kSessionAutoPhraseHistoryCharLimit);
+            }
+            CollectSessionAutoPhraseCandidatesForTail(now);
+            changed = true;
+        } else if (!autoPhraseHistoryText_.empty() && autoPhraseHistoryText_.back() != kSessionAutoPhraseBreak) {
+            autoPhraseHistoryText_.push_back(kSessionAutoPhraseBreak);
+            if (autoPhraseHistoryText_.size() > kSessionAutoPhraseHistoryCharLimit) {
+                autoPhraseHistoryText_.erase(0, autoPhraseHistoryText_.size() - kSessionAutoPhraseHistoryCharLimit);
+            }
+            changed = true;
+        }
+    }
+
+    if (changed) {
+        QueueAutoPhraseSessionWrite();
+    }
+}
+
+void TextService::MergeSessionAutoPhraseCandidates() {
+    if (compositionCode_.size() < 4 || sessionAutoPhraseEntries_.empty()) {
+        return;
+    }
+
+    std::vector<CandidateItem> sessionCandidates;
+    sessionCandidates.reserve(16);
+    for (const auto& pair : sessionAutoPhraseEntries_) {
+        const SessionAutoPhraseEntry& entry = pair.second;
+        if (entry.text.empty()) {
+            continue;
+        }
+
+        if (std::find(entry.codes.begin(), entry.codes.end(), compositionCode_) == entry.codes.end()) {
+            continue;
+        }
+
+        CandidateItem candidate;
+        candidate.text = entry.text;
+        candidate.code = compositionCode_;
+        candidate.commitCode = compositionCode_;
+        candidate.exactMatch = true;
+        candidate.fromSessionAutoPhrase = true;
+        candidate.consumedLength = compositionCode_.size();
+        sessionCandidates.push_back(std::move(candidate));
+    }
+
+    for (CandidateItem& candidate : sessionCandidates) {
+        allCandidates_.push_back(std::move(candidate));
+    }
+}
+
+bool TextService::PromoteSessionAutoPhrase(const std::wstring& text) {
+    const auto it = sessionAutoPhraseEntries_.find(text);
+    if (it == sessionAutoPhraseEntries_.end()) {
+        return false;
+    }
+
+    SessionAutoPhraseEntry entry = it->second;
+    entry.lastTick = GetTickCount64();
+
+    bool changed = false;
+    for (const std::wstring& code : entry.codes) {
+        if (code.empty()) {
+            continue;
+        }
+
+        changed = engine_.AddAutoPhraseEntry(code, entry.text) || changed;
+        AppendPhraseReviewEntry(code, entry.text, L"auto");
+    }
+
+    if (changed) {
+        MarkAutoPhraseDictionaryDirty();
+    }
+
+    sessionAutoPhraseEntries_.erase(it);
+    QueueAutoPhraseSessionWrite();
+    return changed;
 }
 
 void TextService::RefreshCandidates() {
@@ -1537,11 +2467,13 @@ void TextService::RefreshCandidates() {
                               const std::wstring& displayCode,
                               const std::wstring& commitCode,
                               std::uint64_t contextScore,
+                              std::uint64_t learnedScore,
                               bool exactMatch,
                               bool boostedUser,
                               bool boostedLearned,
                               bool boostedContext,
                               bool fromAutoPhrase,
+                              bool fromSessionAutoPhrase,
                               bool fromSystemDict,
                               size_t consumedLength) {
         if (text.empty()) {
@@ -1560,7 +2492,11 @@ void TextService::RefreshCandidates() {
             existing.boostedContext = existing.boostedContext || boostedContext;
             existing.exactMatch = existing.exactMatch || exactMatch;
             existing.fromAutoPhrase = existing.fromAutoPhrase || fromAutoPhrase;
+            existing.fromSessionAutoPhrase = existing.fromSessionAutoPhrase || fromSessionAutoPhrase;
             existing.fromSystemDict = existing.fromSystemDict || fromSystemDict;
+            if (learnedScore > existing.learnedScore) {
+                existing.learnedScore = learnedScore;
+            }
             if (contextScore > existing.contextScore) {
                 existing.contextScore = contextScore;
             }
@@ -1587,11 +2523,13 @@ void TextService::RefreshCandidates() {
         candidate.code = displayCode;
         candidate.commitCode = stableCommitCode;
         candidate.contextScore = contextScore;
+        candidate.learnedScore = learnedScore;
         candidate.exactMatch = exactMatch;
         candidate.boostedUser = boostedUser;
         candidate.boostedLearned = boostedLearned;
         candidate.boostedContext = boostedContext;
         candidate.fromAutoPhrase = fromAutoPhrase;
+        candidate.fromSessionAutoPhrase = fromSessionAutoPhrase;
         candidate.fromSystemDict = fromSystemDict;
         candidate.consumedLength = consumedLength;
         allCandidates_.push_back(std::move(candidate));
@@ -1614,11 +2552,13 @@ void TextService::RefreshCandidates() {
             displayCode,
             item.code.empty() ? compositionCode_ : item.code,
             0,
+            item.learnedScore,
             item.code == compositionCode_,
             item.isUser && !item.isAutoPhrase,
             item.isLearned,
             false,
             item.isAutoPhrase,
+            false,
             !item.isUser,
             compositionCode_.size());
     }
@@ -1640,11 +2580,13 @@ void TextService::RefreshCandidates() {
                     displayCode,
                     prefixCode,
                     0,
+                    item.learnedScore,
                     false,
                     item.isUser && !item.isAutoPhrase,
                     item.isLearned,
                     false,
                     item.isAutoPhrase,
+                    false,
                     !item.isUser,
                     prefixLength);
             }
@@ -1659,6 +2601,7 @@ void TextService::RefreshCandidates() {
     }
 
     if (!hasExactCurrentCode && compositionCode_.size() > 1 && !pinyinFallbackMode) {
+        const size_t prefixFallbackTarget = std::max<size_t>(24, pageSize_ * 3);
         std::wstring prefixCode = compositionCode_;
         for (size_t prefixLength = compositionCode_.size() - 1; prefixLength >= 1; --prefixLength) {
             prefixCode.resize(prefixLength);
@@ -1673,13 +2616,19 @@ void TextService::RefreshCandidates() {
                     item.code,
                     prefixCode,
                     0,
+                    item.learnedScore,
                     false,
                     item.isUser && !item.isAutoPhrase,
                     item.isLearned,
                     false,
                     item.isAutoPhrase,
+                    false,
                     !item.isUser,
                     prefixLength);
+            }
+
+            if (allCandidates_.size() >= prefixFallbackTarget) {
+                break;
             }
 
             if (prefixLength == 1) {
@@ -1712,11 +2661,13 @@ void TextService::RefreshCandidates() {
                     compositionCode_,
                     compositionCode_,
                     0,
+                    item.learnedScore,
                     false,
                     item.isUser && !item.isAutoPhrase,
                     true,
                     true,
                     item.isAutoPhrase,
+                    false,
                     !item.isUser,
                     compositionCode_.size());
             }
@@ -1752,6 +2703,33 @@ void TextService::RefreshCandidates() {
         }
     }
 
+    if (!pinyinFallbackMode && compositionCode_.size() >= 4) {
+        for (const auto& pair : sessionAutoPhraseEntries_) {
+            const SessionAutoPhraseEntry& entry = pair.second;
+            if (entry.text.empty()) {
+                continue;
+            }
+            if (std::find(entry.codes.begin(), entry.codes.end(), compositionCode_) == entry.codes.end()) {
+                continue;
+            }
+
+            mergeCandidate(
+                entry.text,
+                compositionCode_,
+                compositionCode_,
+                0,
+                0,
+                true,
+                false,
+                false,
+                false,
+                false,
+                true,
+                false,
+                compositionCode_.size());
+        }
+    }
+
     const bool repeatBoostActive =
         autoPhraseSelectedStreak_ > 3 &&
         !lastAutoPhraseSelectedKey_.empty() &&
@@ -1777,12 +2755,11 @@ void TextService::RefreshCandidates() {
         const bool exactTwoCodePhrase =
             candidate.text.size() == 2 &&
             candidate.code.size() == 2 &&
-            candidate.commitCode.size() == 2 &&
-            candidate.fromSystemDict &&
-            !candidate.fromAutoPhrase;
+            candidate.commitCode.size() == 2;
         const bool twoCodeSingle =
             candidate.sortSingleChar && candidate.code.size() == 2 && candidate.commitCode.size() == 2;
         candidate.sortTwoCodeSingleOrPhrase = twoCodeSingle || exactTwoCodePhrase;
+        candidate.sortSystemFiveCodePhrase = candidate.fromSystemDict && candidate.text.size() >= 2 && sortCodeLength == 5;
 
         if (candidate.sortOneCodeSingleUsed) {
             candidate.sortShortCodeTier = 0;
@@ -1797,20 +2774,24 @@ void TextService::RefreshCandidates() {
         std::uint8_t tier = 7;
         if (candidate.sortNonGB2312Single) {
             tier = 250;
+        } else if (candidate.sortSystemFiveCodePhrase) {
+            tier = 240;
         } else if (candidate.sortSingleChar && sortCodeLength <= 1) {
             tier = 0;
-        } else if (candidate.text.size() == 2 && sortCodeLength == 2 && !candidate.fromAutoPhrase) {
+        } else if (candidate.text.size() == 2 && sortCodeLength == 2) {
             tier = 1;
         } else if (candidate.sortSingleChar && sortCodeLength == 2) {
             tier = 2;
         } else if (candidate.sortSingleChar && sortCodeLength == 3) {
             tier = 3;
-        } else if (candidate.fromAutoPhrase && sortCodeLength == 4) {
+        } else if (!candidate.exactMatch && sortCodeLength >= 4) {
             tier = 4;
-        } else if (!candidate.fromAutoPhrase && candidate.text.size() >= 2 && sortCodeLength == 4) {
+        } else if (candidate.fromAutoPhrase && sortCodeLength == 4) {
             tier = 5;
-        } else if (candidate.sortSingleChar && sortCodeLength == 4) {
+        } else if (!candidate.fromAutoPhrase && candidate.text.size() >= 2 && sortCodeLength == 4) {
             tier = 6;
+        } else if (candidate.sortSingleChar && sortCodeLength == 4) {
+            tier = 7;
         }
         candidate.sortPrimaryTier = tier;
     };
@@ -1835,14 +2816,6 @@ void TextService::RefreshCandidates() {
                     return left.sortSingleChar > right.sortSingleChar;
                 }
             }
-            if (left.sortPrimaryTier != right.sortPrimaryTier) {
-                return left.sortPrimaryTier < right.sortPrimaryTier;
-            }
-            if (queryCodeLength <= 2) {
-                if (left.sortShortCodeTier != right.sortShortCodeTier) {
-                    return left.sortShortCodeTier < right.sortShortCodeTier;
-                }
-            }
             if (left.exactMatch != right.exactMatch) {
                 return left.exactMatch > right.exactMatch;
             }
@@ -1851,6 +2824,20 @@ void TextService::RefreshCandidates() {
             }
             if (left.boostedLearned != right.boostedLearned) {
                 return left.boostedLearned > right.boostedLearned;
+            }
+            if (left.learnedScore != right.learnedScore) {
+                return left.learnedScore > right.learnedScore;
+            }
+            if (left.fromSessionAutoPhrase != right.fromSessionAutoPhrase) {
+                return left.fromSessionAutoPhrase > right.fromSessionAutoPhrase;
+            }
+            if (left.sortPrimaryTier != right.sortPrimaryTier) {
+                return left.sortPrimaryTier < right.sortPrimaryTier;
+            }
+            if (queryCodeLength <= 2) {
+                if (left.sortShortCodeTier != right.sortShortCodeTier) {
+                    return left.sortShortCodeTier < right.sortShortCodeTier;
+                }
             }
             if (left.sortGB2312Text != right.sortGB2312Text) {
                 return left.sortGB2312Text > right.sortGB2312Text;
@@ -1863,6 +2850,9 @@ void TextService::RefreshCandidates() {
             }
             if (left.boostedAutoRepeat != right.boostedAutoRepeat) {
                 return left.boostedAutoRepeat > right.boostedAutoRepeat;
+            }
+            if (left.sortSystemFiveCodePhrase != right.sortSystemFiveCodePhrase) {
+                return left.sortSystemFiveCodePhrase < right.sortSystemFiveCodePhrase;
             }
             if (left.sortNonGB2312Single != right.sortNonGB2312Single) {
                 return left.sortNonGB2312Single < right.sortNonGB2312Single;
@@ -1896,25 +2886,28 @@ const wchar_t* TextService::GetDictionaryProfileName(DictionaryProfile profile) 
         return L"zhengma-large-pinyin";
     case DictionaryProfile::ZhengmaLarge:
     default:
-        return L"zhengma-large";
+        return L"zhengma-all";
     }
 }
 
 bool TextService::ReloadActiveDictionaries() {
+    FlushPendingUserDataIfNeeded(true);
     const bool loaded = LoadConfiguredDictionaries();
 
-    if (!userDictPath_.empty()) {
-        engine_.LoadUserDictionaryFromFile(userDictPath_);
-    }
-    if (!autoPhraseDictPath_.empty()) {
-        engine_.LoadAutoPhraseDictionaryFromFile(autoPhraseDictPath_);
-    }
     if (!userFreqPath_.empty()) {
         engine_.LoadFrequencyFromFile(userFreqPath_);
     }
     if (!blockedEntriesPath_.empty()) {
         engine_.LoadBlockedEntriesFromFile(blockedEntriesPath_);
     }
+    if (!contextAssocPath_.empty()) {
+        LoadContextAssociationFromFile(contextAssocPath_);
+    }
+    if (!contextAssocBlacklistPath_.empty()) {
+        LoadContextAssociationBlacklistFromFile(contextAssocBlacklistPath_);
+    }
+
+    SyncUserDataFilesStamp();
 
     return loaded;
 }
@@ -1956,8 +2949,15 @@ bool TextService::LoadConfiguredDictionaries() {
     const auto root = ResolveDataRootFromModule(modulePath);
     const auto dataDir = root / "data";
     const auto packagedUserDictPath = dataDir / "yuninput_user.dict";
+    const auto packagedAutoPhraseDictPath = dataDir / "yuninput_user-extend.dict";
+    const auto singleCharSourcePath = dataDir / "zhengma-single.dict";
+    autoPhraseDictPath_ = packagedAutoPhraseDictPath.wstring();
 
-    EnsureSingleCharZhengmaCodeHintsLoaded(dataDir);
+    if (userDictPath_.empty()) {
+        userDictPath_ = packagedUserDictPath.wstring();
+    } else {
+        CopyFileIfMissing(packagedUserDictPath, std::filesystem::path(userDictPath_));
+    }
 
     std::filesystem::path profileDictPath;
     std::wstring profileName = GetDictionaryProfileName(dictionaryProfile_);
@@ -1967,7 +2967,7 @@ bool TextService::LoadConfiguredDictionaries() {
         break;
     case DictionaryProfile::ZhengmaLarge:
     default:
-        profileDictPath = dataDir / "zhengma-large.dict";
+        profileDictPath = dataDir / "zhengma-all.dict";
         break;
     }
 
@@ -1984,12 +2984,33 @@ bool TextService::LoadConfiguredDictionaries() {
         }
     }
 
-    const bool loadedPackagedUser = engine_.LoadUserDictionaryFromFile(packagedUserDictPath.wstring());
+    phraseBuildEngine_ = CompositionEngine{};
+    bool loadedPhraseBuildSource = false;
+    if (std::filesystem::exists(singleCharSourcePath)) {
+        loadedPhraseBuildSource = phraseBuildEngine_.LoadDictionaryFromFile(singleCharSourcePath.wstring());
+    }
+    if (!loadedPhraseBuildSource && loadedProfileDict) {
+        loadedPhraseBuildSource = phraseBuildEngine_.LoadDictionaryFromFile(profileDictPath.wstring());
+    }
+    phraseBuildEngine_.LoadDictionaryMetadataOnlyFromFile(packagedUserDictPath.wstring());
+
+    if (loadedPhraseBuildSource) {
+        singleCharZhengmaCodeHints_ = phraseBuildEngine_.BuildSingleCharCodeHintMap();
+    }
+    if (singleCharZhengmaCodeHints_.empty()) {
+        EnsureSingleCharZhengmaCodeHintsLoaded(dataDir);
+    }
+
+    const bool loadedPackagedUser = engine_.LoadUserDictionaryFromFile(userDictPath_);
+    const bool loadedPackagedAutoPhrase = engine_.LoadAutoPhraseDictionaryFromFile(autoPhraseDictPath_);
+
     Trace(
         L"Dictionary profile=" + profileName +
         L" profile_loaded=" + (loadedProfileDict ? L"1" : L"0") +
         L" fallback_loaded=" + (loadedFallback ? L"1" : L"0") +
         L" packaged_user=" + (loadedPackagedUser ? L"1" : L"0") +
+        L" packaged_extend=" + (loadedPackagedAutoPhrase ? L"1" : L"0") +
+        L" phrase_source=" + (loadedPhraseBuildSource ? L"1" : L"0") +
         (dictionaryProfile_ == DictionaryProfile::ZhengmaLargePinyin ? L" mode=pinyin-single-char-with-zhengma-hint" : L""));
 
     return loadedProfileDict || loadedFallback;
@@ -1998,7 +3019,10 @@ bool TextService::LoadConfiguredDictionaries() {
 void TextService::EnsureSingleCharZhengmaCodeHintsLoaded(const std::filesystem::path& dataDir) {
     singleCharZhengmaCodeHints_.clear();
 
-    const std::filesystem::path zhengmaPath = dataDir / "zhengma-large.dict";
+    std::filesystem::path zhengmaPath = dataDir / "zhengma-single.dict";
+    if (!std::filesystem::exists(zhengmaPath)) {
+        zhengmaPath = dataDir / "zhengma-large.dict";
+    }
     std::ifstream input(zhengmaPath, std::ios::in | std::ios::binary);
     if (!input) {
         Trace(L"load zhengma hint map failed path=" + zhengmaPath.wstring());
@@ -2106,7 +3130,7 @@ size_t TextService::FindPreferredSelectionIndexForPage(size_t pageIndex) const {
 
     auto scoreCandidate = [this](const CandidateItem& candidate) {
         int score = 0;
-        const bool exactFull = !compositionCode_.empty() && candidate.consumedLength >= compositionCode_.size();
+        const bool exactFull = !compositionCode_.empty() && candidate.exactMatch;
         if (exactFull) {
             score += 1000;
         }
@@ -2119,7 +3143,6 @@ size_t TextService::FindPreferredSelectionIndexForPage(size_t pageIndex) const {
         if (candidate.boostedLearned) {
             score += 100;
         }
-        score += static_cast<int>(candidate.consumedLength);
         return score;
     };
 
@@ -2182,12 +3205,12 @@ std::wstring TextService::MakeContextAssociationKey(const std::wstring& prevText
 }
 
 bool TextService::LoadContextAssociationFromFile(const std::wstring& filePath) {
+    contextAssociationScores_.clear();
+
     std::ifstream input(filePath, std::ios::in | std::ios::binary);
     if (!input) {
         return false;
     }
-
-    contextAssociationScores_.clear();
 
     std::string line;
     while (std::getline(input, line)) {
@@ -2216,12 +3239,12 @@ bool TextService::LoadContextAssociationFromFile(const std::wstring& filePath) {
 }
 
 bool TextService::LoadContextAssociationBlacklistFromFile(const std::wstring& filePath) {
+    contextAssociationBlacklist_.clear();
+
     std::ifstream input(filePath, std::ios::in | std::ios::binary);
     if (!input) {
         return false;
     }
-
-    contextAssociationBlacklist_.clear();
 
     std::string line;
     while (std::getline(input, line)) {
@@ -2440,16 +3463,6 @@ const std::vector<CandidateWindow::DisplayCandidate>& TextService::GetCurrentPag
             candidate.code = compositionCode_;
         }
 
-        const size_t consumedLength = std::min(allCandidates_[i].consumedLength, compositionCode_.size());
-        if (consumedLength < compositionCode_.size()) {
-            const std::wstring remaining = compositionCode_.substr(consumedLength);
-            if (!remaining.empty()) {
-                if (!candidate.code.empty()) {
-                    candidate.code += L"  ";
-                }
-                candidate.code += L"未完:" + remaining;
-            }
-        }
         candidate.boostedUser = allCandidates_[i].boostedUser;
         candidate.boostedLearned = allCandidates_[i].boostedLearned;
         candidate.boostedContext = allCandidates_[i].boostedContext;
@@ -2507,35 +3520,9 @@ void TextService::LearnPhraseFromRecentCommits(const std::wstring& committedCode
 
     const ULONGLONG now = GetTickCount64();
 
-    for (auto it = pendingPhraseStats_.begin(); it != pendingPhraseStats_.end();) {
-        if ((now - it->second.lastTick) > 60000ULL) {
-            it = pendingPhraseStats_.erase(it);
-        } else {
-            ++it;
-        }
-    }
-
-    while (pendingPhraseStats_.size() > 256) {
-        auto oldest = pendingPhraseStats_.begin();
-        for (auto it = pendingPhraseStats_.begin(); it != pendingPhraseStats_.end(); ++it) {
-            if (it->second.lastTick < oldest->second.lastTick) {
-                oldest = it;
-            }
-        }
-        pendingPhraseStats_.erase(oldest);
-    }
-
     while (!recentCommits_.empty() && (now - recentCommits_.front().tick) > 60000ULL) {
         recentCommits_.pop_front();
     }
-
-    const auto isLikelyPinyinSingleChar = [this](const std::wstring& code, const std::wstring& text) {
-        return dictionaryProfile_ == DictionaryProfile::ZhengmaLargePinyin &&
-               text.size() == 1 &&
-               code.size() >= 2;
-    };
-
-    const bool currentIsPinyinSingleChar = isLikelyPinyinSingleChar(committedCode, committedText);
 
     if (!recentCommits_.empty()) {
         const CommitHistoryItem& prev = recentCommits_.back();
@@ -2543,111 +3530,20 @@ void TextService::LearnPhraseFromRecentCommits(const std::wstring& committedCode
         if (closeEnough) {
             RecordContextAssociation(prev.text, committedText, 1);
             if (!contextAssocPath_.empty()) {
-                SaveContextAssociationToFile(contextAssocPath_);
+                const std::string snapshot = BuildContextAssociationFileContent();
+                {
+                    std::lock_guard<std::mutex> lock(userDataWriteMutex_);
+                    pendingContextAssocWrite_.path = contextAssocPath_;
+                    pendingContextAssocWrite_.content = snapshot;
+                    pendingContextAssocWrite_.deleteIfEmpty = false;
+                    pendingContextAssocWrite_.generation = ++nextUserDataWriteGeneration_;
+                }
+                userDataWriteCv_.notify_all();
             }
-        }
-        constexpr size_t kMaxLearnSpan = 6;
-        std::vector<CommitHistoryItem> window;
-        window.reserve(recentCommits_.size() + 1);
-        for (const auto& item : recentCommits_) {
-            if (item.text.empty() || item.code.empty()) {
-                continue;
-            }
-            if ((now - item.tick) > 60000ULL) {
-                continue;
-            }
-            if (isLikelyPinyinSingleChar(item.code, item.text)) {
-                continue;
-            }
-            window.push_back(item);
-        }
-
-        CommitHistoryItem current;
-        current.code = committedCode;
-        current.text = committedText;
-        current.tick = now;
-        if (!current.text.empty() && !current.code.empty() && !currentIsPinyinSingleChar) {
-            window.push_back(std::move(current));
-        }
-
-        bool learnedAnyPhrase = false;
-        if (window.size() >= 2) {
-            const size_t end = window.size() - 1;
-            const size_t minStart = end >= (kMaxLearnSpan - 1) ? (end - (kMaxLearnSpan - 1)) : 0;
-            for (size_t start = end; start > minStart; --start) {
-                const size_t phraseStart = start - 1;
-
-                std::wstring phraseText;
-                std::wstring fallbackCode;
-                phraseText.reserve(16);
-                fallbackCode.reserve(24);
-
-                for (size_t idx = phraseStart; idx <= end; ++idx) {
-                    phraseText += window[idx].text;
-                    fallbackCode += window[idx].code;
-                }
-
-                if (phraseText.size() < 2 || phraseText.size() > 8) {
-                    continue;
-                }
-
-                std::vector<std::wstring> phraseCodes;
-                if (!engine_.TryBuildPhraseCodes(phraseText, phraseCodes)) {
-                    phraseCodes.push_back(fallbackCode);
-                }
-                phraseCodes.erase(
-                    std::remove_if(
-                        phraseCodes.begin(),
-                        phraseCodes.end(),
-                        [](const std::wstring& code) {
-                            return code.empty();
-                        }),
-                    phraseCodes.end());
-                if (phraseCodes.empty()) {
-                    continue;
-                }
-
-                for (std::wstring& code : phraseCodes) {
-                    if (code.size() > 20) {
-                        code.resize(20);
-                    }
-                }
-
-                const std::wstring& phraseCode = phraseCodes.front();
-
-                const std::wstring phraseKey = phraseCode + L"\t" + phraseText;
-                PendingPhraseStat& stat = pendingPhraseStats_[phraseKey];
-                stat.hitCount += 1;
-                stat.lastTick = now;
-
-                const std::uint32_t requiredHits = phraseText.size() <= 4 ? 1U : 2U;
-
-                if (stat.hitCount >= requiredHits) {
-                    bool addedAny = false;
-                    for (const std::wstring& generatedCode : phraseCodes) {
-                        const bool added = engine_.AddAutoPhraseEntry(generatedCode, phraseText);
-                        addedAny = addedAny || added;
-                    }
-                    if (addedAny) {
-                        engine_.RecordCommit(phraseCode, phraseText, 2);
-                        AppendPhraseReviewEntry(phraseCode, phraseText, L"auto");
-                        learnedAnyPhrase = true;
-                        Trace(
-                            L"learn phrase(auto table contiguous)=" + phraseText +
-                            L" code=" + phraseCode +
-                            L" variants=" + std::to_wstring(phraseCodes.size()) +
-                            L" hits=" + std::to_wstring(stat.hitCount) +
-                            L" threshold=" + std::to_wstring(requiredHits));
-                    }
-                    pendingPhraseStats_.erase(phraseKey);
-                }
-            }
-        }
-
-        if (learnedAnyPhrase && !autoPhraseDictPath_.empty()) {
-            engine_.SaveAutoPhraseDictionaryToFile(autoPhraseDictPath_);
         }
     }
+
+    UpdateSessionAutoPhraseHistory(committedText, now);
 
     CommitHistoryItem item;
     item.code = committedCode;
@@ -2680,7 +3576,11 @@ bool TextService::CommitCandidateByGlobalIndex(ITfContext* context, size_t globa
 
     const ULONGLONG nowTick = GetTickCount64();
     const std::wstring selectedKey = freqCode + L"\t" + textToCommit;
-    if (candidate.fromAutoPhrase) {
+    if (candidate.fromSessionAutoPhrase) {
+        PromoteSessionAutoPhrase(textToCommit);
+    }
+
+    if (candidate.fromAutoPhrase || candidate.fromSessionAutoPhrase) {
         const bool withinWindow =
             autoPhraseSelectedTick_ != 0 &&
             nowTick >= autoPhraseSelectedTick_ &&
@@ -2700,9 +3600,8 @@ bool TextService::CommitCandidateByGlobalIndex(ITfContext* context, size_t globa
 
     engine_.RecordCommit(freqCode, textToCommit, freqBoost);
     LearnPhraseFromRecentCommits(freqCode, textToCommit);
-    if (!userFreqPath_.empty()) {
-        engine_.SaveFrequencyToFile(userFreqPath_);
-    }
+    MarkFrequencyDataDirty();
+    FlushPendingUserDataIfNeeded(false);
 
     if (keepComposing) {
         compositionCode_ = remainingCode;
@@ -2732,9 +3631,8 @@ bool TextService::PinCandidateByGlobalIndex(size_t globalIndex) {
     }
 
     engine_.PinEntry(pinCode, candidate.text);
-    if (!userDictPath_.empty()) {
-        engine_.SaveUserDictionaryToFile(userDictPath_);
-    }
+    MarkAutoPhraseDictionaryDirty();
+    FlushPendingUserDataIfNeeded(false);
 
     RefreshCandidates();
     Trace(L"pin code=" + pinCode + L" text=" + candidate.text);
@@ -2757,14 +3655,20 @@ bool TextService::BlockCandidateByGlobalIndex(size_t globalIndex) {
 
     engine_.BlockEntry(blockCode, candidate.text);
     if (!blockedEntriesPath_.empty()) {
-        engine_.SaveBlockedEntriesToFile(blockedEntriesPath_);
+        const std::string snapshot = engine_.BuildBlockedEntriesFileContent();
+        {
+            std::lock_guard<std::mutex> lock(userDataWriteMutex_);
+            pendingBlockedEntriesWrite_.path = blockedEntriesPath_;
+            pendingBlockedEntriesWrite_.content = snapshot;
+            pendingBlockedEntriesWrite_.deleteIfEmpty = false;
+            pendingBlockedEntriesWrite_.append = false;
+            pendingBlockedEntriesWrite_.generation = ++nextUserDataWriteGeneration_;
+        }
+        userDataWriteCv_.notify_all();
     }
-    if (!userDictPath_.empty()) {
-        engine_.SaveUserDictionaryToFile(userDictPath_);
-    }
-    if (!userFreqPath_.empty()) {
-        engine_.SaveFrequencyToFile(userFreqPath_);
-    }
+    MarkAutoPhraseDictionaryDirty();
+    MarkFrequencyDataDirty();
+    FlushPendingUserDataIfNeeded(false);
 
     RefreshCandidates();
     Trace(L"block code=" + blockCode + L" text=" + candidate.text);
@@ -2858,7 +3762,11 @@ bool TextService::CommitAsciiKey(ITfContext* context, WPARAM wParam, LPARAM lPar
         }
     }
 
-    return CommitText(context, std::wstring(1, c));
+    const bool committed = CommitText(context, std::wstring(1, c));
+    if (committed) {
+        RecordSessionAutoPhraseBreak();
+    }
+    return committed;
 }
 
 bool TextService::PromoteSelectedCandidateToManualEntry() {
@@ -2883,23 +3791,58 @@ bool TextService::PromoteSelectedCandidateToManualEntry() {
         return false;
     }
 
-    engine_.PinEntry(manualCode, candidate.text);
-    if (!userDictPath_.empty()) {
-        engine_.SaveUserDictionaryToFile(userDictPath_);
+    const auto normalizePhraseCode = [](std::wstring code) {
+        std::transform(
+            code.begin(),
+            code.end(),
+            code.begin(),
+            [](wchar_t ch) {
+                return static_cast<wchar_t>(std::towlower(static_cast<wint_t>(ch)));
+            });
+        code.erase(
+            std::remove_if(
+                code.begin(),
+                code.end(),
+                [](wchar_t ch) {
+                    return ch < L'a' || ch > L'z';
+                }),
+            code.end());
+        return code;
+    };
+
+    std::vector<std::wstring> manualCodes;
+    manualCodes.push_back(manualCode);
+    if (candidate.text.size() >= 2) {
+        std::vector<std::wstring> phraseCodes;
+        if (phraseBuildEngine_.TryBuildPhraseCodes(candidate.text, phraseCodes)) {
+            for (std::wstring& phraseCode : phraseCodes) {
+                phraseCode = normalizePhraseCode(std::move(phraseCode));
+                if (phraseCode.empty()) {
+                    continue;
+                }
+                if (std::find(manualCodes.begin(), manualCodes.end(), phraseCode) == manualCodes.end()) {
+                    manualCodes.push_back(std::move(phraseCode));
+                }
+            }
+        }
     }
-    AppendPhraseReviewEntry(manualCode, candidate.text, L"manual");
+
+    bool changed = false;
+    for (const std::wstring& code : manualCodes) {
+        changed = engine_.PinEntry(code, candidate.text) || changed;
+        AppendPhraseReviewEntry(code, candidate.text, L"manual");
+    }
+    if (changed || !manualCodes.empty()) {
+        MarkAutoPhraseDictionaryDirty();
+        FlushPendingUserDataIfNeeded(false);
+    }
     RefreshCandidates();
-    Trace(L"manual phrase code=" + manualCode + L" text=" + candidate.text);
-    return true;
+    Trace(L"manual phrase code=" + manualCode + L" text=" + candidate.text + L" variants=" + std::to_wstring(manualCodes.size()));
+    return changed || !manualCodes.empty();
 }
 
-void TextService::AppendPhraseReviewEntry(const std::wstring& code, const std::wstring& text, const wchar_t* sourceTag) const {
+void TextService::AppendPhraseReviewEntry(const std::wstring& code, const std::wstring& text, const wchar_t* sourceTag) {
     if (manualPhraseReviewPath_.empty() || code.empty() || text.empty() || sourceTag == nullptr) {
-        return;
-    }
-
-    std::ofstream output(manualPhraseReviewPath_, std::ios::out | std::ios::binary | std::ios::app);
-    if (!output) {
         return;
     }
 
@@ -2913,7 +3856,7 @@ void TextService::AppendPhraseReviewEntry(const std::wstring& code, const std::w
         WideToUtf8Text(text) + " " +
         WideToUtf8Text(sourceTag) + " " +
         WideToUtf8Text(timestamp) + "\n";
-    output.write(line.data(), static_cast<std::streamsize>(line.size()));
+    QueueManualPhraseReviewAppend(line);
 }
 
 bool TextService::CommitText(ITfContext* context, const std::wstring& text) {
@@ -2923,6 +3866,21 @@ bool TextService::CommitText(ITfContext* context, const std::wstring& text) {
     }
 
     const bool sent = SendUnicodeTextWithInput(text);
+    if (sent) {
+        bool hasHan = false;
+        bool hasNonHan = false;
+        for (wchar_t ch : text) {
+            if (IsHanCharacter(ch)) {
+                hasHan = true;
+            } else {
+                hasNonHan = true;
+            }
+        }
+
+        if (!hasHan || hasNonHan) {
+            RecordSessionAutoPhraseBreak();
+        }
+    }
     Trace(std::wstring(L"CommitText direct SendInput=") + (sent ? L"1" : L"0") + L" text=" + text);
     return sent;
 }
@@ -3045,6 +4003,9 @@ void TextService::LoadSettings() {
         if (_wcsicmp(dictionaryProfileValue.c_str(), L"zhengma-large-pinyin") == 0 ||
             _wcsicmp(dictionaryProfileValue.c_str(), L"pinyin") == 0) {
             dictionaryProfile_ = DictionaryProfile::ZhengmaLargePinyin;
+        } else if (_wcsicmp(dictionaryProfileValue.c_str(), L"zhengma-all") == 0 ||
+                   _wcsicmp(dictionaryProfileValue.c_str(), L"zhengma-large") == 0) {
+            dictionaryProfile_ = DictionaryProfile::ZhengmaLarge;
         } else {
             dictionaryProfile_ = DictionaryProfile::ZhengmaLarge;
         }
@@ -3154,6 +4115,8 @@ STDMETHODIMP TextService::OnSetFocus(BOOL foreground) {
         }
         candidateWindow_.Hide();
         Trace(L"OnSetFocus(BOOL): hide candidate window");
+    } else {
+        ReloadUserDataIfChanged(false);
     }
     return S_OK;
 }
@@ -3182,6 +4145,7 @@ STDMETHODIMP TextService::OnUninitDocumentMgr(ITfDocumentMgr* documentMgr) {
 
 STDMETHODIMP TextService::OnSetFocus(ITfDocumentMgr* documentMgrFocus, ITfDocumentMgr* documentMgrPrevFocus) {
     if (documentMgrFocus != documentMgrPrevFocus) {
+        ReloadUserDataIfChanged(false);
         if (!compositionCode_.empty()) {
             ClearComposition();
         }
@@ -3722,9 +4686,8 @@ STDMETHODIMP TextService::OnKeyDown(ITfContext* context, WPARAM wParam, LPARAM l
         const bool pinyinQueryMode = dictionaryProfile_ == DictionaryProfile::ZhengmaLargePinyin;
         const auto countExactCandidates = [this]() {
             size_t count = 0;
-            const size_t currentCodeLength = compositionCode_.size();
             for (const CandidateItem& item : allCandidates_) {
-                if (item.consumedLength >= currentCodeLength) {
+                if (item.exactMatch) {
                     ++count;
                 }
             }
@@ -3742,16 +4705,19 @@ STDMETHODIMP TextService::OnKeyDown(ITfContext* context, WPARAM wParam, LPARAM l
         if (shouldAutoCommitDuringTyping && !shouldSuppressAutoCommitForPinyin && compositionCode_.size() >= kAutoCommitCodeLength) {
             bool autoCommitted = false;
             if (!allCandidates_.empty()) {
-                const size_t currentCodeLength = compositionCode_.size();
                 size_t commitIndex = 0;
+                bool foundExact = false;
                 for (size_t i = 0; i < allCandidates_.size(); ++i) {
-                    if (allCandidates_[i].consumedLength >= currentCodeLength) {
+                    if (allCandidates_[i].exactMatch) {
                         commitIndex = i;
+                        foundExact = true;
                         break;
                     }
                 }
 
-                autoCommitted = CommitCandidateByGlobalIndex(context, commitIndex, 1);
+                if (foundExact) {
+                    autoCommitted = CommitCandidateByGlobalIndex(context, commitIndex, 1);
+                }
                 if (autoCommitted) {
                     Trace(L"auto-commit first candidate on 4-code overflow");
                 }
@@ -3771,7 +4737,7 @@ STDMETHODIMP TextService::OnKeyDown(ITfContext* context, WPARAM wParam, LPARAM l
         if (shouldAutoCommitDuringTyping && !shouldSuppressAutoCommitForPinyin && autoCommitUniqueExact_ && !compositionCode_.empty()) {
             size_t uniqueExactIndex = 0;
             if (compositionCode_.size() >= static_cast<size_t>(autoCommitMinCodeLength_) && TryFindUniqueExactCommitCandidateIndex(uniqueExactIndex)) {
-                if (CommitCandidateByGlobalIndex(context, uniqueExactIndex, 2)) {
+                if (CommitCandidateByGlobalIndex(context, uniqueExactIndex, 1)) {
                     Trace(L"auto-commit exact before continue input");
                 }
             }
@@ -3879,7 +4845,7 @@ STDMETHODIMP TextService::OnKeyDown(ITfContext* context, WPARAM wParam, LPARAM l
         if (selectionOffset < pageCandidateCount) {
             const size_t pageStart = pageIndex_ * pageSize_;
             const size_t index = pageStart + selectionOffset;
-            CommitCandidateByGlobalIndex(context, index, 3);
+            CommitCandidateByGlobalIndex(context, index, 1);
         } else {
             commitRawCompositionThenKey(wParam, lParam);
         }
@@ -3904,7 +4870,7 @@ STDMETHODIMP TextService::OnKeyDown(ITfContext* context, WPARAM wParam, LPARAM l
                 if (enterExactPriority_) {
                     size_t exactIndex = 0;
                     if (TryFindExactCommitCandidateIndex(exactIndex)) {
-                        if (CommitCandidateByGlobalIndex(context, exactIndex, 2)) {
+                        if (CommitCandidateByGlobalIndex(context, exactIndex, 1)) {
                             *eaten = TRUE;
                         }
                     } else {
@@ -3921,7 +4887,7 @@ STDMETHODIMP TextService::OnKeyDown(ITfContext* context, WPARAM wParam, LPARAM l
                 } else {
                     const size_t safeIndexInPage = std::min(selectedIndexInPage_, pageCandidateCount - 1);
                     const size_t globalIndex = pageIndex_ * pageSize_ + safeIndexInPage;
-                    if (CommitCandidateByGlobalIndex(context, globalIndex, 2)) {
+                    if (CommitCandidateByGlobalIndex(context, globalIndex, 1)) {
                         *eaten = TRUE;
                     }
                 }

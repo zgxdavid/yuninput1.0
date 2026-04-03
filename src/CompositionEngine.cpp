@@ -13,6 +13,7 @@
 namespace {
 
 constexpr std::uint64_t kFrequencyScoreMax = 255;
+constexpr const char* kTextFrequencyCommentPrefix = "#textfreq ";
 
 struct CandidateScore {
     std::wstring text;
@@ -35,7 +36,72 @@ struct CandidateScore {
     int lengthPreferenceScore = 100;
     bool preferredTwoCharPhrase = false;
     int twoCodePriorityTier = 3;
+    bool hasSystemFiveCodePhrase = false;
 };
+
+bool IsGb2312SingleCandidate(const std::wstring& text) {
+    if (text.size() != 1) {
+        return false;
+    }
+
+    char bytes[4] = {};
+    BOOL usedDefaultChar = FALSE;
+    const int len = WideCharToMultiByte(
+        20936,
+        WC_NO_BEST_FIT_CHARS,
+        text.c_str(),
+        1,
+        bytes,
+        static_cast<int>(sizeof(bytes)),
+        nullptr,
+        &usedDefaultChar);
+    if (len != 2 || usedDefaultChar) {
+        return false;
+    }
+
+    const unsigned char b1 = static_cast<unsigned char>(bytes[0]);
+    const unsigned char b2 = static_cast<unsigned char>(bytes[1]);
+    return b1 >= 0xB0 && b1 <= 0xF7 && b2 >= 0xA1 && b2 <= 0xFE;
+}
+
+bool IsHanText(const std::wstring& text) {
+    if (text.empty()) {
+        return false;
+    }
+
+    for (wchar_t ch : text) {
+        const bool isHan =
+            (ch >= 0x3400 && ch <= 0x4DBF) ||
+            (ch >= 0x4E00 && ch <= 0x9FFF) ||
+            (ch >= 0xF900 && ch <= 0xFAFF);
+        if (!isHan) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+bool IsFrequencyEligibleEntry(const std::wstring& code, const std::wstring& text) {
+    if (text.empty()) {
+        return false;
+    }
+
+    if (IsGb2312SingleCandidate(text)) {
+        return true;
+    }
+
+    return text.size() >= 2 && code.size() == 4 && IsHanText(text);
+}
+
+std::uint64_t SaturatingAddFrequency(std::uint64_t current, std::uint64_t boost) {
+    const std::uint64_t room = kFrequencyScoreMax > current ? (kFrequencyScoreMax - current) : 0;
+    return current + std::min(room, boost);
+}
+
+bool IsSystemFiveCodePhraseEntry(const CompositionEngine::Entry& entry) {
+    return !entry.isUser && entry.text.size() >= 2 && entry.code.size() == 5;
+}
 
 bool IsPreferredTwoCharPhraseCandidate(const CandidateScore& score, size_t queryCodeLength) {
     if (queryCodeLength != 2) {
@@ -47,14 +113,6 @@ bool IsPreferredTwoCharPhraseCandidate(const CandidateScore& score, size_t query
     }
 
     if (!score.exactCode) {
-        return false;
-    }
-
-    if (!score.hasSystemSource) {
-        return false;
-    }
-
-    if (score.hasAutoPhrase) {
         return false;
     }
 
@@ -75,8 +133,6 @@ int GetTwoCodePriorityTier(const CandidateScore& score, size_t queryCodeLength) 
     }
 
     if (score.text.size() == 2 &&
-        score.hasSystemSource &&
-        !score.hasAutoPhrase &&
         score.shortestCodeLength == 2 &&
         score.displayCodeLength == 2) {
         return 1;
@@ -86,7 +142,7 @@ int GetTwoCodePriorityTier(const CandidateScore& score, size_t queryCodeLength) 
         return 2;
     }
 
-    if (score.text.size() == 2 && score.hasSystemSource && !score.hasAutoPhrase) {
+    if (score.text.size() == 2) {
         return 3;
     }
 
@@ -222,6 +278,30 @@ int GetSingleCharShortCodeRank(const CandidateScore& score) {
     return 3;
 }
 
+std::wstring BuildPrefixKey(const std::wstring& code, size_t prefixLength) {
+    if (code.empty() || prefixLength == 0) {
+        return L"";
+    }
+
+    return code.substr(0, std::min(prefixLength, code.size()));
+}
+
+bool IsBetterSingleCharCodeEntry(const CompositionEngine::Entry& candidate, const CompositionEngine::Entry* bestEntry) {
+    if (bestEntry == nullptr) {
+        return true;
+    }
+
+    // Phrase construction should prefer the longest actual source code and
+    // avoid falling back to short-code variants when a full code exists.
+    if (candidate.code.size() != bestEntry->code.size()) {
+        return candidate.code.size() > bestEntry->code.size();
+    }
+    if (candidate.staticScore != bestEntry->staticScore) {
+        return candidate.staticScore > bestEntry->staticScore;
+    }
+    return candidate.loadOrder < bestEntry->loadOrder;
+}
+
 bool IsCodeToken(const std::string& token) {
     if (token.empty()) {
         return false;
@@ -234,6 +314,31 @@ bool IsCodeToken(const std::string& token) {
     }
 
     return true;
+}
+
+std::string TrimAsciiWhitespace(const std::string& value) {
+    size_t start = 0;
+    while (start < value.size() && std::isspace(static_cast<unsigned char>(value[start]))) {
+        ++start;
+    }
+
+    size_t end = value.size();
+    while (end > start && std::isspace(static_cast<unsigned char>(value[end - 1]))) {
+        --end;
+    }
+
+    return value.substr(start, end - start);
+}
+
+std::string ToLowerAscii(std::string value) {
+    std::transform(
+        value.begin(),
+        value.end(),
+        value.begin(),
+        [](unsigned char ch) {
+            return static_cast<char>(std::tolower(ch));
+        });
+    return value;
 }
 
 bool IsLikelyBrokenCandidate(const std::wstring& text) {
@@ -272,11 +377,18 @@ bool AppendPhraseCodePart(
     }
 
     const std::wstring& code = charCodes[textIndex];
-    if (part.codeIndex >= code.size()) {
+    if (code.empty()) {
         return false;
     }
 
-    outCode.push_back(code[part.codeIndex]);
+    if (code.size() == 1 && part.codeIndex > 0) {
+        outCode.push_back(L'v');
+        return true;
+    }
+
+    // Tolerate shorter source codes by falling back to the last available code letter.
+    const size_t safeCodeIndex = std::min(part.codeIndex, code.size() - 1);
+    outCode.push_back(code[safeCodeIndex]);
     return true;
 }
 
@@ -296,34 +408,142 @@ bool BuildPhraseCodeFromPattern(
     return !outCode.empty();
 }
 
+std::vector<size_t> BuildMinCodeLengthsForPattern(
+    size_t textLength,
+    const std::vector<CompositionEngine::PhraseCodePart>& pattern) {
+    std::vector<size_t> requiredLengths(textLength, 1);
+    for (const CompositionEngine::PhraseCodePart& part : pattern) {
+        if (part.noOp) {
+            continue;
+        }
+
+        const size_t textIndex = part.fromEnd ? (textLength - 1) : part.charIndex;
+        if (textIndex >= textLength) {
+            continue;
+        }
+
+        requiredLengths[textIndex] = std::max(requiredLengths[textIndex], part.codeIndex + 1);
+    }
+
+    return requiredLengths;
+}
+
+bool IsNonGb2312SingleCandidate(const CandidateScore& score) {
+    return score.text.size() == 1 && score.commonCharRank >= 320;
+}
+
+void PushUniquePhrasePattern(
+    const std::vector<CompositionEngine::PhraseCodePart>& pattern,
+    std::vector<std::vector<CompositionEngine::PhraseCodePart>>& outPatterns) {
+    if (pattern.empty()) {
+        return;
+    }
+
+    if (std::find(outPatterns.begin(), outPatterns.end(), pattern) == outPatterns.end()) {
+        outPatterns.push_back(pattern);
+    }
+}
+
+void CollectCompatiblePhrasePatterns(
+    size_t textLength,
+    const std::vector<CompositionEngine::PhraseCodePart>& primaryPattern,
+    std::vector<std::vector<CompositionEngine::PhraseCodePart>>& outPatterns) {
+    outPatterns.clear();
+    PushUniquePhrasePattern(primaryPattern, outPatterns);
+
+    if (textLength == 2) {
+        size_t firstCharTailIndex = 0;
+        size_t secondCharTailIndex = 0;
+        bool firstCharTailFound = false;
+        bool secondCharTailFound = false;
+        for (const CompositionEngine::PhraseCodePart& part : primaryPattern) {
+            if (part.noOp || part.fromEnd || part.codeIndex == 0) {
+                continue;
+            }
+
+            if (part.charIndex == 0) {
+                firstCharTailIndex = part.codeIndex;
+                firstCharTailFound = true;
+            } else if (part.charIndex == 1) {
+                secondCharTailIndex = part.codeIndex;
+                secondCharTailFound = true;
+            }
+        }
+
+        if (firstCharTailFound && secondCharTailFound) {
+            constexpr size_t kMaxTwoCharTailIndex = 3;
+            for (size_t firstTailIndex = firstCharTailIndex; firstTailIndex <= kMaxTwoCharTailIndex; ++firstTailIndex) {
+                for (size_t secondTailIndex = secondCharTailIndex; secondTailIndex <= kMaxTwoCharTailIndex; ++secondTailIndex) {
+                    if (firstTailIndex == firstCharTailIndex && secondTailIndex == secondCharTailIndex) {
+                        continue;
+                    }
+
+                    std::vector<CompositionEngine::PhraseCodePart> compatiblePattern = primaryPattern;
+                    bool adjusted = false;
+                    for (CompositionEngine::PhraseCodePart& part : compatiblePattern) {
+                        if (part.noOp || part.fromEnd || part.codeIndex == 0) {
+                            continue;
+                        }
+
+                        if (part.charIndex == 0 && part.codeIndex == firstCharTailIndex) {
+                            part.codeIndex = firstTailIndex;
+                            adjusted = adjusted || (firstTailIndex != firstCharTailIndex);
+                        } else if (part.charIndex == 1 && part.codeIndex == secondCharTailIndex) {
+                            part.codeIndex = secondTailIndex;
+                            adjusted = adjusted || (secondTailIndex != secondCharTailIndex);
+                        }
+                    }
+
+                    if (adjusted) {
+                        PushUniquePhrasePattern(compatiblePattern, outPatterns);
+                    }
+                }
+            }
+        }
+        return;
+    }
+
+    if (textLength == 3) {
+        std::vector<CompositionEngine::PhraseCodePart> secondCharSecondCode = primaryPattern;
+        bool adjusted = false;
+        for (CompositionEngine::PhraseCodePart& part : secondCharSecondCode) {
+            if (!part.noOp && !part.fromEnd && part.charIndex == 1 && part.codeIndex == 2) {
+                part.codeIndex = 1;
+                adjusted = true;
+                break;
+            }
+        }
+
+        if (adjusted) {
+            PushUniquePhrasePattern(secondCharSecondCode, outPatterns);
+        }
+        return;
+    }
+
+    if (textLength >= 5) {
+        std::vector<CompositionEngine::PhraseCodePart> lastCharHeadCode = primaryPattern;
+        bool adjusted = false;
+        for (CompositionEngine::PhraseCodePart& part : lastCharHeadCode) {
+            if (!part.noOp && !part.fromEnd && part.charIndex == 3 && part.codeIndex == 0) {
+                part.fromEnd = true;
+                part.charIndex = 0;
+                adjusted = true;
+                break;
+            }
+        }
+
+        if (adjusted) {
+            PushUniquePhrasePattern(lastCharHeadCode, outPatterns);
+        }
+    }
+}
+
 void PushUniqueCode(std::vector<std::wstring>& outCodes, const std::wstring& code) {
     if (code.empty()) {
         return;
     }
     if (std::find(outCodes.begin(), outCodes.end(), code) == outCodes.end()) {
         outCodes.push_back(code);
-    }
-}
-
-void ExpandCodeToleranceVariants(const std::wstring& baseCode, std::vector<std::wstring>& outCodes) {
-    if (baseCode.empty()) {
-        return;
-    }
-
-    PushUniqueCode(outCodes, baseCode);
-    if (baseCode.size() >= 2) {
-        PushUniqueCode(outCodes, baseCode.substr(0, 2));
-    }
-    if (baseCode.size() >= 3) {
-        std::wstring firstThird;
-        firstThird.push_back(baseCode[0]);
-        firstThird.push_back(baseCode[2]);
-        PushUniqueCode(outCodes, firstThird);
-    }
-    if (baseCode.size() == 1) {
-        std::wstring padded = baseCode;
-        padded.push_back(L'v');
-        PushUniqueCode(outCodes, padded);
     }
 }
 
@@ -389,8 +609,11 @@ std::string CompositionEngine::WideToUtf8(const std::wstring& input) {
     return output;
 }
 
-std::wstring CompositionEngine::MakeFreqKey(const std::wstring& code, const std::wstring& text) {
-    return code + L"\t" + text;
+CompositionEngine::CandidateKey CompositionEngine::MakeCandidateKey(const std::wstring& code, const std::wstring& text) {
+    CandidateKey key;
+    key.code = code;
+    key.text = text;
+    return key;
 }
 
 std::wstring CompositionEngine::NormalizeCode(const std::wstring& code) {
@@ -398,10 +621,12 @@ std::wstring CompositionEngine::NormalizeCode(const std::wstring& code) {
     normalized.reserve(code.size());
 
     for (wchar_t ch : code) {
-        if (ch >= L'A' && ch <= L'Z') {
-            normalized.push_back(static_cast<wchar_t>(ch - L'A' + L'a'));
-        } else {
-            normalized.push_back(ch);
+        wchar_t lowered = ch;
+        if (lowered >= L'A' && lowered <= L'Z') {
+            lowered = static_cast<wchar_t>(lowered - L'A' + L'a');
+        }
+        if (lowered >= L'a' && lowered <= L'z') {
+            normalized.push_back(lowered);
         }
     }
 
@@ -410,21 +635,22 @@ std::wstring CompositionEngine::NormalizeCode(const std::wstring& code) {
 
 bool CompositionEngine::TryParsePhraseRuleToken(const std::string& token, PhraseCodePart& outPart) {
     outPart = PhraseCodePart{};
-    if (token.size() != 3) {
+    const std::string trimmedToken = TrimAsciiWhitespace(token);
+    if (trimmedToken.size() != 3) {
         return false;
     }
 
-    const char direction = static_cast<char>(std::tolower(static_cast<unsigned char>(token[0])));
+    const char direction = static_cast<char>(std::tolower(static_cast<unsigned char>(trimmedToken[0])));
     if (direction != 'p' && direction != 'n') {
         return false;
     }
 
-    if (!std::isdigit(static_cast<unsigned char>(token[1])) || !std::isdigit(static_cast<unsigned char>(token[2]))) {
+    if (!std::isdigit(static_cast<unsigned char>(trimmedToken[1])) || !std::isdigit(static_cast<unsigned char>(trimmedToken[2]))) {
         return false;
     }
 
-    const int charOrdinal = token[1] - '0';
-    const int codeOrdinal = token[2] - '0';
+    const int charOrdinal = trimmedToken[1] - '0';
+    const int codeOrdinal = trimmedToken[2] - '0';
     if (charOrdinal == 0 || codeOrdinal == 0) {
         outPart.noOp = true;
         return true;
@@ -438,18 +664,20 @@ bool CompositionEngine::TryParsePhraseRuleToken(const std::string& token, Phrase
 
 bool CompositionEngine::TryParsePhraseRuleSpec(const std::string& key, const std::string& value, PhraseRule& outRule) {
     outRule = PhraseRule{};
-    if (key.size() < 2) {
+    const std::string trimmedKey = TrimAsciiWhitespace(key);
+    const std::string trimmedValue = TrimAsciiWhitespace(value);
+    if (trimmedKey.size() < 2) {
         return false;
     }
 
-    const char scope = static_cast<char>(std::tolower(static_cast<unsigned char>(key[0])));
+    const char scope = static_cast<char>(std::tolower(static_cast<unsigned char>(trimmedKey[0])));
     if (scope != 'e' && scope != 'a') {
         return false;
     }
 
     size_t length = 0;
     try {
-        length = static_cast<size_t>(std::stoul(key.substr(1)));
+        length = static_cast<size_t>(std::stoul(trimmedKey.substr(1)));
     }
     catch (...) {
         return false;
@@ -460,7 +688,7 @@ bool CompositionEngine::TryParsePhraseRuleSpec(const std::string& key, const std
     }
 
     std::vector<PhraseCodePart> parts;
-    std::istringstream iss(value);
+    std::istringstream iss(trimmedValue);
     std::string token;
     while (std::getline(iss, token, '+')) {
         PhraseCodePart part;
@@ -501,15 +729,16 @@ void CompositionEngine::UpsertPhraseRule(const PhraseRule& rule) {
 }
 
 void CompositionEngine::ProcessMetadataLine(const std::string& line) {
+    const std::string trimmedLine = TrimAsciiWhitespace(line);
     const std::string constructPrefix = "# yuninput:construct_phrase=";
     const std::string rulePrefix = "# yuninput:rule:";
-    if (line.rfind(constructPrefix, 0) == 0) {
-        constructPhrasePrefix_ = Utf8ToWide(line.substr(constructPrefix.size()));
+    if (trimmedLine.rfind(constructPrefix, 0) == 0) {
+        constructPhrasePrefix_ = Utf8ToWide(trimmedLine.substr(constructPrefix.size()));
         return;
     }
 
-    if (line.rfind(rulePrefix, 0) == 0) {
-        const std::string spec = line.substr(rulePrefix.size());
+    if (trimmedLine.rfind(rulePrefix, 0) == 0) {
+        const std::string spec = trimmedLine.substr(rulePrefix.size());
         const size_t equalPos = spec.find('=');
         if (equalPos != std::string::npos) {
             PhraseRule rule;
@@ -539,19 +768,6 @@ void CompositionEngine::LoadDictionaryMetadataFromFile(const std::wstring& fileP
 bool CompositionEngine::TryGetBestSingleCharCode(wchar_t ch, size_t minLength, std::wstring& outCode) const {
     outCode.clear();
 
-    const auto isBetterCode = [](const Entry& candidate, const Entry* bestEntry) {
-        if (bestEntry == nullptr) {
-            return true;
-        }
-        if (candidate.code.size() != bestEntry->code.size()) {
-            return candidate.code.size() < bestEntry->code.size();
-        }
-        if (candidate.staticScore != bestEntry->staticScore) {
-            return candidate.staticScore > bestEntry->staticScore;
-        }
-        return candidate.loadOrder < bestEntry->loadOrder;
-    };
-
     const Entry* bestEntry = nullptr;
     for (const Entry& entry : entries_) {
         if (entry.text.size() != 1 || entry.text[0] != ch) {
@@ -560,10 +776,10 @@ bool CompositionEngine::TryGetBestSingleCharCode(wchar_t ch, size_t minLength, s
         if (entry.code.size() < minLength) {
             continue;
         }
-        if (blockedEntries_.find(MakeFreqKey(entry.code, entry.text)) != blockedEntries_.end()) {
+        if (blockedEntries_.find(MakeCandidateKey(entry.code, entry.text)) != blockedEntries_.end()) {
             continue;
         }
-        if (isBetterCode(entry, bestEntry)) {
+        if (IsBetterSingleCharCodeEntry(entry, bestEntry)) {
             bestEntry = &entry;
         }
     }
@@ -606,46 +822,10 @@ bool CompositionEngine::TryBuildPhraseCodeFromConfiguredRules(const std::vector<
     return false;
 }
 
-bool CompositionEngine::TryBuildPhraseCode(const std::wstring& text, std::wstring& outCode) const {
-    outCode.clear();
-    if (text.size() < 2) {
+bool CompositionEngine::TryResolvePhrasePattern(size_t textLength, std::vector<PhraseCodePart>& outPattern) const {
+    outPattern.clear();
+    if (textLength < 2) {
         return false;
-    }
-
-    std::vector<std::wstring> charCodes;
-    charCodes.reserve(text.size());
-
-    size_t requiredCodeLength = 1;
-    if (text.size() == 2) {
-        requiredCodeLength = 2;
-    }
-    else if (text.size() == 3) {
-        // 3-char auto phrase: require full-code single-char sources (4-code preferred).
-        requiredCodeLength = 4;
-    }
-
-    for (wchar_t ch : text) {
-        std::wstring charCode;
-        if (!TryGetBestSingleCharCode(ch, requiredCodeLength, charCode)) {
-            return false;
-        }
-        charCodes.push_back(std::move(charCode));
-    }
-
-    static const std::vector<PhraseCodePart> kRule4Plus = {
-        {false, 0, 0, false},
-        {false, 1, 0, false},
-        {false, 2, 0, false},
-        {false, 3, 0, false},
-    };
-
-    // Native Zhengma 4+ phrase rule: use first-four head codes.
-    if (text.size() > 4) {
-        return BuildPhraseCodeFromPattern(charCodes, kRule4Plus, outCode);
-    }
-
-    if (TryBuildPhraseCodeFromConfiguredRules(charCodes, outCode)) {
-        return true;
     }
 
     static const std::vector<PhraseCodePart> kRule2 = {
@@ -660,14 +840,87 @@ bool CompositionEngine::TryBuildPhraseCode(const std::wstring& text, std::wstrin
         {false, 2, 0, false},
         {false, 2, 1, false},
     };
-    if (text.size() == 2) {
-        return BuildPhraseCodeFromPattern(charCodes, kRule2, outCode);
-    }
-    if (text.size() == 3) {
-        return BuildPhraseCodeFromPattern(charCodes, kRule3, outCode);
+    static const std::vector<PhraseCodePart> kRule4Plus = {
+        {false, 0, 0, false},
+        {false, 1, 0, false},
+        {false, 2, 0, false},
+        {false, 3, 0, false},
+    };
+
+    const PhraseRule* bestAtLeastRule = nullptr;
+    for (const PhraseRule& rule : phraseRules_) {
+        if (rule.exactLength) {
+            if (rule.length == textLength) {
+                outPattern = rule.parts;
+                return true;
+            }
+            continue;
+        }
+
+        if (rule.length <= textLength) {
+            if (bestAtLeastRule == nullptr || rule.length > bestAtLeastRule->length) {
+                bestAtLeastRule = &rule;
+            }
+        }
     }
 
-    return BuildPhraseCodeFromPattern(charCodes, kRule4Plus, outCode);
+    if (bestAtLeastRule != nullptr) {
+        outPattern = bestAtLeastRule->parts;
+        return true;
+    }
+
+    if (textLength == 2) {
+        outPattern = kRule2;
+        return true;
+    }
+    if (textLength == 3) {
+        outPattern = kRule3;
+        return true;
+    }
+
+    outPattern = kRule4Plus;
+    return true;
+}
+
+bool CompositionEngine::TryCollectPhraseCharCodes(
+    const std::wstring& text,
+    const std::vector<PhraseCodePart>& pattern,
+    std::vector<std::wstring>& outCodes) const {
+    outCodes.clear();
+    if (text.empty()) {
+        return false;
+    }
+
+    outCodes.reserve(text.size());
+    for (size_t i = 0; i < text.size(); ++i) {
+        std::wstring charCode;
+        if (!TryGetBestSingleCharCode(text[i], 1, charCode)) {
+            outCodes.clear();
+            return false;
+        }
+        outCodes.push_back(std::move(charCode));
+    }
+
+    return true;
+}
+
+bool CompositionEngine::TryBuildPhraseCode(const std::wstring& text, std::wstring& outCode) const {
+    outCode.clear();
+    if (text.size() < 2) {
+        return false;
+    }
+
+    std::vector<PhraseCodePart> pattern;
+    if (!TryResolvePhrasePattern(text.size(), pattern)) {
+        return false;
+    }
+
+    std::vector<std::wstring> charCodes;
+    if (!TryCollectPhraseCharCodes(text, pattern, charCodes)) {
+        return false;
+    }
+
+    return BuildPhraseCodeFromPattern(charCodes, pattern, outCode);
 }
 
 bool CompositionEngine::TryBuildPhraseCodes(const std::wstring& text, std::vector<std::wstring>& outCodes) const {
@@ -695,69 +948,62 @@ bool CompositionEngine::TryBuildPhraseCodes(const std::wstring& text, std::vecto
     }
 
     std::vector<PhraseCodePart> pattern;
-    if (text.size() == 2) {
-        pattern = {
-            {false, 0, 0, false},
-            {false, 0, 1, false},
-            {false, 1, 0, false},
-            {false, 1, 1, false},
-        };
+    if (!TryResolvePhrasePattern(text.size(), pattern)) {
+        return !outCodes.empty();
     }
-    else if (text.size() == 3) {
-        pattern = {
-            {false, 0, 0, false},
-            {false, 1, 0, false},
-            {false, 2, 0, false},
-            {false, 2, 1, false},
-        };
-    }
-    else {
-        pattern = {
-            {false, 0, 0, false},
-            {false, 1, 0, false},
-            {false, 2, 0, false},
-            {false, 3, 0, false},
-        };
+
+    std::vector<std::vector<PhraseCodePart>> compatiblePatterns;
+    CollectCompatiblePhrasePatterns(text.size(), pattern, compatiblePatterns);
+    if (compatiblePatterns.empty()) {
+        compatiblePatterns.push_back(pattern);
     }
 
     std::wstring building;
-    building.reserve(pattern.size());
-    constexpr size_t kMaxGeneratedCodes = 24;
-    std::function<void(size_t)> dfs = [&](size_t partIndex) {
-        if (outCodes.size() >= kMaxGeneratedCodes) {
-            return;
-        }
-        if (partIndex >= pattern.size()) {
-            PushUniqueCode(outCodes, building);
-            return;
-        }
+    const size_t maxGeneratedCodes = text.size() == 2 ? 256 : (text.size() == 3 ? 128 : 48);
+    for (const std::vector<PhraseCodePart>& compatiblePattern : compatiblePatterns) {
+        building.clear();
+        building.reserve(compatiblePattern.size());
 
-        const PhraseCodePart& part = pattern[partIndex];
-        if (part.noOp) {
-            dfs(partIndex + 1);
-            return;
-        }
-
-        const size_t textIndex = part.fromEnd ? (charCodeVariants.size() - 1) : part.charIndex;
-        if (textIndex >= charCodeVariants.size()) {
-            return;
-        }
-
-        for (const std::wstring& codeVariant : charCodeVariants[textIndex]) {
-            if (part.codeIndex >= codeVariant.size()) {
-                continue;
-            }
-
-            building.push_back(codeVariant[part.codeIndex]);
-            dfs(partIndex + 1);
-            building.pop_back();
-            if (outCodes.size() >= kMaxGeneratedCodes) {
+        std::function<void(size_t)> dfs = [&](size_t partIndex) {
+            if (outCodes.size() >= maxGeneratedCodes) {
                 return;
             }
-        }
-    };
+            if (partIndex >= compatiblePattern.size()) {
+                PushUniqueCode(outCodes, building);
+                return;
+            }
 
-    dfs(0);
+            const PhraseCodePart& part = compatiblePattern[partIndex];
+            if (part.noOp) {
+                dfs(partIndex + 1);
+                return;
+            }
+
+            const size_t textIndex = part.fromEnd ? (charCodeVariants.size() - 1) : part.charIndex;
+            if (textIndex >= charCodeVariants.size()) {
+                return;
+            }
+
+            for (const std::wstring& codeVariant : charCodeVariants[textIndex]) {
+                if (codeVariant.empty()) {
+                    continue;
+                }
+
+                const size_t safeCodeIndex = std::min(part.codeIndex, codeVariant.size() - 1);
+                building.push_back(codeVariant[safeCodeIndex]);
+                dfs(partIndex + 1);
+                building.pop_back();
+                if (outCodes.size() >= maxGeneratedCodes) {
+                    return;
+                }
+            }
+        };
+
+        dfs(0);
+        if (outCodes.size() >= maxGeneratedCodes) {
+            break;
+        }
+    }
     return !outCodes.empty();
 }
 
@@ -774,7 +1020,7 @@ bool CompositionEngine::TryGetSingleCharCodeVariants(wchar_t ch, std::vector<std
         if (normalized.empty()) {
             continue;
         }
-        if (blockedEntries_.find(MakeFreqKey(entry.code, entry.text)) != blockedEntries_.end()) {
+        if (blockedEntries_.find(MakeCandidateKey(entry.code, entry.text)) != blockedEntries_.end()) {
             continue;
         }
         if (std::find(matchingCodes.begin(), matchingCodes.end(), normalized) == matchingCodes.end()) {
@@ -787,92 +1033,163 @@ bool CompositionEngine::TryGetSingleCharCodeVariants(wchar_t ch, std::vector<std
         matchingCodes.end(),
         [](const std::wstring& left, const std::wstring& right) {
             if (left.size() != right.size()) {
-                return left.size() > right.size();
+                return left.size() < right.size();
             }
             return left < right;
         });
 
-    // Keep representation diversity: full-code and short-code sources should all be able to participate.
-    std::wstring bestFull;
-    std::wstring bestThree;
-    std::wstring bestTwo;
-    std::wstring bestOne;
     for (const std::wstring& code : matchingCodes) {
-        if (code.size() >= 4) {
-            if (bestFull.empty()) {
-                bestFull = code;
-            }
-            continue;
-        }
-        if (code.size() == 3) {
-            if (bestThree.empty()) {
-                bestThree = code;
-            }
-            continue;
-        }
-        if (code.size() == 2) {
-            if (bestTwo.empty()) {
-                bestTwo = code;
-            }
-            continue;
-        }
-        if (code.size() == 1) {
-            if (bestOne.empty()) {
-                bestOne = code;
-            }
-        }
-    }
-
-    if (!bestFull.empty()) {
-        ExpandCodeToleranceVariants(bestFull, outCodes);
-    }
-    if (!bestTwo.empty()) {
-        ExpandCodeToleranceVariants(bestTwo, outCodes);
-    }
-    if (!bestOne.empty()) {
-        ExpandCodeToleranceVariants(bestOne, outCodes);
-    }
-    if (!bestThree.empty()) {
-        ExpandCodeToleranceVariants(bestThree, outCodes);
-    }
-
-    constexpr size_t kMaxBaseCodes = 8;
-    size_t baseCount = 0;
-    for (const std::wstring& code : matchingCodes) {
-        ExpandCodeToleranceVariants(code, outCodes);
-        ++baseCount;
-        if (baseCount >= kMaxBaseCodes || outCodes.size() >= 32) {
-            break;
-        }
+        PushUniqueCode(outCodes, code);
     }
 
     return !outCodes.empty();
 }
 
+int CompositionEngine::GetCommonCharRankCached(const std::wstring& text) const {
+    const auto cacheIt = commonCharRankCache_.find(text);
+    if (cacheIt != commonCharRankCache_.end()) {
+        return cacheIt->second;
+    }
+
+    const int rank = GetCommonCharRank(text);
+    if (commonCharRankCache_.size() > 8192) {
+        commonCharRankCache_.clear();
+    }
+    commonCharRankCache_.emplace(text, rank);
+    return rank;
+}
+
+void CompositionEngine::InvalidateQueryCache() const {
+    queryCache_.clear();
+}
+
+bool CompositionEngine::EntryIndexLess(size_t left, size_t right) const {
+    const Entry& l = entries_[left];
+    const Entry& r = entries_[right];
+    if (l.code != r.code) {
+        return l.code < r.code;
+    }
+    if (l.staticScore != r.staticScore) {
+        return l.staticScore > r.staticScore;
+    }
+    if (l.loadOrder != r.loadOrder) {
+        return l.loadOrder < r.loadOrder;
+    }
+    return l.text < r.text;
+}
+
+void CompositionEngine::RebuildPrefixRanges() {
+    prefixRanges_.clear();
+    prefixRanges_.reserve(26 + (26 * 26));
+    for (size_t position = 0; position < sortedIndices_.size(); ++position) {
+        const Entry& entry = entries_[sortedIndices_[position]];
+        if (entry.code.empty()) {
+            continue;
+        }
+
+        const size_t maxPrefixLength = std::min<size_t>(2, entry.code.size());
+        for (size_t prefixLength = 1; prefixLength <= maxPrefixLength; ++prefixLength) {
+            const std::wstring prefix = entry.code.substr(0, prefixLength);
+            auto it = prefixRanges_.find(prefix);
+            if (it == prefixRanges_.end()) {
+                prefixRanges_.emplace(prefix, PrefixRange{position, position + 1});
+            } else {
+                it->second.end = position + 1;
+            }
+        }
+    }
+}
+
+void CompositionEngine::InsertEntryIntoIndices(size_t index) {
+    const Entry& entry = entries_[index];
+    if (entry.isUser) {
+        userEntryIndices_.push_back(index);
+    }
+    if (entry.isAutoPhrase) {
+        autoPhraseEntryIndices_.push_back(index);
+    }
+
+    const auto insertIt = std::lower_bound(
+        sortedIndices_.begin(),
+        sortedIndices_.end(),
+        index,
+        [this](size_t existing, size_t inserted) {
+            return EntryIndexLess(existing, inserted);
+        });
+    sortedIndices_.insert(insertIt, index);
+    RebuildPrefixRanges();
+    InvalidateQueryCache();
+}
+
 void CompositionEngine::RebuildIndex() {
     sortedIndices_.clear();
     sortedIndices_.reserve(entries_.size());
+    userEntryIndices_.clear();
+    autoPhraseEntryIndices_.clear();
+    userEntryIndices_.reserve(entries_.size());
+    autoPhraseEntryIndices_.reserve(entries_.size());
     for (size_t i = 0; i < entries_.size(); ++i) {
         sortedIndices_.push_back(i);
+        if (entries_[i].isUser) {
+            userEntryIndices_.push_back(i);
+        }
+        if (entries_[i].isAutoPhrase) {
+            autoPhraseEntryIndices_.push_back(i);
+        }
     }
 
     std::stable_sort(
         sortedIndices_.begin(),
         sortedIndices_.end(),
         [this](size_t left, size_t right) {
-            const Entry& l = entries_[left];
-            const Entry& r = entries_[right];
-            if (l.code != r.code) {
-                return l.code < r.code;
-            }
-            if (l.staticScore != r.staticScore) {
-                return l.staticScore > r.staticScore;
-            }
-            if (l.loadOrder != r.loadOrder) {
-                return l.loadOrder < r.loadOrder;
-            }
-            return l.text < r.text;
+            return EntryIndexLess(left, right);
         });
+
+    RebuildPrefixRanges();
+
+    InvalidateQueryCache();
+}
+
+std::pair<std::vector<size_t>::const_iterator, std::vector<size_t>::const_iterator> CompositionEngine::FindCandidateRange(
+    const std::wstring& normalizedCode) const {
+    if (sortedIndices_.empty()) {
+        return {sortedIndices_.end(), sortedIndices_.end()};
+    }
+
+    auto rangeBegin = sortedIndices_.begin();
+    auto rangeEnd = sortedIndices_.end();
+    const std::wstring shortPrefix = BuildPrefixKey(normalizedCode, std::min<size_t>(2, normalizedCode.size()));
+    if (!shortPrefix.empty()) {
+        const auto prefixIt = prefixRanges_.find(shortPrefix);
+        if (prefixIt == prefixRanges_.end()) {
+            return {sortedIndices_.end(), sortedIndices_.end()};
+        }
+
+        rangeBegin = sortedIndices_.begin() + static_cast<std::ptrdiff_t>(prefixIt->second.begin);
+        rangeEnd = sortedIndices_.begin() + static_cast<std::ptrdiff_t>(prefixIt->second.end);
+        if (normalizedCode.size() <= 2) {
+            return {rangeBegin, rangeEnd};
+        }
+    }
+
+    const std::wstring rangeEndKey = normalizedCode + std::wstring(1, static_cast<wchar_t>(0xFFFF));
+    const auto begin = std::lower_bound(
+        rangeBegin,
+        rangeEnd,
+        normalizedCode,
+        [this](size_t idx, const std::wstring& key) {
+            return entries_[idx].code < key;
+        });
+
+    const auto end = std::lower_bound(
+        begin,
+        rangeEnd,
+        rangeEndKey,
+        [this](size_t idx, const std::wstring& key) {
+            return entries_[idx].code < key;
+        });
+
+    return {begin, end};
 }
 
 bool CompositionEngine::LoadDictionaryInternal(const std::wstring& filePath, bool clearExisting, bool isUserSource, bool isAutoPhraseSource) {
@@ -925,12 +1242,28 @@ bool CompositionEngine::LoadDictionaryInternal(const std::wstring& filePath, boo
         }
 
         std::uint32_t staticScore = 0;
+        bool taggedAuto = false;
         if (iss >> thirdToken) {
             try {
                 staticScore = static_cast<std::uint32_t>(std::stoul(thirdToken));
+                std::string tagToken;
+                while (iss >> tagToken) {
+                    if (ToLowerAscii(tagToken) == "auto") {
+                        taggedAuto = true;
+                    }
+                }
             }
             catch (...) {
-                staticScore = 0;
+                if (ToLowerAscii(thirdToken) == "auto") {
+                    taggedAuto = true;
+                }
+
+                std::string tagToken;
+                while (iss >> tagToken) {
+                    if (ToLowerAscii(tagToken) == "auto") {
+                        taggedAuto = true;
+                    }
+                }
             }
         }
 
@@ -940,7 +1273,7 @@ bool CompositionEngine::LoadDictionaryInternal(const std::wstring& filePath, boo
         entry.staticScore = staticScore;
         entry.loadOrder = entries_.size();
         entry.isUser = isUserSource;
-        entry.isAutoPhrase = isAutoPhraseSource;
+        entry.isAutoPhrase = isAutoPhraseSource || (isUserSource && taggedAuto);
         if (!entry.code.empty() && !entry.text.empty()) {
             entries_.push_back(std::move(entry));
         }
@@ -1006,17 +1339,32 @@ bool CompositionEngine::LoadAutoPhraseDictionaryFromFile(const std::wstring& fil
     return LoadDictionaryInternal(filePath, false, true, true);
 }
 
+bool CompositionEngine::LoadDictionaryMetadataOnlyFromFile(const std::wstring& filePath) {
+    LoadDictionaryMetadataFromFile(filePath + L".rules");
+    return true;
+}
+
 bool CompositionEngine::LoadFrequencyFromFile(const std::wstring& filePath) {
+    frequency_.clear();
+    textFrequency_.clear();
+
     std::ifstream input(filePath, std::ios::in | std::ios::binary);
     if (!input) {
+        InvalidateQueryCache();
         return false;
     }
 
-    frequency_.clear();
-
     std::string line;
     while (std::getline(input, line)) {
-        if (line.empty() || line[0] == '#') {
+        if (line.empty()) {
+            continue;
+        }
+
+        if (line.rfind(kTextFrequencyCommentPrefix, 0) == 0) {
+            continue;
+        }
+
+        if (line[0] == '#') {
             continue;
         }
 
@@ -1034,19 +1382,30 @@ bool CompositionEngine::LoadFrequencyFromFile(const std::wstring& filePath) {
             continue;
         }
 
-        frequency_[MakeFreqKey(code, text)] = score;
+        const std::wstring normalizedCode = NormalizeCode(code);
+        if (!IsFrequencyEligibleEntry(normalizedCode, text)) {
+            continue;
+        }
+
+        frequency_[MakeCandidateKey(normalizedCode, text)] = score;
+        const auto textIt = textFrequency_.find(text);
+        if (textIt == textFrequency_.end() || score > textIt->second) {
+            textFrequency_[text] = score;
+        }
     }
 
+    InvalidateQueryCache();
     return true;
 }
 
 bool CompositionEngine::LoadBlockedEntriesFromFile(const std::wstring& filePath) {
+    blockedEntries_.clear();
+
     std::ifstream input(filePath, std::ios::in | std::ios::binary);
     if (!input) {
+        InvalidateQueryCache();
         return false;
     }
-
-    blockedEntries_.clear();
 
     std::string line;
     while (std::getline(input, line)) {
@@ -1067,9 +1426,10 @@ bool CompositionEngine::LoadBlockedEntriesFromFile(const std::wstring& filePath)
             continue;
         }
 
-        blockedEntries_.insert(MakeFreqKey(code, text));
+        blockedEntries_.insert(MakeCandidateKey(code, text));
     }
 
+    InvalidateQueryCache();
     return true;
 }
 
@@ -1079,18 +1439,24 @@ bool CompositionEngine::SaveFrequencyToFile(const std::wstring& filePath) const 
         return false;
     }
 
-    for (const auto& pair : frequency_) {
-        const size_t split = pair.first.find(L'\t');
-        if (split == std::wstring::npos) {
-            continue;
-        }
-
-        const std::wstring code = pair.first.substr(0, split);
-        const std::wstring text = pair.first.substr(split + 1);
-        output << WideToUtf8(code) << ' ' << WideToUtf8(text) << ' ' << pair.second << '\n';
-    }
+    const std::string content = BuildFrequencyFileContent();
+    output.write(content.data(), static_cast<std::streamsize>(content.size()));
 
     return true;
+}
+
+std::string CompositionEngine::BuildFrequencyFileContent() const {
+    std::ostringstream output;
+
+    for (const auto& pair : textFrequency_) {
+        output << kTextFrequencyCommentPrefix << WideToUtf8(pair.first) << ' ' << pair.second << '\n';
+    }
+
+    for (const auto& pair : frequency_) {
+        output << WideToUtf8(pair.first.code) << ' ' << WideToUtf8(pair.first.text) << ' ' << pair.second << '\n';
+    }
+
+    return output.str();
 }
 
 bool CompositionEngine::SaveBlockedEntriesToFile(const std::wstring& filePath) const {
@@ -1099,18 +1465,20 @@ bool CompositionEngine::SaveBlockedEntriesToFile(const std::wstring& filePath) c
         return false;
     }
 
-    for (const auto& blockedKey : blockedEntries_) {
-        const size_t split = blockedKey.find(L'\t');
-        if (split == std::wstring::npos) {
-            continue;
-        }
-
-        const std::wstring code = blockedKey.substr(0, split);
-        const std::wstring text = blockedKey.substr(split + 1);
-        output << WideToUtf8(code) << ' ' << WideToUtf8(text) << '\n';
-    }
+    const std::string content = BuildBlockedEntriesFileContent();
+    output.write(content.data(), static_cast<std::streamsize>(content.size()));
 
     return true;
+}
+
+std::string CompositionEngine::BuildBlockedEntriesFileContent() const {
+    std::ostringstream output;
+
+    for (const auto& blockedKey : blockedEntries_) {
+        output << WideToUtf8(blockedKey.code) << ' ' << WideToUtf8(blockedKey.text) << '\n';
+    }
+
+    return output.str();
 }
 
 bool CompositionEngine::SaveUserDictionaryToFile(const std::wstring& filePath) const {
@@ -1119,15 +1487,29 @@ bool CompositionEngine::SaveUserDictionaryToFile(const std::wstring& filePath) c
         return false;
     }
 
-    for (const Entry& entry : entries_) {
-        if (!entry.isUser || entry.isAutoPhrase || entry.code.empty() || entry.text.empty()) {
+    const std::string content = BuildUserDictionaryFileContent();
+    output.write(content.data(), static_cast<std::streamsize>(content.size()));
+
+    return true;
+}
+
+std::string CompositionEngine::BuildUserDictionaryFileContent() const {
+    std::ostringstream output;
+
+    for (size_t index : userEntryIndices_) {
+        const Entry& entry = entries_[index];
+        if (entry.code.empty() || entry.text.empty()) {
             continue;
         }
 
-        output << WideToUtf8(entry.code) << ' ' << WideToUtf8(entry.text) << ' ' << entry.staticScore << '\n';
+        output << WideToUtf8(entry.code) << ' ' << WideToUtf8(entry.text) << ' ' << entry.staticScore;
+        if (entry.isAutoPhrase) {
+            output << " auto";
+        }
+        output << '\n';
     }
 
-    return true;
+    return output.str();
 }
 
 bool CompositionEngine::SaveAutoPhraseDictionaryToFile(const std::wstring& filePath) const {
@@ -1136,8 +1518,9 @@ bool CompositionEngine::SaveAutoPhraseDictionaryToFile(const std::wstring& fileP
         return false;
     }
 
-    for (const Entry& entry : entries_) {
-        if (!entry.isAutoPhrase || entry.code.empty() || entry.text.empty()) {
+    for (size_t index : autoPhraseEntryIndices_) {
+        const Entry& entry = entries_[index];
+        if (entry.code.empty() || entry.text.empty()) {
             continue;
         }
 
@@ -1153,12 +1536,18 @@ bool CompositionEngine::AddUserEntry(const std::wstring& code, const std::wstrin
         return false;
     }
 
-    blockedEntries_.erase(MakeFreqKey(normalizedCode, text));
+    blockedEntries_.erase(MakeCandidateKey(normalizedCode, text));
 
     for (Entry& entry : entries_) {
         if (entry.code == normalizedCode && entry.text == text) {
+            const bool changed = !entry.isUser || entry.isAutoPhrase;
             entry.isUser = true;
             entry.isAutoPhrase = false;
+            if (changed) {
+                RebuildIndex();
+            } else {
+                InvalidateQueryCache();
+            }
             return false;
         }
     }
@@ -1171,7 +1560,7 @@ bool CompositionEngine::AddUserEntry(const std::wstring& code, const std::wstrin
     entry.isUser = true;
     entry.isAutoPhrase = false;
     entries_.push_back(std::move(entry));
-    RebuildIndex();
+    InsertEntryIntoIndices(entries_.size() - 1);
     return true;
 }
 
@@ -1181,7 +1570,7 @@ bool CompositionEngine::AddAutoPhraseEntry(const std::wstring& code, const std::
         return false;
     }
 
-    blockedEntries_.erase(MakeFreqKey(normalizedCode, text));
+    blockedEntries_.erase(MakeCandidateKey(normalizedCode, text));
 
     for (Entry& entry : entries_) {
         if (entry.code == normalizedCode && entry.text == text) {
@@ -1191,6 +1580,9 @@ bool CompositionEngine::AddAutoPhraseEntry(const std::wstring& code, const std::
             const bool changed = !entry.isAutoPhrase;
             entry.isUser = true;
             entry.isAutoPhrase = true;
+            if (changed) {
+                RebuildIndex();
+            }
             return changed;
         }
     }
@@ -1203,8 +1595,36 @@ bool CompositionEngine::AddAutoPhraseEntry(const std::wstring& code, const std::
     entry.isUser = true;
     entry.isAutoPhrase = true;
     entries_.push_back(std::move(entry));
-    RebuildIndex();
+    InsertEntryIntoIndices(entries_.size() - 1);
     return true;
+}
+
+std::unordered_map<wchar_t, std::wstring> CompositionEngine::BuildSingleCharCodeHintMap() const {
+    std::unordered_map<wchar_t, const Entry*> bestByChar;
+    bestByChar.reserve(4096);
+
+    for (const Entry& entry : entries_) {
+        if (entry.text.size() != 1 || entry.code.empty()) {
+            continue;
+        }
+        if (blockedEntries_.find(MakeCandidateKey(entry.code, entry.text)) != blockedEntries_.end()) {
+            continue;
+        }
+
+        const wchar_t ch = entry.text[0];
+        const auto it = bestByChar.find(ch);
+        const Entry* currentBest = it == bestByChar.end() ? nullptr : it->second;
+        if (IsBetterSingleCharCodeEntry(entry, currentBest)) {
+            bestByChar[ch] = &entry;
+        }
+    }
+
+    std::unordered_map<wchar_t, std::wstring> hints;
+    hints.reserve(bestByChar.size());
+    for (const auto& pair : bestByChar) {
+        hints.emplace(pair.first, pair.second->code);
+    }
+    return hints;
 }
 
 bool CompositionEngine::PinEntry(const std::wstring& code, const std::wstring& text) {
@@ -1213,13 +1633,16 @@ bool CompositionEngine::PinEntry(const std::wstring& code, const std::wstring& t
         return false;
     }
 
-    blockedEntries_.erase(MakeFreqKey(normalizedCode, text));
+    blockedEntries_.erase(MakeCandidateKey(normalizedCode, text));
 
     for (Entry& entry : entries_) {
         if (entry.code == normalizedCode && entry.text == text) {
-            const bool changed = !entry.isUser;
+            const bool changed = !entry.isUser || entry.isAutoPhrase;
             entry.isUser = true;
             entry.isAutoPhrase = false;
+            if (changed) {
+                RebuildIndex();
+            }
             return changed;
         }
     }
@@ -1242,9 +1665,12 @@ bool CompositionEngine::BlockEntry(const std::wstring& code, const std::wstring&
         return false;
     }
 
-    const std::wstring key = MakeFreqKey(normalizedCode, text);
+    const CandidateKey key = MakeCandidateKey(normalizedCode, text);
     const bool inserted = blockedEntries_.insert(key).second;
     frequency_.erase(key);
+    if (inserted) {
+        InvalidateQueryCache();
+    }
 
     const size_t oldSize = entries_.size();
     entries_.erase(
@@ -1266,6 +1692,27 @@ bool CompositionEngine::BlockEntry(const std::wstring& code, const std::wstring&
     return inserted || entries_.size() != oldSize;
 }
 
+bool CompositionEngine::HasEntry(const std::wstring& code, const std::wstring& text) const {
+    const std::wstring normalizedCode = NormalizeCode(code);
+    if (normalizedCode.empty() || text.empty() || sortedIndices_.empty()) {
+        return false;
+    }
+
+    const auto range = FindCandidateRange(normalizedCode);
+    for (auto it = range.first; it != range.second; ++it) {
+        const Entry& entry = entries_[*it];
+        if (entry.code != normalizedCode || entry.text != text) {
+            continue;
+        }
+        if (blockedEntries_.find(MakeCandidateKey(entry.code, entry.text)) != blockedEntries_.end()) {
+            continue;
+        }
+        return true;
+    }
+
+    return false;
+}
+
 std::vector<CompositionEngine::Entry> CompositionEngine::QueryCandidateEntries(const std::wstring& code, size_t maxCandidates) const {
     std::vector<Entry> result;
     if (code.empty() || maxCandidates == 0 || sortedIndices_.empty()) {
@@ -1273,43 +1720,43 @@ std::vector<CompositionEngine::Entry> CompositionEngine::QueryCandidateEntries(c
     }
 
     const std::wstring normalizedCode = NormalizeCode(code);
+    const QueryCacheKey cacheKey{normalizedCode, maxCandidates};
+    const auto cachedIt = queryCache_.find(cacheKey);
+    if (cachedIt != queryCache_.end()) {
+        return cachedIt->second;
+    }
 
-    const std::wstring rangeEnd = normalizedCode + std::wstring(1, static_cast<wchar_t>(0xFFFF));
-    const auto begin = std::lower_bound(
-        sortedIndices_.begin(),
-        sortedIndices_.end(),
-        normalizedCode,
-        [this](size_t idx, const std::wstring& key) {
-            return entries_[idx].code < key;
-        });
-
-    const auto end = std::lower_bound(
-        begin,
-        sortedIndices_.end(),
-        rangeEnd,
-        [this](size_t idx, const std::wstring& key) {
-            return entries_[idx].code < key;
-        });
+    const auto range = FindCandidateRange(normalizedCode);
+    const auto begin = range.first;
+    const auto end = range.second;
+    if (begin == sortedIndices_.end() || begin == end) {
+        return result;
+    }
 
     std::unordered_map<std::wstring, CandidateScore> bestScoreByText;
     bestScoreByText.reserve(static_cast<size_t>(std::distance(begin, end)));
 
     for (auto it = begin; it != end; ++it) {
         const Entry& item = entries_[*it];
-        const std::wstring freqKey = MakeFreqKey(item.code, item.text);
+        const CandidateKey freqKey = MakeCandidateKey(item.code, item.text);
         if (blockedEntries_.find(freqKey) != blockedEntries_.end()) {
             continue;
         }
         if (IsLikelyBrokenCandidate(item.text)) {
             continue;
         }
+        const bool frequencyEligible = IsFrequencyEligibleEntry(item.code, item.text);
         const auto freqIt = frequency_.find(freqKey);
-        const std::uint64_t score = (freqIt == frequency_.end()) ? 0 : freqIt->second;
+        const auto textFreqIt = textFrequency_.find(item.text);
+        const std::uint64_t codeScore = (frequencyEligible && freqIt != frequency_.end()) ? freqIt->second : 0;
+        const std::uint64_t textScore = (frequencyEligible && textFreqIt != textFrequency_.end()) ? textFreqIt->second : 0;
+        const std::uint64_t score = std::max(codeScore, textScore);
         const bool exactCode = item.code == normalizedCode;
         const size_t completionDelta = item.code.size() >= normalizedCode.size()
             ? (item.code.size() - normalizedCode.size())
             : 0;
         const int lengthPreferenceScore = GetLengthPreferenceScore(normalizedCode.size(), item.text.size());
+        const bool systemFiveCodePhrase = IsSystemFiveCodePhraseEntry(item);
 
         auto scoreIt = bestScoreByText.find(item.text);
         if (scoreIt == bestScoreByText.end()) {
@@ -1328,12 +1775,13 @@ std::vector<CompositionEngine::Entry> CompositionEngine::QueryCandidateEntries(c
             candidate.hasManualUser = item.isUser && !item.isAutoPhrase;
             candidate.hasAutoPhrase = item.isAutoPhrase;
             candidate.hasSystemSource = !item.isUser;
-            candidate.hasLearned = score > 0;
-            candidate.commonCharRank = GetCommonCharRank(item.text);
+            candidate.hasLearned = frequencyEligible && score > 0;
+            candidate.commonCharRank = GetCommonCharRankCached(item.text);
             candidate.completionDelta = completionDelta;
             candidate.lengthPreferenceScore = lengthPreferenceScore;
             candidate.preferredTwoCharPhrase = IsPreferredTwoCharPhraseCandidate(candidate, normalizedCode.size());
             candidate.twoCodePriorityTier = GetTwoCodePriorityTier(candidate, normalizedCode.size());
+            candidate.hasSystemFiveCodePhrase = systemFiveCodePhrase;
             bestScoreByText.emplace(item.text, candidate);
             continue;
         }
@@ -1344,7 +1792,8 @@ std::vector<CompositionEngine::Entry> CompositionEngine::QueryCandidateEntries(c
         existing.hasManualUser = existing.hasManualUser || (item.isUser && !item.isAutoPhrase);
         existing.hasAutoPhrase = existing.hasAutoPhrase || item.isAutoPhrase;
         existing.hasSystemSource = existing.hasSystemSource || !item.isUser;
-        existing.hasLearned = existing.hasLearned || (score > 0);
+        existing.hasLearned = existing.hasLearned || (frequencyEligible && score > 0);
+        existing.hasSystemFiveCodePhrase = existing.hasSystemFiveCodePhrase || systemFiveCodePhrase;
         if (score > existing.frequency) {
             existing.frequency = score;
         }
@@ -1357,7 +1806,7 @@ std::vector<CompositionEngine::Entry> CompositionEngine::QueryCandidateEntries(c
         if (item.loadOrder < existing.earliestLoadOrder) {
             existing.earliestLoadOrder = item.loadOrder;
         }
-        const int rank = GetCommonCharRank(item.text);
+        const int rank = GetCommonCharRankCached(item.text);
         if (rank < existing.commonCharRank) {
             existing.commonCharRank = rank;
         }
@@ -1393,21 +1842,27 @@ std::vector<CompositionEngine::Entry> CompositionEngine::QueryCandidateEntries(c
         ranked.push_back(pair.second);
     }
 
-    const size_t queryCodeLength = normalizedCode.size();
-
-    std::stable_sort(
-        ranked.begin(),
-        ranked.end(),
-        [queryCodeLength](const auto& left, const auto& right) {
+    const auto candidateLess = [](const auto& left, const auto& right) {
             const int leftShortCodeRank = GetSingleCharShortCodeRank(left);
             const int rightShortCodeRank = GetSingleCharShortCodeRank(right);
             const bool leftShortFullCode = left.shortestCodeLength < 4;
             const bool rightShortFullCode = right.shortestCodeLength < 4;
-            if (left.twoCodePriorityTier != right.twoCodePriorityTier) {
-                return left.twoCodePriorityTier < right.twoCodePriorityTier;
-            }
+            const bool leftNonGb2312Single = IsNonGb2312SingleCandidate(left);
+            const bool rightNonGb2312Single = IsNonGb2312SingleCandidate(right);
             if (left.exactCode != right.exactCode) {
                 return left.exactCode > right.exactCode;
+            }
+            if (left.hasManualUser != right.hasManualUser) {
+                return left.hasManualUser > right.hasManualUser;
+            }
+            if (left.hasLearned != right.hasLearned) {
+                return left.hasLearned > right.hasLearned;
+            }
+            if (left.frequency != right.frequency) {
+                return left.frequency > right.frequency;
+            }
+            if (left.twoCodePriorityTier != right.twoCodePriorityTier) {
+                return left.twoCodePriorityTier < right.twoCodePriorityTier;
             }
             if (left.preferredTwoCharPhrase != right.preferredTwoCharPhrase) {
                 return left.preferredTwoCharPhrase > right.preferredTwoCharPhrase;
@@ -1418,23 +1873,23 @@ std::vector<CompositionEngine::Entry> CompositionEngine::QueryCandidateEntries(c
             if (leftShortCodeRank != rightShortCodeRank) {
                 return leftShortCodeRank < rightShortCodeRank;
             }
+            if (left.commonCharRank != right.commonCharRank) {
+                return left.commonCharRank < right.commonCharRank;
+            }
+            if (left.hasSystemFiveCodePhrase != right.hasSystemFiveCodePhrase) {
+                return left.hasSystemFiveCodePhrase < right.hasSystemFiveCodePhrase;
+            }
+            if (leftNonGb2312Single != rightNonGb2312Single) {
+                return leftNonGb2312Single < rightNonGb2312Single;
+            }
             const bool leftAutoOnly = left.hasAutoPhrase && !left.hasSystemSource && !left.hasManualUser;
             const bool rightAutoOnly = right.hasAutoPhrase && !right.hasSystemSource && !right.hasManualUser;
             if (leftAutoOnly != rightAutoOnly) {
                 return leftAutoOnly < rightAutoOnly;
             }
-            if (left.hasManualUser != right.hasManualUser) {
-                return left.hasManualUser > right.hasManualUser;
-            }
-            if (left.frequency != right.frequency) {
-                return left.frequency > right.frequency;
-            }
             if (left.shortestCodeLength != right.shortestCodeLength) {
                 // Shorter code level should come first when user/learned signals tie.
                 return left.shortestCodeLength < right.shortestCodeLength;
-            }
-            if (left.commonCharRank != right.commonCharRank) {
-                return left.commonCharRank < right.commonCharRank;
             }
             if (left.staticScore != right.staticScore) {
                 return left.staticScore > right.staticScore;
@@ -1449,15 +1904,24 @@ std::vector<CompositionEngine::Entry> CompositionEngine::QueryCandidateEntries(c
                 return left.earliestLoadOrder < right.earliestLoadOrder;
             }
             return left.text < right.text;
-        });
+        };
 
-    result.reserve(std::min(maxCandidates, ranked.size()));
+    const size_t rankedLimit = std::min(maxCandidates, ranked.size());
+    if (rankedLimit < ranked.size()) {
+        std::partial_sort(ranked.begin(), ranked.begin() + rankedLimit, ranked.end(), candidateLess);
+        ranked.resize(rankedLimit);
+    } else {
+        std::stable_sort(ranked.begin(), ranked.end(), candidateLess);
+    }
+
+    result.reserve(ranked.size());
 
     for (const auto& candidate : ranked) {
         Entry entry;
         entry.text = candidate.text;
         entry.code = candidate.displayCode;
         entry.staticScore = candidate.staticScore;
+        entry.learnedScore = candidate.frequency;
         entry.loadOrder = candidate.earliestLoadOrder;
         entry.isUser = candidate.hasManualUser;
         entry.isLearned = candidate.hasLearned;
@@ -1468,6 +1932,10 @@ std::vector<CompositionEngine::Entry> CompositionEngine::QueryCandidateEntries(c
         }
     }
 
+    if (queryCache_.size() >= 256) {
+        queryCache_.clear();
+    }
+    queryCache_.emplace(cacheKey, result);
     return result;
 }
 
@@ -1486,34 +1954,25 @@ void CompositionEngine::RecordCommit(const std::wstring& code, const std::wstrin
         return;
     }
 
-    const std::wstring key = MakeFreqKey(NormalizeCode(code), text);
-    auto decayFrequency = [this]() {
-        for (auto it = frequency_.begin(); it != frequency_.end();) {
-            if (it->second <= 1) {
-                it = frequency_.erase(it);
-                continue;
-            }
-            it->second = std::max<std::uint64_t>(1, it->second / 2);
-            ++it;
-        }
-    };
+    const std::wstring normalizedCode = NormalizeCode(code);
+    if (!IsFrequencyEligibleEntry(normalizedCode, text)) {
+        return;
+    }
 
+    const CandidateKey key = MakeCandidateKey(normalizedCode, text);
     std::uint64_t current = 0;
     const auto it = frequency_.find(key);
     if (it != frequency_.end()) {
         current = it->second;
     }
 
-    std::uint64_t next = current + boost;
-    if (next > kFrequencyScoreMax) {
-        decayFrequency();
-        const auto refreshed = frequency_.find(key);
-        current = refreshed == frequency_.end() ? 0 : refreshed->second;
-        next = current + boost;
-        if (next > kFrequencyScoreMax) {
-            next = kFrequencyScoreMax;
-        }
-    }
+    frequency_[key] = SaturatingAddFrequency(current, boost);
 
-    frequency_[key] = next;
+    std::uint64_t textCurrent = 0;
+    const auto textIt = textFrequency_.find(text);
+    if (textIt != textFrequency_.end()) {
+        textCurrent = textIt->second;
+    }
+    textFrequency_[text] = SaturatingAddFrequency(textCurrent, boost);
+    InvalidateQueryCache();
 }

@@ -40,9 +40,10 @@ Copy-Item (Join-Path $projectRoot "scripts\unregister_ime.ps1") (Join-Path $payl
 Copy-Item (Join-Path $projectRoot "scripts\install_enable.ps1") (Join-Path $payloadDir "scripts\install_enable.ps1")
 Copy-Item (Join-Path $projectRoot "scripts\uninstall_clean.ps1") (Join-Path $payloadDir "scripts\uninstall_clean.ps1")
 Copy-Item (Join-Path $projectRoot "scripts\build_config_app.ps1") (Join-Path $payloadDir "scripts\build_config_app.ps1")
-Copy-Item (Join-Path $projectRoot "data\yuninput_basic.dict") (Join-Path $payloadDir "data\yuninput_basic.dict")
-if (Test-Path (Join-Path $projectRoot "data\yuninput_user.dict")) {
-    Copy-Item (Join-Path $projectRoot "data\yuninput_user.dict") (Join-Path $payloadDir "data\yuninput_user.dict")
+Get-ChildItem -Path (Join-Path $projectRoot "data") -File | Where-Object {
+    $_.Name -match '\.dict(\.rules)?$'
+} | ForEach-Object {
+    Copy-Item $_.FullName (Join-Path $payloadDir (Join-Path "data" $_.Name))
 }
 if (Test-Path $configExe) {
     Copy-Item $configExe (Join-Path $payloadDir "tools\yuninput_config.exe")
@@ -236,7 +237,7 @@ public class InstallerForm : Form
             sb.AppendLine("  \"context_association_enabled\": true,");
             sb.AppendLine("  \"context_association_max_entries\": 6000,");
             sb.AppendLine("  \"candidate_page_size\": " + numCandidateCount.Value.ToString() + ",");
-            sb.AppendLine("  \"dictionary_profile\": \"zhengma-large\",");
+            sb.AppendLine("  \"dictionary_profile\": \"zhengma-all\",");
             sb.AppendLine("  \"toggle_hotkey\": \"" + cmbToggleHotkey.SelectedItem.ToString() + "\"");
             sb.AppendLine("}");
             File.WriteAllText(configPath, sb.ToString(), Encoding.UTF8);
