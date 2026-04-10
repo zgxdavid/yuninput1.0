@@ -14,10 +14,15 @@ $outExe = Join-Path (Split-Path -Parent $projectRoot) "yuninput_setup.exe"
 $configBuildScript = Join-Path $projectRoot "scripts\build_config_app.ps1"
 $configExe = Join-Path $projectRoot "tools\yuninput_config.exe"
 $iconPath = Join-Path $projectRoot "assets\icon_yun.ico"
+$builderExe = Join-Path $projectRoot "build\Release\yuninput_user_dict_builder.exe"
 
 $dllPath = Join-Path $projectRoot "build\Release\yuninput.dll"
 if (-not (Test-Path $dllPath)) {
     throw "Missing build output: $dllPath"
+}
+
+if (-not (Test-Path $builderExe)) {
+    throw "Missing build output: $builderExe"
 }
 
 if (-not (Test-Path $configExe) -and (Test-Path $configBuildScript)) {
@@ -35,6 +40,7 @@ New-Item -ItemType Directory -Path (Join-Path $payloadDir "tools") | Out-Null
 New-Item -ItemType Directory -Path (Join-Path $payloadDir "assets") | Out-Null
 
 Copy-Item (Join-Path $projectRoot "build\Release\yuninput.dll") (Join-Path $payloadDir "build\Release\yuninput.dll")
+Copy-Item $builderExe (Join-Path $payloadDir "build\Release\yuninput_user_dict_builder.exe")
 Copy-Item (Join-Path $projectRoot "scripts\register_ime.ps1") (Join-Path $payloadDir "scripts\register_ime.ps1")
 Copy-Item (Join-Path $projectRoot "scripts\unregister_ime.ps1") (Join-Path $payloadDir "scripts\unregister_ime.ps1")
 Copy-Item (Join-Path $projectRoot "scripts\install_enable.ps1") (Join-Path $payloadDir "scripts\install_enable.ps1")

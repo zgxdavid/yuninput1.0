@@ -2,6 +2,7 @@
 
 #include <Windows.h>
 
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -13,6 +14,8 @@ public:
         bool boostedUser = false;
         bool boostedLearned = false;
         bool boostedContext = false;
+        bool fromAutoPhrase = false;
+        bool fromSessionAutoPhrase = false;
         size_t consumedLength = 0;
     };
 
@@ -33,7 +36,11 @@ public:
         bool chineseMode,
         bool fullShapeMode,
         const POINT* anchorScreenPos);
-    void Hide();
+    void SetAsyncPollCallback(std::function<void()> callback);
+    void ScheduleAsyncPoll(UINT delayMs);
+    void CancelAsyncPoll();
+    bool IsVisible() const;
+    bool Hide();
 
 private:
     static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
@@ -59,8 +66,13 @@ private:
     int lastY_;
     int lastWidth_;
     int lastHeight_;
+    size_t lastMeasuredRowCount_;
+    size_t lastMeasuredTotalPages_;
+    size_t lastMeasuredTotalCandidateCount_;
     HFONT titleFont_;
     HFONT textFont_;
     HFONT selectedTextFont_;
     HFONT smallFont_;
+    HFONT codeFont_;
+    std::function<void()> asyncPollCallback_;
 };

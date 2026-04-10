@@ -1,6 +1,6 @@
 param(
-    [string]$Version = '1.0.0',
-    [string]$OutputName = 'Yuninput1.0.msi',
+    [string]$Version = '1.2.0',
+    [string]$OutputName = 'Yuninput1.2.msi',
     [switch]$SkipDictionaryGeneration
 )
 
@@ -17,7 +17,7 @@ $configBuildScript = Join-Path $PSScriptRoot 'build_config_app.ps1'
 $generateUserDictScript = Join-Path $PSScriptRoot 'generate_user_dict.ps1'
 $wxsPath = Join-Path $projectRoot 'tools\msi\YuninputSetupWrapper.wxs'
 $licenseRtf = Join-Path $projectRoot 'tools\msi\license.rtf'
-$outMsi = Join-Path (Split-Path -Parent $projectRoot) $OutputName
+$outMsi = Join-Path $projectRoot $OutputName
 
 function Invoke-TimedStep {
     param(
@@ -35,6 +35,7 @@ function Invoke-TimedStep {
 
 $requiredFiles = @(
     (Join-Path $projectRoot 'build\Release\yuninput.dll'),
+    (Join-Path $projectRoot 'build\Release\yuninput_user_dict_builder.exe'),
     (Join-Path $projectRoot 'assets\icon_yun.ico'),
     (Join-Path $projectRoot 'scripts\install_enable.ps1'),
     (Join-Path $projectRoot 'scripts\register_ime.ps1'),

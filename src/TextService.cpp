@@ -20,11 +20,31 @@ namespace {
 
 constexpr const wchar_t* kBuildMarker = L"cw-r4-20260403-yuninput1-userdict-slim-v1";
 constexpr ULONGLONG kAnchorReuseWindowMs = 2500ULL;
+constexpr ULONGLONG kAnchorFastReuseWindowMs = 120ULL;
 constexpr ULONGLONG kAutoPhraseFlushIntervalMs = 3000ULL;
 constexpr ULONGLONG kUserFrequencyFlushIntervalMs = 3000ULL;
+constexpr ULONGLONG kUserDataReloadMinIntervalMs = 1500ULL;
+constexpr ULONGLONG kHelperAutoPhraseReloadMinIntervalMs = 500ULL;
+constexpr ULONGLONG kAutoPhraseBuilderLaunchMinIntervalMs = 2000ULL;
+constexpr const wchar_t* kAutoPhraseHelperWakeEventName = L"Local\\Yuninput.AutoPhraseHelper.Wake";
 constexpr size_t kSessionAutoPhraseHistoryCharLimit = 2000;
 constexpr size_t kSessionAutoPhraseMaxLength = 12;
+constexpr size_t kRoamingAutoPhraseMaxEntries = 4096;
+constexpr size_t kPrimaryCandidateQueryLimit = 96;
+constexpr size_t kPrefixCandidateQueryLimit = 16;
+constexpr size_t kPhraseCandidateQueryLimit = 24;
+constexpr size_t kRefreshTargetCandidateCount = 18;
+constexpr size_t kFastQueryScanBudgetOneChar = 384;
+constexpr size_t kFastQueryScanBudgetTwoChar = 256;
 constexpr wchar_t kSessionAutoPhraseBreak = static_cast<wchar_t>(0xE000);
+constexpr size_t kRuntimeLogMaxQueuedLines = 512;
+
+std::mutex g_runtimeLogMutex;
+std::condition_variable g_runtimeLogCv;
+std::deque<std::wstring> g_runtimeLogQueue;
+std::thread g_runtimeLogThread;
+bool g_runtimeLogStopRequested = false;
+unsigned int g_runtimeLogClientCount = 0;
 
 std::wstring BuildUserDataFilePath(const std::wstring& userDataDir, const wchar_t* fileName) {
     if (userDataDir.empty() || fileName == nullptr || *fileName == L'\0') {
@@ -215,6 +235,20 @@ bool FileContainsLegacyFrequencyNoise(const std::wstring& filePath) {
     return false;
 }
 
+bool IsAsciiCodeToken(const std::string& token) {
+    if (token.empty()) {
+        return false;
+    }
+
+    for (unsigned char ch : token) {
+        if (!((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z'))) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
 std::wstring QueryFileStampToken(const std::wstring& filePath) {
     if (filePath.empty()) {
         return L"-";
@@ -236,6 +270,19 @@ std::wstring QueryFileStampToken(const std::wstring& filePath) {
     return L"1:" + std::to_wstring(static_cast<long long>(writeTime.time_since_epoch().count()));
 }
 
+std::wstring QuoteCommandLineArg(const std::wstring& value) {
+    std::wstring quoted = L"\"";
+    for (wchar_t ch : value) {
+        if (ch == L'"') {
+            quoted += L"\\\"";
+        } else {
+            quoted.push_back(ch);
+        }
+    }
+    quoted += L'"';
+    return quoted;
+}
+
 std::wstring BuildUserDataFilesStamp(
     const std::wstring& userDictPath,
     const std::wstring& autoPhraseDictPath,
@@ -249,6 +296,17 @@ std::wstring BuildUserDataFilesStamp(
         QueryFileStampToken(blockedEntriesPath) + L"|" +
         QueryFileStampToken(contextAssocPath) + L"|" +
         QueryFileStampToken(contextAssocBlacklistPath);
+}
+
+bool SignalAutoPhraseHelperWakeEvent() {
+    HANDLE wakeEvent = OpenEventW(EVENT_MODIFY_STATE, FALSE, kAutoPhraseHelperWakeEventName);
+    if (wakeEvent == nullptr) {
+        return false;
+    }
+
+    const BOOL signaled = SetEvent(wakeEvent);
+    CloseHandle(wakeEvent);
+    return signaled == TRUE;
 }
 
 void MigrateLegacyUserDataFiles(const std::wstring& userDataDir) {
@@ -410,7 +468,92 @@ std::wstring GetRuntimeLogPath() {
     return std::wstring(localAppData, len) + L"\\yuninput\\runtime.log";
 }
 
-void AppendRuntimeLog(const std::wstring& message) {
+bool IsTruthyEnvironmentValue(const wchar_t* value) {
+    if (value == nullptr || *value == L'\0') {
+        return false;
+    }
+
+    return _wcsicmp(value, L"1") == 0 ||
+           _wcsicmp(value, L"true") == 0 ||
+           _wcsicmp(value, L"yes") == 0 ||
+           _wcsicmp(value, L"on") == 0;
+}
+
+bool IsVerboseKeyTraceEnabled() {
+#ifdef _DEBUG
+    return true;
+#else
+    static const bool enabled = []() {
+        if (IsDebuggerPresent()) {
+            return true;
+        }
+
+        wchar_t buffer[16] = {};
+        const DWORD len = GetEnvironmentVariableW(L"YUNINPUT_VERBOSE_KEY_TRACE", buffer, _countof(buffer));
+        if (len == 0 || len >= _countof(buffer)) {
+            return false;
+        }
+
+        return IsTruthyEnvironmentValue(buffer);
+    }();
+    return enabled;
+#endif
+}
+
+void Trace(const std::wstring& text);
+
+bool IsLatencyProfilingEnabled() {
+#ifdef _DEBUG
+    return true;
+#else
+    static const bool enabled = []() {
+        wchar_t buffer[16] = {};
+        const DWORD len = GetEnvironmentVariableW(L"YUNINPUT_DISABLE_LATENCY_TRACE", buffer, _countof(buffer));
+        if (len == 0 || len >= _countof(buffer)) {
+            return true;
+        }
+
+        return !IsTruthyEnvironmentValue(buffer);
+    }();
+    return enabled;
+#endif
+}
+
+LONGLONG QueryPerfCounterValue() {
+    LARGE_INTEGER value = {};
+    QueryPerformanceCounter(&value);
+    return value.QuadPart;
+}
+
+double PerfCounterElapsedMs(LONGLONG startCounter, LONGLONG endCounter) {
+    static const double frequency = []() {
+        LARGE_INTEGER value = {};
+        QueryPerformanceFrequency(&value);
+        return value.QuadPart > 0 ? static_cast<double>(value.QuadPart) : 0.0;
+    }();
+
+    if (frequency <= 0.0) {
+        return 0.0;
+    }
+
+    return (static_cast<double>(endCounter - startCounter) * 1000.0) / frequency;
+}
+
+void TraceLatencySample(const std::wstring& label, LONGLONG startCounter, LONGLONG endCounter) {
+    if (!IsLatencyProfilingEnabled()) {
+        return;
+    }
+
+    wchar_t elapsedBuffer[32] = {};
+    swprintf_s(elapsedBuffer, L"%.3f", PerfCounterElapsedMs(startCounter, endCounter));
+    Trace(L"latency " + label + L" ms=" + elapsedBuffer);
+}
+
+void WriteRuntimeLogBatch(const std::deque<std::wstring>& batch) {
+    if (batch.empty()) {
+        return;
+    }
+
     const std::wstring logPath = GetRuntimeLogPath();
     const std::size_t slash = logPath.find_last_of(L"\\/");
     if (slash != std::wstring::npos) {
@@ -424,21 +567,90 @@ void AppendRuntimeLog(const std::wstring& message) {
     }
 
     SYSTEMTIME now = {};
-    GetLocalTime(&now);
     wchar_t prefix[64] = {};
-    swprintf_s(
-        prefix,
-        L"[%04u-%02u-%02u %02u:%02u:%02u] ",
-        now.wYear,
-        now.wMonth,
-        now.wDay,
-        now.wHour,
-        now.wMinute,
-        now.wSecond);
+    for (const std::wstring& message : batch) {
+        GetLocalTime(&now);
+        swprintf_s(
+            prefix,
+            L"[%04u-%02u-%02u %02u:%02u:%02u] ",
+            now.wYear,
+            now.wMonth,
+            now.wDay,
+            now.wHour,
+            now.wMinute,
+            now.wSecond);
 
-    const std::wstring line = std::wstring(prefix) + message + L"\r\n";
-    const std::string utf8 = WideToUtf8ForLog(line);
-    stream.write(utf8.data(), static_cast<std::streamsize>(utf8.size()));
+        const std::wstring line = std::wstring(prefix) + message + L"\r\n";
+        const std::string utf8 = WideToUtf8ForLog(line);
+        stream.write(utf8.data(), static_cast<std::streamsize>(utf8.size()));
+    }
+}
+
+void RuntimeLogWorkerMain() {
+    for (;;) {
+        std::deque<std::wstring> batch;
+        {
+            std::unique_lock<std::mutex> lock(g_runtimeLogMutex);
+            g_runtimeLogCv.wait(lock, []() {
+                return g_runtimeLogStopRequested || !g_runtimeLogQueue.empty();
+            });
+
+            if (g_runtimeLogStopRequested && g_runtimeLogQueue.empty()) {
+                break;
+            }
+
+            batch.swap(g_runtimeLogQueue);
+        }
+
+        WriteRuntimeLogBatch(batch);
+    }
+}
+
+void StartRuntimeLogWorker() {
+    std::lock_guard<std::mutex> lock(g_runtimeLogMutex);
+    ++g_runtimeLogClientCount;
+    if (g_runtimeLogThread.joinable()) {
+        return;
+    }
+
+    g_runtimeLogStopRequested = false;
+    g_runtimeLogThread = std::thread(&RuntimeLogWorkerMain);
+}
+
+void StopRuntimeLogWorker() {
+    std::thread worker;
+    {
+        std::lock_guard<std::mutex> lock(g_runtimeLogMutex);
+        if (g_runtimeLogClientCount > 0) {
+            --g_runtimeLogClientCount;
+        }
+
+        if (g_runtimeLogClientCount != 0 || !g_runtimeLogThread.joinable()) {
+            return;
+        }
+
+        g_runtimeLogStopRequested = true;
+        worker = std::move(g_runtimeLogThread);
+    }
+
+    g_runtimeLogCv.notify_all();
+    worker.join();
+}
+
+void AppendRuntimeLog(const std::wstring& message) {
+    std::lock_guard<std::mutex> lock(g_runtimeLogMutex);
+    if (!g_runtimeLogThread.joinable()) {
+        std::deque<std::wstring> singleEntry;
+        singleEntry.push_back(message);
+        WriteRuntimeLogBatch(singleEntry);
+        return;
+    }
+
+    if (g_runtimeLogQueue.size() >= kRuntimeLogMaxQueuedLines) {
+        g_runtimeLogQueue.pop_front();
+    }
+    g_runtimeLogQueue.push_back(message);
+    g_runtimeLogCv.notify_all();
 }
 
 void Trace(const std::wstring& text) {
@@ -787,6 +999,32 @@ bool IsPunctuationVirtualKey(WPARAM key) {
            key == VK_OEM_PERIOD ||
            key == VK_OEM_PLUS ||
            key == VK_ADD;
+}
+
+bool IsMinusPageUpKey(WPARAM key, WPARAM rawKey, LPARAM lParam) {
+    if (key == VK_OEM_MINUS || key == VK_SUBTRACT || rawKey == VK_OEM_MINUS || rawKey == VK_SUBTRACT) {
+        return true;
+    }
+
+    wchar_t input = 0;
+    if (!TryGetTypedChar(rawKey, lParam, input)) {
+        return false;
+    }
+
+    return input == L'-' || input == L'_';
+}
+
+bool IsPlusPageDownKey(WPARAM key, WPARAM rawKey, LPARAM lParam) {
+    if (key == VK_OEM_PLUS || key == VK_ADD || rawKey == VK_OEM_PLUS || rawKey == VK_ADD) {
+        return true;
+    }
+
+    wchar_t input = 0;
+    if (!TryGetTypedChar(rawKey, lParam, input)) {
+        return false;
+    }
+
+    return input == L'=' || input == L'+';
 }
 
 bool TryBuildPunctuationCommitText(
@@ -1502,6 +1740,7 @@ TextService::TextService()
       keyEventSinkAdvised_(false),
     threadMgrEventSinkAdvised_(false),
     threadMgrEventSinkCookie_(TF_INVALID_COOKIE),
+        runtimeReady_(false),
       chineseMode_(true),
       fullShapeMode_(false),
     chinesePunctuation_(true),
@@ -1535,16 +1774,32 @@ TextService::TextService()
                     userFrequencyDirty_(false),
                     userDataFirstDirtyTick_(0),
                     userDataLastFlushTick_(0),
+                    lastUserDataReloadCheckTick_(0),
+                    lastHelperAutoPhraseReloadCheckTick_(0),
+                    lastAutoPhraseBuilderLaunchTick_(0),
+                    lastAutoPhraseHistoryUpdateTick_(0),
+                    autoPhraseBuilderPending_(false),
+                    autoPhraseBuilderProcess_(nullptr),
                                     userDataWriteStopRequested_(false),
                                     nextUserDataWriteGeneration_(0),
+                    userDataStampRefreshPending_(false),
                                 pageCandidatesCacheRevision_(0),
                                 pageCandidatesCachePageIndex_(0),
-                                pageCandidatesCachePageSize_(0) {
+                                pageCandidatesCachePageSize_(0),
+                                    candidatesFullyExpanded_(false),
+                                    deferredExpansionDueTick_(0) {
     InterlockedIncrement(&g_objectCount);
+    StartRuntimeLogWorker();
 }
 
 TextService::~TextService() {
+    ReapAutoPhraseBuilderProcess(false);
+    if (autoPhraseBuilderProcess_ != nullptr) {
+        CloseHandle(autoPhraseBuilderProcess_);
+        autoPhraseBuilderProcess_ = nullptr;
+    }
                     StopUserDataWriteWorker(true);
+    StopRuntimeLogWorker();
 
     if (langBarItemMgr_ != nullptr && configLangBarItem_ != nullptr) {
         langBarItemMgr_->RemoveItem(configLangBarItem_);
@@ -1691,35 +1946,9 @@ STDMETHODIMP TextService::Activate(ITfThreadMgr* threadMgr, TfClientId clientId)
     }
 
     LoadSettings();
-
-    if (EnsureUserDataDirectory(userDataDir_)) {
-        MigrateLegacyUserDataFiles(userDataDir_);
-        userDictPath_ = BuildUserDataFilePath(userDataDir_, L"yuninput_user.dict");
-        userFreqPath_ = BuildUserDataFilePath(userDataDir_, L"user_freq.txt");
-        blockedEntriesPath_ = BuildUserDataFilePath(userDataDir_, L"blocked_entries.txt");
-        contextAssocPath_ = BuildUserDataFilePath(userDataDir_, L"context_assoc.txt");
-        contextAssocBlacklistPath_ = BuildUserDataFilePath(userDataDir_, L"context_assoc_blacklist.txt");
-        manualPhraseReviewPath_ = BuildUserDataFilePath(userDataDir_, L"manual_phrase_review.txt");
-        autoPhraseSessionPath_ = BuildUserDataFilePath(userDataDir_, L"auto_phrase_session.txt");
+    if (chineseMode_) {
+        EnsureRuntimeReady();
     }
-
-    StartUserDataWriteWorker();
-
-    LoadConfiguredDictionaries();
-
-    if (!userDataDir_.empty()) {
-        engine_.LoadFrequencyFromFile(userFreqPath_);
-        engine_.LoadBlockedEntriesFromFile(blockedEntriesPath_);
-        LoadContextAssociationFromFile(contextAssocPath_);
-        LoadContextAssociationBlacklistFromFile(contextAssocBlacklistPath_);
-        LoadAutoPhraseSessionState();
-        if (FileContainsLegacyFrequencyNoise(userFreqPath_)) {
-            engine_.SaveFrequencyToFile(userFreqPath_);
-        }
-        SyncUserDataFilesStamp();
-    }
-
-    candidateWindow_.EnsureCreated();
 
     Trace(std::wstring(L"TextService activated marker=") + kBuildMarker);
 
@@ -1727,9 +1956,9 @@ STDMETHODIMP TextService::Activate(ITfThreadMgr* threadMgr, TfClientId clientId)
 }
 
 STDMETHODIMP TextService::Deactivate() {
-    FlushPendingUserDataIfNeeded(true);
+    FlushPendingUserDataIfNeeded(true, false);
     QueueAutoPhraseSessionWrite();
-    StopUserDataWriteWorker(true);
+    ReapAutoPhraseBuilderProcess(false);
 
     if (langBarItemMgr_ != nullptr && configLangBarItem_ != nullptr) {
         langBarItemMgr_->RemoveItem(configLangBarItem_);
@@ -1770,7 +1999,6 @@ STDMETHODIMP TextService::Deactivate() {
     clientId_ = TF_CLIENTID_NULL;
     ClearComposition();
     candidateWindow_.Hide();
-    candidateWindow_.Destroy();
     Trace(L"TextService deactivated");
     return S_OK;
 }
@@ -1804,6 +2032,23 @@ bool TextService::ReloadUserDataIfChanged(bool force) {
         return false;
     }
 
+    if (!force) {
+        const ULONGLONG now = GetTickCount64();
+        if (lastUserDataReloadCheckTick_ != 0 &&
+            now >= lastUserDataReloadCheckTick_ &&
+            (now - lastUserDataReloadCheckTick_) < kUserDataReloadMinIntervalMs) {
+            return false;
+        }
+        lastUserDataReloadCheckTick_ = now;
+    } else {
+        lastUserDataReloadCheckTick_ = GetTickCount64();
+    }
+
+    if (userDataStampRefreshPending_ && !HasPendingTrackedUserDataWrites()) {
+        SyncUserDataFilesStamp();
+        userDataStampRefreshPending_ = false;
+    }
+
     const std::wstring currentStamp = BuildUserDataFilesStamp(
         userDictPath_,
         autoPhraseDictPath_,
@@ -1820,9 +2065,85 @@ bool TextService::ReloadUserDataIfChanged(bool force) {
     return reloaded;
 }
 
-void TextService::FlushPendingUserDataIfNeeded(bool force) {
+bool TextService::ReloadHelperAutoPhraseEntriesIfChanged(bool force) {
+    if (autoPhraseHelperPath_.empty()) {
+        helperAutoPhraseEntriesByCode_.clear();
+        helperAutoPhraseStamp_.clear();
+        return false;
+    }
+
+    if (!force) {
+        const ULONGLONG now = GetTickCount64();
+        if (lastHelperAutoPhraseReloadCheckTick_ != 0 &&
+            now >= lastHelperAutoPhraseReloadCheckTick_ &&
+            (now - lastHelperAutoPhraseReloadCheckTick_) < kHelperAutoPhraseReloadMinIntervalMs) {
+            return false;
+        }
+        lastHelperAutoPhraseReloadCheckTick_ = now;
+    } else {
+        lastHelperAutoPhraseReloadCheckTick_ = GetTickCount64();
+    }
+
+    const std::wstring currentStamp = QueryFileStampToken(autoPhraseHelperPath_);
+    if (!force && currentStamp == helperAutoPhraseStamp_) {
+        return false;
+    }
+
+    const bool loaded = LoadHelperAutoPhraseEntries();
+    helperAutoPhraseStamp_ = currentStamp;
+    Trace(L"helper auto phrase reloaded force=" + std::to_wstring(force ? 1 : 0) + L" loaded=" + std::to_wstring(loaded ? 1 : 0));
+    return true;
+}
+
+bool TextService::EnsureRuntimeReady() {
+    if (runtimeReady_) {
+        return true;
+    }
+
+    if (EnsureUserDataDirectory(userDataDir_)) {
+        MigrateLegacyUserDataFiles(userDataDir_);
+        userDictPath_ = BuildUserDataFilePath(userDataDir_, L"yuninput_user.dict");
+        autoPhraseUserPath_ = BuildUserDataFilePath(userDataDir_, L"auto_phrase_runtime.dict");
+        autoPhraseHelperPath_ = BuildUserDataFilePath(userDataDir_, L"auto_phrase_helper.dict");
+        userFreqPath_ = BuildUserDataFilePath(userDataDir_, L"user_freq.txt");
+        blockedEntriesPath_ = BuildUserDataFilePath(userDataDir_, L"blocked_entries.txt");
+        contextAssocPath_ = BuildUserDataFilePath(userDataDir_, L"context_assoc.txt");
+        contextAssocBlacklistPath_ = BuildUserDataFilePath(userDataDir_, L"context_assoc_blacklist.txt");
+        manualPhraseReviewPath_ = BuildUserDataFilePath(userDataDir_, L"manual_phrase_review.txt");
+        autoPhraseSessionPath_ = BuildUserDataFilePath(userDataDir_, L"auto_phrase_session.txt");
+    }
+
+    StartUserDataWriteWorker();
+    const bool dictionariesLoaded = LoadConfiguredDictionaries();
+
+    if (!userDataDir_.empty()) {
+        engine_.LoadFrequencyFromFile(userFreqPath_);
+        engine_.LoadBlockedEntriesFromFile(blockedEntriesPath_);
+        LoadContextAssociationFromFile(contextAssocPath_);
+        LoadContextAssociationBlacklistFromFile(contextAssocBlacklistPath_);
+        LoadAutoPhraseSessionState();
+        autoPhraseBuilderPending_ = true;
+        LaunchAutoPhraseBuilderProcess();
+        if (FileContainsLegacyFrequencyNoise(userFreqPath_)) {
+            engine_.SaveFrequencyToFile(userFreqPath_);
+        }
+        SyncUserDataFilesStamp();
+        helperAutoPhraseStamp_ = QueryFileStampToken(autoPhraseHelperPath_);
+    }
+
+    candidateWindow_.EnsureCreated();
+    candidateWindow_.SetAsyncPollCallback([this]() {
+        RunDeferredCandidateExpansion();
+    });
+
+    runtimeReady_ = true;
+    Trace(L"runtime init completed dict=" + std::to_wstring(dictionariesLoaded ? 1 : 0));
+    return dictionariesLoaded;
+}
+
+void TextService::FlushPendingUserDataIfNeeded(bool force, bool waitForCompletion) {
     if (!autoPhraseDictionaryDirty_ && !userFrequencyDirty_) {
-        if (force) {
+        if (force && waitForCompletion) {
             WaitForUserDataWrites(false);
             SyncUserDataFilesStamp();
         }
@@ -1847,17 +2168,23 @@ void TextService::FlushPendingUserDataIfNeeded(bool force) {
 
     bool queuedAny = false;
     if (autoPhraseDictionaryDirty_ && !userDictPath_.empty()) {
-        const std::string snapshot = engine_.BuildUserDictionaryFileContent();
+        const std::string userSnapshot = engine_.BuildUserDictionaryFileContent();
         {
             std::lock_guard<std::mutex> lock(userDataWriteMutex_);
             pendingUserDictWrite_.path = userDictPath_;
-            pendingUserDictWrite_.content = snapshot;
+            pendingUserDictWrite_.content = userSnapshot;
             pendingUserDictWrite_.deleteIfEmpty = false;
             pendingUserDictWrite_.generation = ++nextUserDataWriteGeneration_;
+
+            pendingAutoPhraseDictWrite_.path = autoPhraseUserPath_;
+            pendingAutoPhraseDictWrite_.content = engine_.BuildAutoPhraseDictionaryFileContent(kRoamingAutoPhraseMaxEntries);
+            pendingAutoPhraseDictWrite_.deleteIfEmpty = true;
+            pendingAutoPhraseDictWrite_.generation = ++nextUserDataWriteGeneration_;
         }
         userDataWriteCv_.notify_all();
         autoPhraseDictionaryDirty_ = false;
         queuedAny = true;
+        userDataStampRefreshPending_ = true;
     }
 
     if (userFrequencyDirty_ && !userFreqPath_.empty()) {
@@ -1872,6 +2199,7 @@ void TextService::FlushPendingUserDataIfNeeded(bool force) {
         userDataWriteCv_.notify_all();
         userFrequencyDirty_ = false;
         queuedAny = true;
+        userDataStampRefreshPending_ = true;
     }
 
     if (queuedAny) {
@@ -1879,10 +2207,11 @@ void TextService::FlushPendingUserDataIfNeeded(bool force) {
         userDataLastFlushTick_ = now;
     }
 
-    if (force) {
+    if (force && waitForCompletion) {
         WaitForUserDataWrites(false);
         if (queuedAny) {
             SyncUserDataFilesStamp();
+            userDataStampRefreshPending_ = false;
         }
     }
 }
@@ -1916,6 +2245,7 @@ void TextService::StopUserDataWriteWorker(bool waitForPending) {
 void TextService::UserDataWriteWorkerMain() {
     for (;;) {
         PendingAsyncFileWrite userDictWrite;
+        PendingAsyncFileWrite autoPhraseDictWrite;
         PendingAsyncFileWrite userFreqWrite;
         PendingAsyncFileWrite contextAssocWrite;
         PendingAsyncFileWrite blockedEntriesWrite;
@@ -1927,6 +2257,7 @@ void TextService::UserDataWriteWorkerMain() {
             userDataWriteCv_.wait(lock, [this]() {
                 return userDataWriteStopRequested_ ||
                     pendingUserDictWrite_.generation > pendingUserDictWrite_.completedGeneration ||
+                    pendingAutoPhraseDictWrite_.generation > pendingAutoPhraseDictWrite_.completedGeneration ||
                     pendingUserFreqWrite_.generation > pendingUserFreqWrite_.completedGeneration ||
                     pendingContextAssocWrite_.generation > pendingContextAssocWrite_.completedGeneration ||
                     pendingBlockedEntriesWrite_.generation > pendingBlockedEntriesWrite_.completedGeneration ||
@@ -1936,6 +2267,7 @@ void TextService::UserDataWriteWorkerMain() {
 
             if (userDataWriteStopRequested_ &&
                 pendingUserDictWrite_.generation == pendingUserDictWrite_.completedGeneration &&
+                pendingAutoPhraseDictWrite_.generation == pendingAutoPhraseDictWrite_.completedGeneration &&
                 pendingUserFreqWrite_.generation == pendingUserFreqWrite_.completedGeneration &&
                 pendingContextAssocWrite_.generation == pendingContextAssocWrite_.completedGeneration &&
                 pendingBlockedEntriesWrite_.generation == pendingBlockedEntriesWrite_.completedGeneration &&
@@ -1946,6 +2278,9 @@ void TextService::UserDataWriteWorkerMain() {
 
             if (pendingUserDictWrite_.generation > pendingUserDictWrite_.completedGeneration) {
                 userDictWrite = pendingUserDictWrite_;
+            }
+            if (pendingAutoPhraseDictWrite_.generation > pendingAutoPhraseDictWrite_.completedGeneration) {
+                autoPhraseDictWrite = pendingAutoPhraseDictWrite_;
             }
             if (pendingUserFreqWrite_.generation > pendingUserFreqWrite_.completedGeneration) {
                 userFreqWrite = pendingUserFreqWrite_;
@@ -1969,6 +2304,13 @@ void TextService::UserDataWriteWorkerMain() {
             WriteUtf8FileSnapshot(userDictWrite.path, userDictWrite.content, userDictWrite.deleteIfEmpty, userDictWrite.append);
             std::lock_guard<std::mutex> lock(userDataWriteMutex_);
             pendingUserDictWrite_.completedGeneration = std::max(pendingUserDictWrite_.completedGeneration, userDictWrite.generation);
+            userDataWriteCv_.notify_all();
+        }
+
+        if (autoPhraseDictWrite.generation != 0) {
+            WriteUtf8FileSnapshot(autoPhraseDictWrite.path, autoPhraseDictWrite.content, autoPhraseDictWrite.deleteIfEmpty, autoPhraseDictWrite.append);
+            std::lock_guard<std::mutex> lock(userDataWriteMutex_);
+            pendingAutoPhraseDictWrite_.completedGeneration = std::max(pendingAutoPhraseDictWrite_.completedGeneration, autoPhraseDictWrite.generation);
             userDataWriteCv_.notify_all();
         }
 
@@ -2016,14 +2358,20 @@ void TextService::QueueAutoPhraseSessionWrite() {
 
     bool deleteFile = false;
     const std::string snapshot = BuildAutoPhraseSessionStateSnapshot(deleteFile);
-    {
-        std::lock_guard<std::mutex> lock(userDataWriteMutex_);
-        pendingAutoPhraseSessionWrite_.path = autoPhraseSessionPath_;
-        pendingAutoPhraseSessionWrite_.content = snapshot;
-        pendingAutoPhraseSessionWrite_.deleteIfEmpty = deleteFile;
-        pendingAutoPhraseSessionWrite_.generation = ++nextUserDataWriteGeneration_;
+    if (!WriteUtf8FileSnapshot(autoPhraseSessionPath_, snapshot, deleteFile, false)) {
+        return;
     }
-    userDataWriteCv_.notify_all();
+
+    autoPhraseSessionStamp_ = QueryFileStampToken(autoPhraseSessionPath_);
+    if (deleteFile) {
+        autoPhraseBuilderPending_ = false;
+        lastAutoPhraseHistoryUpdateTick_ = 0;
+        return;
+    }
+
+    autoPhraseBuilderPending_ = true;
+    lastAutoPhraseHistoryUpdateTick_ = GetTickCount64();
+    LaunchAutoPhraseBuilderProcess();
 }
 
 void TextService::QueueManualPhraseReviewAppend(const std::string& line) {
@@ -2049,23 +2397,34 @@ bool TextService::WaitForUserDataWrites(bool includeSessionWrite) {
 
     std::unique_lock<std::mutex> lock(userDataWriteMutex_);
     const std::uint64_t targetUserDictGeneration = pendingUserDictWrite_.generation;
+    const std::uint64_t targetAutoPhraseDictGeneration = pendingAutoPhraseDictWrite_.generation;
     const std::uint64_t targetUserFreqGeneration = pendingUserFreqWrite_.generation;
     const std::uint64_t targetContextAssocGeneration = pendingContextAssocWrite_.generation;
     const std::uint64_t targetBlockedEntriesGeneration = pendingBlockedEntriesWrite_.generation;
     const std::uint64_t targetSessionGeneration = pendingAutoPhraseSessionWrite_.generation;
     const std::uint64_t targetManualPhraseReviewGeneration = pendingManualPhraseReviewWrite_.generation;
 
-    userDataWriteCv_.wait(lock, [this, includeSessionWrite, targetUserDictGeneration, targetUserFreqGeneration, targetContextAssocGeneration, targetBlockedEntriesGeneration, targetSessionGeneration, targetManualPhraseReviewGeneration]() {
+    userDataWriteCv_.wait(lock, [this, includeSessionWrite, targetUserDictGeneration, targetAutoPhraseDictGeneration, targetUserFreqGeneration, targetContextAssocGeneration, targetBlockedEntriesGeneration, targetSessionGeneration, targetManualPhraseReviewGeneration]() {
         const bool userDictDone = pendingUserDictWrite_.completedGeneration >= targetUserDictGeneration;
+        const bool autoPhraseDictDone = pendingAutoPhraseDictWrite_.completedGeneration >= targetAutoPhraseDictGeneration;
         const bool userFreqDone = pendingUserFreqWrite_.completedGeneration >= targetUserFreqGeneration;
         const bool contextAssocDone = pendingContextAssocWrite_.completedGeneration >= targetContextAssocGeneration;
         const bool blockedEntriesDone = pendingBlockedEntriesWrite_.completedGeneration >= targetBlockedEntriesGeneration;
         const bool sessionDone = pendingAutoPhraseSessionWrite_.completedGeneration >= targetSessionGeneration;
         const bool manualPhraseReviewDone = pendingManualPhraseReviewWrite_.completedGeneration >= targetManualPhraseReviewGeneration;
-        return userDictDone && userFreqDone && contextAssocDone && blockedEntriesDone && manualPhraseReviewDone && (!includeSessionWrite || sessionDone);
+        return userDictDone && autoPhraseDictDone && userFreqDone && contextAssocDone && blockedEntriesDone && manualPhraseReviewDone && (!includeSessionWrite || sessionDone);
     });
 
     return true;
+}
+
+bool TextService::HasPendingTrackedUserDataWrites() {
+    std::lock_guard<std::mutex> lock(userDataWriteMutex_);
+    return pendingUserDictWrite_.generation > pendingUserDictWrite_.completedGeneration ||
+           pendingAutoPhraseDictWrite_.generation > pendingAutoPhraseDictWrite_.completedGeneration ||
+           pendingUserFreqWrite_.generation > pendingUserFreqWrite_.completedGeneration ||
+           pendingContextAssocWrite_.generation > pendingContextAssocWrite_.completedGeneration ||
+           pendingBlockedEntriesWrite_.generation > pendingBlockedEntriesWrite_.completedGeneration;
 }
 
 bool TextService::WriteUtf8FileSnapshot(const std::wstring& filePath, const std::string& content, bool deleteIfEmpty, bool append) {
@@ -2096,7 +2455,7 @@ bool TextService::WriteUtf8FileSnapshot(const std::wstring& filePath, const std:
 }
 
 std::string TextService::BuildAutoPhraseSessionStateSnapshot(bool& deleteFile) const {
-    deleteFile = autoPhraseHistoryText_.empty() && sessionAutoPhraseEntries_.empty();
+    deleteFile = autoPhraseHistoryText_.empty();
     if (deleteFile) {
         return std::string();
     }
@@ -2104,27 +2463,165 @@ std::string TextService::BuildAutoPhraseSessionStateSnapshot(bool& deleteFile) c
     std::ostringstream output;
     output << "boot_tick\t" << GetTickCount64() << '\n';
     output << "history\t" << WideToUtf8Text(autoPhraseHistoryText_) << '\n';
-    for (const auto& pair : sessionAutoPhraseEntries_) {
-        const SessionAutoPhraseEntry& entry = pair.second;
-        if (entry.text.empty() || entry.codes.empty()) {
-            continue;
-        }
+    return output.str();
+}
 
-        std::ostringstream codeStream;
-        for (size_t index = 0; index < entry.codes.size(); ++index) {
-            if (index != 0) {
-                codeStream << ',';
-            }
-            codeStream << WideToUtf8Text(entry.codes[index]);
-        }
-
-        output << "entry\t"
-               << WideToUtf8Text(entry.text) << '\t'
-               << codeStream.str() << '\t'
-               << entry.lastTick << '\n';
+bool TextService::ReloadAutoPhraseSessionStateIfChanged(bool force) {
+    if (autoPhraseSessionPath_.empty()) {
+        return false;
     }
 
-    return output.str();
+    const std::wstring currentStamp = QueryFileStampToken(autoPhraseSessionPath_);
+    if (!force && currentStamp == autoPhraseSessionStamp_) {
+        return false;
+    }
+
+    return LoadAutoPhraseSessionState();
+}
+
+bool TextService::ReapAutoPhraseBuilderProcess(bool reloadSessionState) {
+    if (autoPhraseBuilderProcess_ == nullptr) {
+        return false;
+    }
+
+    const DWORD waitResult = WaitForSingleObject(autoPhraseBuilderProcess_, 0);
+    if (waitResult == WAIT_TIMEOUT) {
+        return false;
+    }
+
+    DWORD exitCode = STILL_ACTIVE;
+    if (!GetExitCodeProcess(autoPhraseBuilderProcess_, &exitCode)) {
+        exitCode = GetLastError();
+        Trace(L"auto phrase builder exit-code query failed error=" + std::to_wstring(exitCode));
+    } else {
+        Trace(L"auto phrase builder completed exit=" + std::to_wstring(exitCode));
+    }
+
+    CloseHandle(autoPhraseBuilderProcess_);
+    autoPhraseBuilderProcess_ = nullptr;
+
+    if (reloadSessionState) {
+        ReloadAutoPhraseSessionStateIfChanged(true);
+    }
+
+    return true;
+}
+
+bool TextService::LaunchAutoPhraseBuilderProcess() {
+    ReapAutoPhraseBuilderProcess(true);
+
+    if (autoPhraseSessionPath_.empty() || autoPhraseHistoryText_.empty()) {
+        autoPhraseBuilderPending_ = false;
+        return false;
+    }
+
+    if (autoPhraseBuilderProcess_ != nullptr) {
+        if (SignalAutoPhraseHelperWakeEvent()) {
+            return true;
+        }
+
+        Trace(L"auto phrase builder still running; skip relaunch");
+        return false;
+    }
+
+    if (!autoPhraseBuilderPending_) {
+        return SignalAutoPhraseHelperWakeEvent();
+    }
+
+    if (SignalAutoPhraseHelperWakeEvent()) {
+        autoPhraseBuilderPending_ = false;
+        return true;
+    }
+
+    const ULONGLONG now = GetTickCount64();
+    if (lastAutoPhraseHistoryUpdateTick_ != 0 &&
+        lastAutoPhraseBuilderLaunchTick_ != 0 &&
+        now >= lastAutoPhraseHistoryUpdateTick_ &&
+        (now - lastAutoPhraseHistoryUpdateTick_) < kAutoPhraseBuilderLaunchMinIntervalMs) {
+        return false;
+    }
+
+    std::wstring modulePath;
+    if (!GetModulePath(modulePath)) {
+        return false;
+    }
+
+    if (autoPhraseBuilderPath_.empty()) {
+        const std::filesystem::path moduleFile(modulePath);
+        const std::filesystem::path moduleDir = moduleFile.parent_path();
+        const std::filesystem::path rootDir = ResolveDataRootFromModule(modulePath);
+        const std::filesystem::path releaseDir = rootDir / L"build" / L"Release";
+        const std::filesystem::path binDir = rootDir / L"bin";
+        const std::filesystem::path candidates[] = {
+            moduleDir / L"yuninput_user_dict_builder.exe",
+            releaseDir / L"yuninput_user_dict_builder.exe",
+            binDir / L"yuninput_user_dict_builder.exe",
+        };
+
+        for (const auto& candidate : candidates) {
+            std::error_code ec;
+            if (std::filesystem::exists(candidate, ec)) {
+                autoPhraseBuilderPath_ = candidate.wstring();
+                break;
+            }
+        }
+    }
+
+    if (autoPhraseBuilderPath_.empty()) {
+        Trace(L"auto phrase builder executable missing");
+        return false;
+    }
+
+    const std::filesystem::path rootDir = ResolveDataRootFromModule(modulePath);
+    const std::filesystem::path dataDir = rootDir / L"data";
+    const std::wstring profileDictPath = dictionaryProfile_ == DictionaryProfile::ZhengmaLargePinyin
+        ? (dataDir / L"zhengma-pinyin.dict").wstring()
+        : (dataDir / L"zhengma-all.dict").wstring();
+    const std::wstring fallbackDictPath = (dataDir / L"yuninput_basic.dict").wstring();
+    const std::wstring phraseSourcePath = std::filesystem::exists(dataDir / L"zhengma-single.dict")
+        ? (dataDir / L"zhengma-single.dict").wstring()
+        : profileDictPath;
+
+    std::wstring commandLine = QuoteCommandLineArg(autoPhraseBuilderPath_) +
+        L" session-watch " +
+        QuoteCommandLineArg(autoPhraseSessionPath_) + L" " +
+        QuoteCommandLineArg(profileDictPath) + L" " +
+        QuoteCommandLineArg(fallbackDictPath) + L" " +
+        QuoteCommandLineArg(phraseSourcePath) + L" " +
+        QuoteCommandLineArg(userDictPath_) + L" " +
+        QuoteCommandLineArg(autoPhraseDictPath_) + L" " +
+        QuoteCommandLineArg(autoPhraseUserPath_) + L" " +
+        QuoteCommandLineArg(autoPhraseHelperPath_);
+
+    Trace(L"auto phrase builder launch command=" + commandLine);
+
+    STARTUPINFOW startupInfo = {};
+    startupInfo.cb = sizeof(startupInfo);
+    PROCESS_INFORMATION processInfo = {};
+    std::vector<wchar_t> mutableCommand(commandLine.begin(), commandLine.end());
+    mutableCommand.push_back(L'\0');
+    if (!CreateProcessW(
+            nullptr,
+            mutableCommand.data(),
+            nullptr,
+            nullptr,
+            FALSE,
+            CREATE_NO_WINDOW,
+            nullptr,
+            std::filesystem::path(autoPhraseBuilderPath_).parent_path().c_str(),
+            &startupInfo,
+            &processInfo)) {
+        const DWORD error = GetLastError();
+        Trace(L"auto phrase builder launch failed error=" + std::to_wstring(error));
+        return false;
+    }
+
+    CloseHandle(processInfo.hThread);
+    autoPhraseBuilderProcess_ = processInfo.hProcess;
+    lastAutoPhraseBuilderLaunchTick_ = now;
+    autoPhraseBuilderPending_ = false;
+    Trace(L"auto phrase builder launched pid=" + std::to_wstring(static_cast<unsigned long long>(processInfo.dwProcessId)));
+    return true;
 }
 
 std::string TextService::BuildContextAssociationFileContent() const {
@@ -2159,11 +2656,13 @@ bool TextService::LoadAutoPhraseSessionState() {
     sessionAutoPhraseEntries_.clear();
 
     if (autoPhraseSessionPath_.empty()) {
+        autoPhraseSessionStamp_.clear();
         return false;
     }
 
     std::ifstream input(autoPhraseSessionPath_, std::ios::in | std::ios::binary);
     if (!input) {
+        autoPhraseSessionStamp_ = QueryFileStampToken(autoPhraseSessionPath_);
         return false;
     }
 
@@ -2239,10 +2738,96 @@ bool TextService::LoadAutoPhraseSessionState() {
         autoPhraseHistoryText_.clear();
         sessionAutoPhraseEntries_.clear();
         QueueAutoPhraseSessionWrite();
+        autoPhraseSessionStamp_ = QueryFileStampToken(autoPhraseSessionPath_);
         return false;
     }
 
+    if (!autoPhraseHistoryText_.empty()) {
+        CollectSessionAutoPhraseCandidatesForTail(GetTickCount64());
+    }
+
+    if (PruneSessionAutoPhraseEntries()) {
+        QueueAutoPhraseSessionWrite();
+    }
+
+    autoPhraseSessionStamp_ = QueryFileStampToken(autoPhraseSessionPath_);
     return !autoPhraseHistoryText_.empty() || !sessionAutoPhraseEntries_.empty();
+}
+
+bool TextService::LoadHelperAutoPhraseEntries() {
+    helperAutoPhraseEntriesByCode_.clear();
+
+    if (autoPhraseHelperPath_.empty()) {
+        return false;
+    }
+
+    std::ifstream input(autoPhraseHelperPath_, std::ios::in | std::ios::binary);
+    if (!input) {
+        return false;
+    }
+
+    std::string line;
+    while (std::getline(input, line)) {
+        if (line.empty() || line[0] == '#') {
+            continue;
+        }
+
+        std::istringstream iss(line);
+        std::string firstToken;
+        std::string secondToken;
+        if (!(iss >> firstToken >> secondToken)) {
+            continue;
+        }
+
+        const bool firstIsCode = IsAsciiCodeToken(firstToken);
+        const bool secondIsCode = IsAsciiCodeToken(secondToken);
+        if (firstIsCode == secondIsCode) {
+            continue;
+        }
+
+        const std::string codeUtf8 = firstIsCode ? firstToken : secondToken;
+        const std::string textUtf8 = firstIsCode ? secondToken : firstToken;
+
+        std::wstring code = Utf8ToWideText(codeUtf8);
+        std::transform(
+            code.begin(),
+            code.end(),
+            code.begin(),
+            [](wchar_t ch) {
+                return static_cast<wchar_t>(std::towlower(static_cast<wint_t>(ch)));
+            });
+        code.erase(
+            std::remove_if(
+                code.begin(),
+                code.end(),
+                [](wchar_t ch) {
+                    return ch < L'a' || ch > L'z';
+                }),
+            code.end());
+
+        const std::wstring text = Utf8ToWideText(textUtf8);
+        if (code.empty() || text.empty()) {
+            continue;
+        }
+
+        auto& entries = helperAutoPhraseEntriesByCode_[code];
+        const auto duplicateIt = std::find_if(
+            entries.begin(),
+            entries.end(),
+            [&text](const HelperAutoPhraseEntry& entry) {
+                return entry.text == text;
+            });
+        if (duplicateIt != entries.end()) {
+            continue;
+        }
+
+        HelperAutoPhraseEntry entry;
+        entry.code = code;
+        entry.text = text;
+        entries.push_back(std::move(entry));
+    }
+
+    return !helperAutoPhraseEntriesByCode_.empty();
 }
 
 bool TextService::IsHanCharacter(wchar_t ch) {
@@ -2257,6 +2842,7 @@ void TextService::RecordSessionAutoPhraseBreak() {
         if (autoPhraseHistoryText_.size() > kSessionAutoPhraseHistoryCharLimit) {
             autoPhraseHistoryText_.erase(0, autoPhraseHistoryText_.size() - kSessionAutoPhraseHistoryCharLimit);
         }
+        PruneSessionAutoPhraseEntries();
         QueueAutoPhraseSessionWrite();
     }
 }
@@ -2298,44 +2884,99 @@ void TextService::CollectSessionAutoPhraseCandidatesForTail(ULONGLONG now) {
     }
 
     const size_t maxPhraseLength = std::min(kSessionAutoPhraseMaxLength, tailText.size());
-    for (size_t phraseLength = 2; phraseLength <= maxPhraseLength; ++phraseLength) {
-        const std::wstring phraseText = tailText.substr(tailText.size() - phraseLength, phraseLength);
-        if (sessionAutoPhraseEntries_.find(phraseText) != sessionAutoPhraseEntries_.end()) {
-            sessionAutoPhraseEntries_[phraseText].lastTick = now;
-            continue;
-        }
-
-        std::vector<std::wstring> phraseCodes;
-        if (!phraseBuildEngine_.TryBuildPhraseCodes(phraseText, phraseCodes) || phraseCodes.empty()) {
-            continue;
-        }
-
-        std::vector<std::wstring> sanitizedCodes;
-        sanitizedCodes.reserve(phraseCodes.size());
-        for (std::wstring& phraseCode : phraseCodes) {
-            phraseCode = sanitizePhraseCode(std::move(phraseCode));
-            if (phraseCode.empty()) {
+    for (size_t start = 0; start + 2 <= tailText.size(); ++start) {
+        const size_t remaining = tailText.size() - start;
+        const size_t maxLengthForStart = std::min(maxPhraseLength, remaining);
+        for (size_t phraseLength = 2; phraseLength <= maxLengthForStart; ++phraseLength) {
+            const std::wstring phraseText = tailText.substr(start, phraseLength);
+            auto existingIt = sessionAutoPhraseEntries_.find(phraseText);
+            if (existingIt != sessionAutoPhraseEntries_.end()) {
+                existingIt->second.lastTick = now;
                 continue;
             }
-            if (std::find(sanitizedCodes.begin(), sanitizedCodes.end(), phraseCode) != sanitizedCodes.end()) {
+
+            std::vector<std::wstring> phraseCodes;
+            if (!phraseBuildEngine_.TryBuildPhraseCodes(phraseText, phraseCodes) || phraseCodes.empty()) {
                 continue;
             }
-            if (engine_.HasEntry(phraseCode, phraseText)) {
+
+            std::vector<std::wstring> sanitizedCodes;
+            sanitizedCodes.reserve(phraseCodes.size());
+            for (std::wstring& phraseCode : phraseCodes) {
+                phraseCode = sanitizePhraseCode(std::move(phraseCode));
+                if (phraseCode.empty()) {
                     continue;
+                }
+                if (std::find(sanitizedCodes.begin(), sanitizedCodes.end(), phraseCode) != sanitizedCodes.end()) {
+                    continue;
+                }
+                if (engine_.HasEntry(phraseCode, phraseText)) {
+                    continue;
+                }
+                sanitizedCodes.push_back(std::move(phraseCode));
             }
-            sanitizedCodes.push_back(std::move(phraseCode));
-        }
 
             if (sanitizedCodes.empty()) {
-            continue;
+                continue;
+            }
+
+            SessionAutoPhraseEntry entry;
+            entry.text = phraseText;
+            entry.codes = std::move(sanitizedCodes);
+            entry.lastTick = now;
+            sessionAutoPhraseEntries_.emplace(entry.text, std::move(entry));
+        }
+    }
+}
+
+bool TextService::PruneSessionAutoPhraseEntries() {
+    if (sessionAutoPhraseEntries_.empty()) {
+        return false;
+    }
+
+    std::unordered_set<std::wstring> validPhrases;
+    validPhrases.reserve(sessionAutoPhraseEntries_.size() * 2);
+
+    size_t segmentStart = 0;
+    while (segmentStart < autoPhraseHistoryText_.size()) {
+        while (segmentStart < autoPhraseHistoryText_.size() && autoPhraseHistoryText_[segmentStart] == kSessionAutoPhraseBreak) {
+            ++segmentStart;
+        }
+        if (segmentStart >= autoPhraseHistoryText_.size()) {
+            break;
         }
 
-        SessionAutoPhraseEntry entry;
-        entry.text = phraseText;
-        entry.codes = std::move(sanitizedCodes);
-        entry.lastTick = now;
-        sessionAutoPhraseEntries_.emplace(entry.text, std::move(entry));
+        size_t segmentEnd = segmentStart;
+        while (segmentEnd < autoPhraseHistoryText_.size() && autoPhraseHistoryText_[segmentEnd] != kSessionAutoPhraseBreak) {
+            ++segmentEnd;
+        }
+
+        const size_t segmentLength = segmentEnd - segmentStart;
+        if (segmentLength >= 2) {
+            const size_t maxPhraseLength = std::min(kSessionAutoPhraseMaxLength, segmentLength);
+            for (size_t start = 0; start + 2 <= segmentLength; ++start) {
+                const size_t remaining = segmentLength - start;
+                const size_t maxLengthForStart = std::min(maxPhraseLength, remaining);
+                for (size_t phraseLength = 2; phraseLength <= maxLengthForStart; ++phraseLength) {
+                    validPhrases.insert(autoPhraseHistoryText_.substr(segmentStart + start, phraseLength));
+                }
+            }
+        }
+
+        segmentStart = segmentEnd + 1;
     }
+
+    bool changed = false;
+    for (auto it = sessionAutoPhraseEntries_.begin(); it != sessionAutoPhraseEntries_.end();) {
+        if (it->second.codes.empty() || validPhrases.find(it->first) == validPhrases.end()) {
+            it = sessionAutoPhraseEntries_.erase(it);
+            changed = true;
+        } else {
+            ++it;
+        }
+    }
+
+    return changed;
 }
 
 void TextService::UpdateSessionAutoPhraseHistory(const std::wstring& committedText, ULONGLONG now) {
@@ -2346,7 +2987,6 @@ void TextService::UpdateSessionAutoPhraseHistory(const std::wstring& committedTe
             if (autoPhraseHistoryText_.size() > kSessionAutoPhraseHistoryCharLimit) {
                 autoPhraseHistoryText_.erase(0, autoPhraseHistoryText_.size() - kSessionAutoPhraseHistoryCharLimit);
             }
-            CollectSessionAutoPhraseCandidatesForTail(now);
             changed = true;
         } else if (!autoPhraseHistoryText_.empty() && autoPhraseHistoryText_.back() != kSessionAutoPhraseBreak) {
             autoPhraseHistoryText_.push_back(kSessionAutoPhraseBreak);
@@ -2358,6 +2998,8 @@ void TextService::UpdateSessionAutoPhraseHistory(const std::wstring& committedTe
     }
 
     if (changed) {
+        CollectSessionAutoPhraseCandidatesForTail(now);
+        PruneSessionAutoPhraseEntries();
         QueueAutoPhraseSessionWrite();
     }
 }
@@ -2409,8 +3051,8 @@ bool TextService::PromoteSessionAutoPhrase(const std::wstring& text) {
             continue;
         }
 
-        changed = engine_.AddAutoPhraseEntry(code, entry.text) || changed;
-        AppendPhraseReviewEntry(code, entry.text, L"auto");
+        changed = engine_.AddUserEntry(code, entry.text) || changed;
+        AppendPhraseReviewEntry(code, entry.text, L"auto-commit");
     }
 
     if (changed) {
@@ -2422,9 +3064,13 @@ bool TextService::PromoteSessionAutoPhrase(const std::wstring& text) {
     return changed;
 }
 
-void TextService::RefreshCandidates() {
+void TextService::RefreshCandidates(bool expandAll) {
+    const LONGLONG refreshStartCounter = QueryPerfCounterValue();
     allCandidates_.clear();
     InvalidatePageCandidatesCache();
+    ReloadUserDataIfChanged(false);
+    ReloadHelperAutoPhraseEntriesIfChanged(false);
+    candidatesFullyExpanded_ = expandAll;
     if (compositionCode_.empty()) {
         pageIndex_ = 0;
         selectedIndexInPage_ = 0;
@@ -2433,7 +3079,12 @@ void TextService::RefreshCandidates() {
         return;
     }
 
+    const size_t fastTargetCandidateCount = std::max<size_t>(pageSize_ + 2, std::min<size_t>(pageSize_ * 2, 12));
+    const size_t targetCandidateCount = expandAll ? kRefreshTargetCandidateCount : fastTargetCandidateCount;
+    const size_t primaryQueryLimit = expandAll ? kPrimaryCandidateQueryLimit : std::max<size_t>(pageSize_ * 2, 12);
+
     const bool pinyinFallbackMode = dictionaryProfile_ == DictionaryProfile::ZhengmaLargePinyin;
+    const bool allowIncrementalPrefixCache = !expandAll && !pinyinFallbackMode && compositionCode_.size() > 1;
 
     auto buildDisplayCode = [this, pinyinFallbackMode](const std::wstring& text, const std::wstring& rawCode) {
         if (!pinyinFallbackMode) {
@@ -2448,10 +3099,8 @@ void TextService::RefreshCandidates() {
         return std::wstring(L"-");
     };
 
-    const std::vector<CompositionEngine::Entry> queried = engine_.QueryCandidateEntries(compositionCode_, 200);
-    allCandidates_.reserve(queried.size() + 32);
     std::unordered_map<std::wstring, size_t> candidateIndexByKey;
-    candidateIndexByKey.reserve(queried.size() + 64);
+    candidateIndexByKey.reserve(primaryQueryLimit + 64);
 
     auto makeCandidateMergeKey = [](const std::wstring& text, const std::wstring& commitCode) {
         std::wstring key;
@@ -2536,7 +3185,71 @@ void TextService::RefreshCandidates() {
         candidateIndexByKey.emplace(candidateKey, allCandidates_.size() - 1);
     };
 
-    bool hasExactCurrentCode = false;
+    std::vector<CandidateItem> helperTailCandidates;
+
+    if (allowIncrementalPrefixCache) {
+        const std::wstring previousCode = compositionCode_.substr(0, compositionCode_.size() - 1);
+        const auto cacheIt = compositionCandidateCache_.find(previousCode);
+        if (cacheIt != compositionCandidateCache_.end()) {
+            const auto& cachedCandidates = cacheIt->second.candidates;
+            allCandidates_.reserve(std::max(allCandidates_.capacity(), cachedCandidates.size() + 32));
+            for (const CandidateItem& cached : cachedCandidates) {
+                std::wstring stableCode = cached.commitCode.empty() ? cached.code : cached.commitCode;
+                if (stableCode.empty()) {
+                    continue;
+                }
+
+                if (stableCode.size() < compositionCode_.size() ||
+                    stableCode.compare(0, compositionCode_.size(), compositionCode_) != 0) {
+                    continue;
+                }
+
+                CandidateItem candidate = cached;
+                candidate.exactMatch = stableCode == compositionCode_;
+                candidate.consumedLength = compositionCode_.size();
+                if (candidate.code.empty()) {
+                    candidate.code = stableCode;
+                }
+
+                const std::wstring candidateKey = makeCandidateMergeKey(candidate.text, stableCode);
+                if (candidateIndexByKey.find(candidateKey) != candidateIndexByKey.end()) {
+                    continue;
+                }
+
+                allCandidates_.push_back(std::move(candidate));
+                candidateIndexByKey.emplace(candidateKey, allCandidates_.size() - 1);
+            }
+        }
+    }
+
+    bool hasExactCurrentCode = std::any_of(
+        allCandidates_.begin(),
+        allCandidates_.end(),
+        [](const CandidateItem& item) {
+            return item.exactMatch;
+        });
+    const bool canUseIncrementalPrefixFastPath =
+        allowIncrementalPrefixCache &&
+        hasExactCurrentCode &&
+        allCandidates_.size() >= pageSize_;
+
+    const size_t fastQueryScanBudget =
+        expandAll
+            ? 0
+            : (compositionCode_.size() <= 1
+                   ? kFastQueryScanBudgetOneChar
+                   : (compositionCode_.size() == 2 ? kFastQueryScanBudgetTwoChar : 0));
+
+    const std::vector<CompositionEngine::Entry> queried =
+        canUseIncrementalPrefixFastPath
+            ? std::vector<CompositionEngine::Entry>()
+            : (fastQueryScanBudget == 0
+                   ? engine_.QueryCandidateEntries(compositionCode_, primaryQueryLimit)
+                   : engine_.QueryCandidateEntriesFast(compositionCode_, primaryQueryLimit, fastQueryScanBudget));
+    if (!canUseIncrementalPrefixFastPath) {
+        allCandidates_.reserve(std::max(allCandidates_.capacity(), queried.size() + 32));
+    }
+
     for (const auto& item : queried) {
         if (pinyinFallbackMode && item.text.size() != 1) {
             continue;
@@ -2563,11 +3276,17 @@ void TextService::RefreshCandidates() {
             compositionCode_.size());
     }
 
-    if (pinyinFallbackMode && allCandidates_.empty() && compositionCode_.size() > 2) {
+    auto needsMoreCandidates = [this, targetCandidateCount]() {
+        return allCandidates_.size() < targetCandidateCount;
+    };
+
+    const bool fastPathSatisfied = !expandAll && hasExactCurrentCode && allCandidates_.size() >= pageSize_;
+
+    if (!fastPathSatisfied && pinyinFallbackMode && allCandidates_.empty() && compositionCode_.size() > 2) {
         std::wstring prefixCode = compositionCode_;
         for (size_t prefixLength = compositionCode_.size() - 1; prefixLength >= 2; --prefixLength) {
             prefixCode.resize(prefixLength);
-            const std::vector<CompositionEngine::Entry> prefixMatches = engine_.QueryCandidateEntries(prefixCode, 80);
+            const std::vector<CompositionEngine::Entry> prefixMatches = engine_.QueryCandidateEntries(prefixCode, kPrefixCandidateQueryLimit);
             for (const auto& item : prefixMatches) {
                 if (item.text.size() != 1 || item.code != prefixCode) {
                     continue;
@@ -2600,12 +3319,12 @@ void TextService::RefreshCandidates() {
         }
     }
 
-    if (!hasExactCurrentCode && compositionCode_.size() > 1 && !pinyinFallbackMode) {
-        const size_t prefixFallbackTarget = std::max<size_t>(24, pageSize_ * 3);
+    if (!fastPathSatisfied && !hasExactCurrentCode && compositionCode_.size() > 1 && !pinyinFallbackMode && needsMoreCandidates()) {
+        const size_t prefixFallbackTarget = std::max(targetCandidateCount, pageSize_ * 3);
         std::wstring prefixCode = compositionCode_;
         for (size_t prefixLength = compositionCode_.size() - 1; prefixLength >= 1; --prefixLength) {
             prefixCode.resize(prefixLength);
-            const std::vector<CompositionEngine::Entry> prefixMatches = engine_.QueryCandidateEntries(prefixCode, 24);
+            const std::vector<CompositionEngine::Entry> prefixMatches = engine_.QueryCandidateEntries(prefixCode, kPrefixCandidateQueryLimit);
             for (const auto& item : prefixMatches) {
                 if (item.code != prefixCode) {
                     continue;
@@ -2638,11 +3357,11 @@ void TextService::RefreshCandidates() {
     }
 
     const ULONGLONG now = GetTickCount64();
-    if (!recentCommits_.empty() && !pinyinFallbackMode) {
+    if (!fastPathSatisfied && !recentCommits_.empty() && !pinyinFallbackMode && needsMoreCandidates()) {
         const CommitHistoryItem& previous = recentCommits_.back();
         if ((now - previous.tick) <= 8000ULL && !previous.code.empty() && !previous.text.empty()) {
             const std::wstring phraseCode = previous.code + compositionCode_;
-            const std::vector<CompositionEngine::Entry> phraseMatches = engine_.QueryCandidateEntries(phraseCode, 64);
+            const std::vector<CompositionEngine::Entry> phraseMatches = engine_.QueryCandidateEntries(phraseCode, kPhraseCandidateQueryLimit);
             for (const auto& item : phraseMatches) {
                 if (item.text.size() <= previous.text.size()) {
                     continue;
@@ -2674,7 +3393,7 @@ void TextService::RefreshCandidates() {
         }
     }
 
-    if (contextAssociationEnabled_ && !recentCommits_.empty()) {
+    if (!fastPathSatisfied && contextAssociationEnabled_ && !recentCommits_.empty() && !allCandidates_.empty()) {
         const CommitHistoryItem& previous = recentCommits_.back();
         if ((now - previous.tick) <= 15000ULL && !previous.text.empty()) {
             const std::wstring associationPrefix = previous.text + L"\t";
@@ -2703,7 +3422,7 @@ void TextService::RefreshCandidates() {
         }
     }
 
-    if (!pinyinFallbackMode && compositionCode_.size() >= 4) {
+    if (!fastPathSatisfied && !pinyinFallbackMode && compositionCode_.size() >= 4) {
         for (const auto& pair : sessionAutoPhraseEntries_) {
             const SessionAutoPhraseEntry& entry = pair.second;
             if (entry.text.empty()) {
@@ -2727,6 +3446,30 @@ void TextService::RefreshCandidates() {
                 true,
                 false,
                 compositionCode_.size());
+        }
+
+        const auto helperIt = helperAutoPhraseEntriesByCode_.find(compositionCode_);
+        if (helperIt != helperAutoPhraseEntriesByCode_.end()) {
+            helperTailCandidates.reserve(helperIt->second.size());
+            for (const HelperAutoPhraseEntry& entry : helperIt->second) {
+                if (entry.text.empty()) {
+                    continue;
+                }
+
+                const std::wstring candidateKey = makeCandidateMergeKey(entry.text, compositionCode_);
+                if (candidateIndexByKey.find(candidateKey) != candidateIndexByKey.end()) {
+                    continue;
+                }
+
+                CandidateItem candidate;
+                candidate.text = entry.text;
+                candidate.code = compositionCode_;
+                candidate.commitCode = compositionCode_;
+                candidate.exactMatch = true;
+                candidate.fromAutoPhrase = true;
+                candidate.consumedLength = compositionCode_.size();
+                helperTailCandidates.push_back(std::move(candidate));
+            }
         }
     }
 
@@ -2771,27 +3514,41 @@ void TextService::RefreshCandidates() {
             candidate.sortShortCodeTier = 3;
         }
 
+        candidate.sortPreferredPhrase =
+            candidate.text.size() >= 2 &&
+            candidate.exactMatch &&
+            sortCodeLength >= 4 &&
+            (candidate.fromSessionAutoPhrase ||
+             candidate.fromAutoPhrase ||
+             candidate.boostedUser ||
+             candidate.boostedLearned ||
+             candidate.boostedContext ||
+             candidate.learnedScore > 0 ||
+             candidate.contextScore > 0);
+
         std::uint8_t tier = 7;
         if (candidate.sortNonGB2312Single) {
             tier = 250;
         } else if (candidate.sortSystemFiveCodePhrase) {
             tier = 240;
-        } else if (candidate.sortSingleChar && sortCodeLength <= 1) {
+        } else if (candidate.sortPreferredPhrase) {
             tier = 0;
-        } else if (candidate.text.size() == 2 && sortCodeLength == 2) {
+        } else if (candidate.sortSingleChar && sortCodeLength <= 1) {
             tier = 1;
-        } else if (candidate.sortSingleChar && sortCodeLength == 2) {
+        } else if (candidate.text.size() == 2 && sortCodeLength == 2) {
             tier = 2;
-        } else if (candidate.sortSingleChar && sortCodeLength == 3) {
+        } else if (candidate.sortSingleChar && sortCodeLength == 2) {
             tier = 3;
-        } else if (!candidate.exactMatch && sortCodeLength >= 4) {
+        } else if (candidate.sortSingleChar && sortCodeLength == 3) {
             tier = 4;
-        } else if (candidate.fromAutoPhrase && sortCodeLength == 4) {
+        } else if (!candidate.exactMatch && sortCodeLength >= 4) {
             tier = 5;
-        } else if (!candidate.fromAutoPhrase && candidate.text.size() >= 2 && sortCodeLength == 4) {
+        } else if (candidate.fromAutoPhrase && sortCodeLength == 4) {
             tier = 6;
-        } else if (candidate.sortSingleChar && sortCodeLength == 4) {
+        } else if (!candidate.fromAutoPhrase && candidate.text.size() >= 2 && sortCodeLength == 4) {
             tier = 7;
+        } else if (candidate.sortSingleChar && sortCodeLength == 4) {
+            tier = 8;
         }
         candidate.sortPrimaryTier = tier;
     };
@@ -2831,6 +3588,9 @@ void TextService::RefreshCandidates() {
             if (left.fromSessionAutoPhrase != right.fromSessionAutoPhrase) {
                 return left.fromSessionAutoPhrase > right.fromSessionAutoPhrase;
             }
+            if (left.sortPreferredPhrase != right.sortPreferredPhrase) {
+                return left.sortPreferredPhrase > right.sortPreferredPhrase;
+            }
             if (left.sortPrimaryTier != right.sortPrimaryTier) {
                 return left.sortPrimaryTier < right.sortPrimaryTier;
             }
@@ -2866,6 +3626,10 @@ void TextService::RefreshCandidates() {
             return false;
         });
 
+    for (CandidateItem& candidate : helperTailCandidates) {
+        allCandidates_.push_back(std::move(candidate));
+    }
+
     pageIndex_ = 0;
     selectedIndexInPage_ = FindPreferredSelectionIndexForPage(pageIndex_);
     if (allCandidates_.empty()) {
@@ -2877,7 +3641,17 @@ void TextService::RefreshCandidates() {
         emptyCandidateAlerted_ = false;
     }
 
+    CacheCurrentCandidatesForCode();
     UpdateCandidateWindow();
+    if (!expandAll) {
+        ScheduleDeferredCandidateExpansion();
+    }
+    TraceLatencySample(
+        L"refresh code=" + compositionCode_ +
+            L" expand=" + std::to_wstring(expandAll ? 1 : 0) +
+            L" count=" + std::to_wstring(allCandidates_.size()),
+        refreshStartCounter,
+        QueryPerfCounterValue());
 }
 
 const wchar_t* TextService::GetDictionaryProfileName(DictionaryProfile profile) {
@@ -3003,6 +3777,9 @@ bool TextService::LoadConfiguredDictionaries() {
 
     const bool loadedPackagedUser = engine_.LoadUserDictionaryFromFile(userDictPath_);
     const bool loadedPackagedAutoPhrase = engine_.LoadAutoPhraseDictionaryFromFile(autoPhraseDictPath_);
+    const bool loadedRoamingAutoPhrase = !autoPhraseUserPath_.empty() && engine_.LoadAutoPhraseDictionaryFromFile(autoPhraseUserPath_);
+    const bool loadedHelperAutoPhrase = LoadHelperAutoPhraseEntries();
+        helperAutoPhraseStamp_ = QueryFileStampToken(autoPhraseHelperPath_);
 
     Trace(
         L"Dictionary profile=" + profileName +
@@ -3010,6 +3787,8 @@ bool TextService::LoadConfiguredDictionaries() {
         L" fallback_loaded=" + (loadedFallback ? L"1" : L"0") +
         L" packaged_user=" + (loadedPackagedUser ? L"1" : L"0") +
         L" packaged_extend=" + (loadedPackagedAutoPhrase ? L"1" : L"0") +
+        L" roaming_auto=" + (loadedRoamingAutoPhrase ? L"1" : L"0") +
+        L" helper_auto=" + (loadedHelperAutoPhrase ? L"1" : L"0") +
         L" phrase_source=" + (loadedPhraseBuildSource ? L"1" : L"0") +
         (dictionaryProfile_ == DictionaryProfile::ZhengmaLargePinyin ? L" mode=pinyin-single-char-with-zhengma-hint" : L""));
 
@@ -3358,23 +4137,39 @@ std::uint64_t TextService::QueryContextAssociationScore(const std::wstring& prev
 }
 
 void TextService::UpdateCandidateWindow() {
+    const LONGLONG updateWindowStartCounter = QueryPerfCounterValue();
     if (compositionCode_.empty()) {
         candidateWindow_.Hide();
+        return;
+    }
+
+    if (!candidateWindow_.EnsureCreated()) {
+        Trace(L"UpdateCandidateWindow: candidate window create failed");
         return;
     }
 
     POINT anchor = {};
     const POINT* anchorPtr = nullptr;
     bool hasFocusedContext = false;
+    const ULONGLONG nowTick = GetTickCount64();
+
+    if (candidateWindow_.IsVisible() &&
+        hasRecentAnchor_ &&
+        nowTick >= lastAnchorTick_ &&
+        (nowTick - lastAnchorTick_) <= kAnchorFastReuseWindowMs) {
+        anchor = lastAnchor_;
+        anchorPtr = &anchor;
+        hasFocusedContext = true;
+    }
 
     ITfContext* focusedContext = nullptr;
-    if (TryGetFocusedContext(threadMgr_, &focusedContext)) {
+    if (!hasFocusedContext && TryGetFocusedContext(threadMgr_, &focusedContext)) {
         hasFocusedContext = true;
         if (TryGetCaretScreenPointFromContext(focusedContext, clientId_, anchor)) {
             anchorPtr = &anchor;
             hasRecentAnchor_ = true;
             lastAnchor_ = anchor;
-            lastAnchorTick_ = GetTickCount64();
+            lastAnchorTick_ = nowTick;
         }
         focusedContext->Release();
     }
@@ -3414,7 +4209,7 @@ void TextService::UpdateCandidateWindow() {
     if (anchorPtr != nullptr) {
         hasRecentAnchor_ = true;
         lastAnchor_ = *anchorPtr;
-        lastAnchorTick_ = GetTickCount64();
+        lastAnchorTick_ = nowTick;
     }
 
     const auto& pageCandidates = GetCurrentPageCandidates();
@@ -3429,6 +4224,12 @@ void TextService::UpdateCandidateWindow() {
         chineseMode_,
         fullShapeMode_,
         anchorPtr);
+    TraceLatencySample(
+        L"candidate-window code=" + compositionCode_ +
+            L" visible=" + std::to_wstring(pageCandidates.empty() ? 0 : 1) +
+            L" page=" + std::to_wstring(pageIndex_),
+        updateWindowStartCounter,
+        QueryPerfCounterValue());
 }
 
 const std::vector<CandidateWindow::DisplayCandidate>& TextService::GetCurrentPageCandidates() const {
@@ -3466,6 +4267,8 @@ const std::vector<CandidateWindow::DisplayCandidate>& TextService::GetCurrentPag
         candidate.boostedUser = allCandidates_[i].boostedUser;
         candidate.boostedLearned = allCandidates_[i].boostedLearned;
         candidate.boostedContext = allCandidates_[i].boostedContext;
+        candidate.fromAutoPhrase = allCandidates_[i].fromAutoPhrase;
+        candidate.fromSessionAutoPhrase = allCandidates_[i].fromSessionAutoPhrase;
         candidate.consumedLength = allCandidates_[i].consumedLength;
         pageCandidatesCache_.push_back(std::move(candidate));
     }
@@ -3502,9 +4305,104 @@ size_t TextService::GetTotalPages() const {
     return (allCandidates_.size() + pageSize_ - 1) / pageSize_;
 }
 
+void TextService::ScheduleDeferredCandidateExpansion() {
+    if (compositionCode_.empty() ||
+        candidatesFullyExpanded_ ||
+        !candidateWindow_.IsVisible() ||
+        compositionCode_.size() <= 2) {
+        deferredExpansionCode_.clear();
+        deferredExpansionDueTick_ = 0;
+        candidateWindow_.CancelAsyncPoll();
+        return;
+    }
+
+    deferredExpansionCode_ = compositionCode_;
+    deferredExpansionDueTick_ = GetTickCount64() + 45ULL;
+    candidateWindow_.ScheduleAsyncPoll(45);
+}
+
+void TextService::RunDeferredCandidateExpansion() {
+    if (deferredExpansionCode_.empty()) {
+        return;
+    }
+
+    if (compositionCode_ != deferredExpansionCode_ || compositionCode_.empty() || candidatesFullyExpanded_) {
+        deferredExpansionCode_.clear();
+        deferredExpansionDueTick_ = 0;
+        return;
+    }
+
+    const ULONGLONG now = GetTickCount64();
+    if (now < deferredExpansionDueTick_) {
+        candidateWindow_.ScheduleAsyncPoll(static_cast<UINT>(std::max<ULONGLONG>(1, deferredExpansionDueTick_ - now)));
+        return;
+    }
+
+    deferredExpansionCode_.clear();
+    deferredExpansionDueTick_ = 0;
+    RefreshCandidates(true);
+}
+
+bool TextService::TryRestoreCachedCandidatesForCode(const std::wstring& code) {
+    const LONGLONG restoreStartCounter = QueryPerfCounterValue();
+    if (code.empty()) {
+        return false;
+    }
+
+    const auto it = compositionCandidateCache_.find(code);
+    if (it == compositionCandidateCache_.end()) {
+        return false;
+    }
+
+    compositionCode_ = code;
+    allCandidates_ = it->second.candidates;
+    candidatesFullyExpanded_ = it->second.fullyExpanded;
+    InvalidatePageCandidatesCache();
+    pageIndex_ = 0;
+    selectedIndexInPage_ = FindPreferredSelectionIndexForPage(pageIndex_);
+    emptyCandidateAlerted_ = allCandidates_.empty();
+    UpdateCandidateWindow();
+    if (!candidatesFullyExpanded_) {
+        ScheduleDeferredCandidateExpansion();
+    }
+    TraceLatencySample(
+        L"restore-cache code=" + code + L" count=" + std::to_wstring(allCandidates_.size()),
+        restoreStartCounter,
+        QueryPerfCounterValue());
+    return true;
+}
+
+void TextService::CacheCurrentCandidatesForCode() {
+    if (compositionCode_.empty()) {
+        return;
+    }
+
+    CachedCandidateState state;
+    state.candidates = allCandidates_;
+    state.fullyExpanded = candidatesFullyExpanded_;
+
+    const bool alreadyPresent = compositionCandidateCache_.find(compositionCode_) != compositionCandidateCache_.end();
+    compositionCandidateCache_[compositionCode_] = std::move(state);
+    if (!alreadyPresent) {
+        compositionCandidateCacheOrder_.push_back(compositionCode_);
+    }
+
+    while (compositionCandidateCacheOrder_.size() > 12) {
+        const std::wstring oldestCode = compositionCandidateCacheOrder_.front();
+        compositionCandidateCacheOrder_.pop_front();
+        compositionCandidateCache_.erase(oldestCode);
+    }
+}
+
 void TextService::ClearComposition() {
     compositionCode_.clear();
     allCandidates_.clear();
+    candidatesFullyExpanded_ = false;
+    compositionCandidateCache_.clear();
+    compositionCandidateCacheOrder_.clear();
+    deferredExpansionCode_.clear();
+    deferredExpansionDueTick_ = 0;
+    candidateWindow_.CancelAsyncPoll();
     InvalidatePageCandidatesCache();
     pageIndex_ = 0;
     selectedIndexInPage_ = 0;
@@ -3538,6 +4436,7 @@ void TextService::LearnPhraseFromRecentCommits(const std::wstring& committedCode
                     pendingContextAssocWrite_.deleteIfEmpty = false;
                     pendingContextAssocWrite_.generation = ++nextUserDataWriteGeneration_;
                 }
+                userDataStampRefreshPending_ = true;
                 userDataWriteCv_.notify_all();
             }
         }
@@ -3578,6 +4477,10 @@ bool TextService::CommitCandidateByGlobalIndex(ITfContext* context, size_t globa
     const std::wstring selectedKey = freqCode + L"\t" + textToCommit;
     if (candidate.fromSessionAutoPhrase) {
         PromoteSessionAutoPhrase(textToCommit);
+    } else if (candidate.fromAutoPhrase && !freqCode.empty()) {
+        engine_.AddUserEntry(freqCode, textToCommit);
+        AppendPhraseReviewEntry(freqCode, textToCommit, L"auto-commit");
+        MarkAutoPhraseDictionaryDirty();
     }
 
     if (candidate.fromAutoPhrase || candidate.fromSessionAutoPhrase) {
@@ -3664,6 +4567,7 @@ bool TextService::BlockCandidateByGlobalIndex(size_t globalIndex) {
             pendingBlockedEntriesWrite_.append = false;
             pendingBlockedEntriesWrite_.generation = ++nextUserDataWriteGeneration_;
         }
+        userDataStampRefreshPending_ = true;
         userDataWriteCv_.notify_all();
     }
     MarkAutoPhraseDictionaryDirty();
@@ -4110,13 +5014,14 @@ bool TextService::IsToggleHotkeyPressed(WPARAM wParam) const {
 
 STDMETHODIMP TextService::OnSetFocus(BOOL foreground) {
     if (!foreground) {
-        if (!compositionCode_.empty()) {
+        const bool hadComposition = !compositionCode_.empty();
+        if (hadComposition) {
             ClearComposition();
         }
-        candidateWindow_.Hide();
-        Trace(L"OnSetFocus(BOOL): hide candidate window");
-    } else {
-        ReloadUserDataIfChanged(false);
+        const bool hidWindow = candidateWindow_.Hide();
+        if (hadComposition || hidWindow) {
+            Trace(L"OnSetFocus(BOOL): hide candidate window");
+        }
     }
     return S_OK;
 }
@@ -4134,23 +5039,33 @@ STDMETHODIMP TextService::OnUninitDocumentMgr(ITfDocumentMgr* documentMgr) {
     }
 
     if (losingFocusedDoc) {
-        if (!compositionCode_.empty()) {
+        const bool hadComposition = !compositionCode_.empty();
+        if (hadComposition) {
             ClearComposition();
         }
-        candidateWindow_.Hide();
-        Trace(L"OnUninitDocumentMgr: hide candidate window");
+        const bool hidWindow = candidateWindow_.Hide();
+        if (hadComposition || hidWindow) {
+            Trace(L"OnUninitDocumentMgr: hide candidate window");
+        }
     }
     return S_OK;
 }
 
 STDMETHODIMP TextService::OnSetFocus(ITfDocumentMgr* documentMgrFocus, ITfDocumentMgr* documentMgrPrevFocus) {
     if (documentMgrFocus != documentMgrPrevFocus) {
-        ReloadUserDataIfChanged(false);
-        if (!compositionCode_.empty()) {
+        const bool hadComposition = !compositionCode_.empty();
+        if (hadComposition) {
             ClearComposition();
         }
-        candidateWindow_.Hide();
-        Trace(L"OnSetFocus(DocumentMgr): hide candidate window");
+        const bool hidWindow = candidateWindow_.Hide();
+        if (hadComposition || hidWindow) {
+            Trace(L"OnSetFocus(DocumentMgr): hide candidate window");
+        }
+
+        if (documentMgrFocus != nullptr && chineseMode_) {
+            EnsureRuntimeReady();
+            ReloadUserDataIfChanged(false);
+        }
     }
     return S_OK;
 }
@@ -4169,6 +5084,7 @@ STDMETHODIMP TextService::OnTestKeyDown(ITfContext*, WPARAM wParam, LPARAM lPara
     }
 
     const WPARAM key = NormalizeVirtualKey(wParam, lParam);
+    const bool verboseKeyTrace = IsVerboseKeyTraceEnabled();
     const bool ctrlPressed =
         (GetKeyState(VK_CONTROL) & 0x8000) != 0 ||
         (GetKeyState(VK_LCONTROL) & 0x8000) != 0 ||
@@ -4214,17 +5130,24 @@ STDMETHODIMP TextService::OnTestKeyDown(ITfContext*, WPARAM wParam, LPARAM lPara
             leftShiftTogglePending_ = true;
             leftShiftToggleDownTick_ = GetTickCount64();
         }
-        wchar_t shiftTestLog[220] = {};
-        swprintf_s(
-            shiftTestLog,
-            L"OnTestKeyDown shift raw=0x%04X key=0x%04X pending=%d wasDown=%d chinese=%d fullShape=%d",
-            static_cast<unsigned int>(wParam),
-            static_cast<unsigned int>(key),
-            leftShiftTogglePending_ ? 1 : 0,
-            wasDown ? 1 : 0,
-            chineseMode_ ? 1 : 0,
-            fullShapeMode_ ? 1 : 0);
-        Trace(shiftTestLog);
+        if (verboseKeyTrace) {
+            wchar_t shiftTestLog[220] = {};
+            swprintf_s(
+                shiftTestLog,
+                L"OnTestKeyDown shift raw=0x%04X key=0x%04X pending=%d wasDown=%d chinese=%d fullShape=%d",
+                static_cast<unsigned int>(wParam),
+                static_cast<unsigned int>(key),
+                leftShiftTogglePending_ ? 1 : 0,
+                wasDown ? 1 : 0,
+                chineseMode_ ? 1 : 0,
+                fullShapeMode_ ? 1 : 0);
+            Trace(shiftTestLog);
+        }
+    }
+
+    if (altPressed || winPressed) {
+        *eaten = FALSE;
+        return S_OK;
     }
 
     if (!chineseMode_) {
@@ -4238,7 +5161,8 @@ STDMETHODIMP TextService::OnTestKeyDown(ITfContext*, WPARAM wParam, LPARAM lPara
                       key == VK_APPS)
                          ? TRUE
                          : FALSE;
-            if (key == VK_BACK || key == VK_DELETE || key == VK_OEM_MINUS || key == VK_SUBTRACT || key == VK_OEM_PLUS || key == VK_ADD || IsLeftShiftToggleKey(key, lParam)) {
+            if (verboseKeyTrace &&
+                (key == VK_BACK || key == VK_DELETE || key == VK_OEM_MINUS || key == VK_SUBTRACT || key == VK_OEM_PLUS || key == VK_ADD || IsLeftShiftToggleKey(key, lParam))) {
                 wchar_t englishBypassLog[240] = {};
                 swprintf_s(
                     englishBypassLog,
@@ -4274,6 +5198,9 @@ STDMETHODIMP TextService::OnTestKeyDown(ITfContext*, WPARAM wParam, LPARAM lPara
 
     const bool hasComposition = !compositionCode_.empty();
 
+    const bool minusPageUpKey = IsMinusPageUpKey(key, wParam, lParam);
+    const bool plusPageDownKey = IsPlusPageDownKey(key, wParam, lParam);
+
     *eaten = (IsAlphaKey(key) ||
               (key >= L'0' && key <= L'9') ||
               (key >= L'1' && key <= L'9') ||
@@ -4281,8 +5208,8 @@ STDMETHODIMP TextService::OnTestKeyDown(ITfContext*, WPARAM wParam, LPARAM lPara
               (tabNavigation_ && key == VK_TAB) ||
               (key == VK_BACK && hasComposition) ||
               (key == VK_DELETE && hasComposition) ||
-              key == VK_SPACE ||
-              key == VK_RETURN ||
+              (key == VK_SPACE && hasComposition) ||
+              (key == VK_RETURN && hasComposition) ||
               key == VK_ESCAPE ||
               key == VK_UP ||
               key == VK_DOWN ||
@@ -4297,10 +5224,8 @@ STDMETHODIMP TextService::OnTestKeyDown(ITfContext*, WPARAM wParam, LPARAM lPara
                   key == VK_OEM_1 ||
                   key == VK_OEM_2 ||
                   key == VK_OEM_3 ||
-              key == VK_OEM_MINUS ||
-                  key == VK_SUBTRACT ||
-              key == VK_OEM_PLUS ||
-                  key == VK_ADD ||
+              minusPageUpKey ||
+              plusPageDownKey ||
               key == VK_OEM_COMMA ||
               key == VK_OEM_PERIOD ||
               key == VK_OEM_4 ||
@@ -4309,13 +5234,14 @@ STDMETHODIMP TextService::OnTestKeyDown(ITfContext*, WPARAM wParam, LPARAM lPara
               key == VK_OEM_6)
                  ? TRUE
                  : FALSE;
-    if (IsAlphaKey(key) ||
-        (key >= L'0' && key <= L'9') ||
-        (key >= VK_NUMPAD0 && key <= VK_NUMPAD9) ||
-        key == VK_SPACE ||
-        key == VK_RETURN ||
-        key == VK_F9 ||
-        wParam == VK_PROCESSKEY) {
+    if (verboseKeyTrace &&
+        (IsAlphaKey(key) ||
+         (key >= L'0' && key <= L'9') ||
+         (key >= VK_NUMPAD0 && key <= VK_NUMPAD9) ||
+         key == VK_SPACE ||
+         key == VK_RETURN ||
+         key == VK_F9 ||
+         wParam == VK_PROCESSKEY)) {
         wchar_t keyLog[200] = {};
         swprintf_s(keyLog, L"OnTestKeyDown raw=0x%04X key=0x%04X eaten=%d chinese=%d", static_cast<unsigned int>(wParam), static_cast<unsigned int>(key), *eaten ? 1 : 0, chineseMode_ ? 1 : 0);
         Trace(keyLog);
@@ -4344,20 +5270,10 @@ STDMETHODIMP TextService::OnKeyDown(ITfContext* context, WPARAM wParam, LPARAM l
     }
 
     const WPARAM key = NormalizeVirtualKey(wParam, lParam);
+    const bool verboseKeyTrace = IsVerboseKeyTraceEnabled();
+    const LONGLONG keyDownStartCounter = QueryPerfCounterValue();
 
     *eaten = FALSE;
-
-    if (IsAlphaKey(key) ||
-        (key >= L'0' && key <= L'9') ||
-        (key >= VK_NUMPAD0 && key <= VK_NUMPAD9) ||
-        key == VK_SPACE ||
-        key == VK_RETURN ||
-        key == VK_F9 ||
-        wParam == VK_PROCESSKEY) {
-        wchar_t keyLog[200] = {};
-        swprintf_s(keyLog, L"OnKeyDown raw=0x%04X key=0x%04X chinese=%d codeLen=%u", static_cast<unsigned int>(wParam), static_cast<unsigned int>(key), chineseMode_ ? 1 : 0, static_cast<unsigned int>(compositionCode_.size()));
-        Trace(keyLog);
-    }
 
     const bool ctrlPressed =
         (GetKeyState(VK_CONTROL) & 0x8000) != 0 ||
@@ -4395,6 +5311,45 @@ STDMETHODIMP TextService::OnKeyDown(ITfContext* context, WPARAM wParam, LPARAM l
         return S_OK;
     }
 
+    if (altPressed || winPressed) {
+        *eaten = FALSE;
+        return S_OK;
+    }
+
+    const bool mayNeedRuntimeInit = chineseMode_ &&
+        (IsAlphaKey(key) ||
+         !compositionCode_.empty() ||
+         key == VK_BACK ||
+         key == VK_DELETE ||
+         key == VK_SPACE ||
+         key == VK_RETURN ||
+         key == VK_UP ||
+         key == VK_DOWN ||
+         key == VK_PRIOR ||
+         key == VK_NEXT ||
+         key == VK_OEM_MINUS ||
+         key == VK_SUBTRACT ||
+         key == VK_OEM_PLUS ||
+         key == VK_ADD ||
+         key == VK_OEM_COMMA ||
+         key == VK_OEM_PERIOD);
+    if (mayNeedRuntimeInit) {
+        EnsureRuntimeReady();
+    }
+
+    if (verboseKeyTrace &&
+        (IsAlphaKey(key) ||
+         (key >= L'0' && key <= L'9') ||
+         (key >= VK_NUMPAD0 && key <= VK_NUMPAD9) ||
+         key == VK_SPACE ||
+         key == VK_RETURN ||
+         key == VK_F9 ||
+         wParam == VK_PROCESSKEY)) {
+        wchar_t keyLog[200] = {};
+        swprintf_s(keyLog, L"OnKeyDown raw=0x%04X key=0x%04X chinese=%d codeLen=%u", static_cast<unsigned int>(wParam), static_cast<unsigned int>(key), chineseMode_ ? 1 : 0, static_cast<unsigned int>(compositionCode_.size()));
+        Trace(keyLog);
+    }
+
     if (leftShiftTogglePending_ && !(key == VK_SHIFT || key == VK_LSHIFT || key == VK_RSHIFT)) {
         leftShiftTogglePending_ = false;
         leftShiftToggleDownTick_ = 0;
@@ -4408,19 +5363,21 @@ STDMETHODIMP TextService::OnKeyDown(ITfContext* context, WPARAM wParam, LPARAM l
         const bool rightDown =
             (GetKeyState(VK_RSHIFT) & 0x8000) != 0 ||
             (GetAsyncKeyState(VK_RSHIFT) & 0x8000) != 0;
-        wchar_t shiftLog[220] = {};
-        swprintf_s(
-            shiftLog,
-            L"shift key event raw=0x%04X key=0x%04X scan=0x%02X left=%d right=%d ctrl=%d alt=%d win=%d",
-            static_cast<unsigned int>(wParam),
-            static_cast<unsigned int>(key),
-            static_cast<unsigned int>(scanCode),
-            leftDown ? 1 : 0,
-            rightDown ? 1 : 0,
-            ctrlPressed ? 1 : 0,
-            altPressed ? 1 : 0,
-            winPressed ? 1 : 0);
-        Trace(shiftLog);
+        if (verboseKeyTrace) {
+            wchar_t shiftLog[220] = {};
+            swprintf_s(
+                shiftLog,
+                L"shift key event raw=0x%04X key=0x%04X scan=0x%02X left=%d right=%d ctrl=%d alt=%d win=%d",
+                static_cast<unsigned int>(wParam),
+                static_cast<unsigned int>(key),
+                static_cast<unsigned int>(scanCode),
+                leftDown ? 1 : 0,
+                rightDown ? 1 : 0,
+                ctrlPressed ? 1 : 0,
+                altPressed ? 1 : 0,
+                winPressed ? 1 : 0);
+            Trace(shiftLog);
+        }
     }
 
     // Defer Left Shift toggle to key-up. KeyDown stays uneaten so Shift combos keep their native keyboard state.
@@ -4518,7 +5475,9 @@ STDMETHODIMP TextService::OnKeyDown(ITfContext* context, WPARAM wParam, LPARAM l
     auto commitRawCompositionThenKey = [&](WPARAM trailingKey, LPARAM trailingLParam) {
         const std::wstring rawCode = compositionCode_;
         if (!CommitText(context, rawCode)) {
-            Trace(L"commit(raw fallback) failed text=" + rawCode);
+            if (verboseKeyTrace) {
+                Trace(L"commit(raw fallback) failed text=" + rawCode);
+            }
             return false;
         }
 
@@ -4528,7 +5487,9 @@ STDMETHODIMP TextService::OnKeyDown(ITfContext* context, WPARAM wParam, LPARAM l
         if ((trailingKey >= L'0' && trailingKey <= L'9') || (trailingKey >= VK_NUMPAD0 && trailingKey <= VK_NUMPAD9)) {
             committedTrailing = CommitAsciiKey(context, trailingKey, trailingLParam);
         }
-        Trace(L"commit(raw fallback)=" + rawCode);
+        if (verboseKeyTrace) {
+            Trace(L"commit(raw fallback)=" + rawCode);
+        }
         return committedTrailing || true;
     };
 
@@ -4550,8 +5511,8 @@ STDMETHODIMP TextService::OnKeyDown(ITfContext* context, WPARAM wParam, LPARAM l
         return S_OK;
     }
 
-    const bool minusPageUpKey = (key == VK_OEM_MINUS || key == VK_SUBTRACT);
-    const bool plusPageDownKey = (key == VK_OEM_PLUS || key == VK_ADD);
+    const bool minusPageUpKey = IsMinusPageUpKey(key, wParam, lParam);
+    const bool plusPageDownKey = IsPlusPageDownKey(key, wParam, lParam);
     if (!minusPageUpKey && !plusPageDownKey) {
         pageBoundaryDirection_ = 0;
         pageBoundaryHitCount_ = 0;
@@ -4559,6 +5520,19 @@ STDMETHODIMP TextService::OnKeyDown(ITfContext* context, WPARAM wParam, LPARAM l
 
     std::wstring punctuationText;
     if (!compositionCode_.empty() && (minusPageUpKey || plusPageDownKey)) {
+        if (plusPageDownKey && !candidatesFullyExpanded_) {
+            const size_t requestedPage = pageIndex_ + 1;
+            RefreshCandidates(true);
+            const size_t expandedTotalPages = GetTotalPages();
+            if (expandedTotalPages > 0 && requestedPage < expandedTotalPages) {
+                pageIndex_ = requestedPage;
+                selectedIndexInPage_ = FindPreferredSelectionIndexForPage(pageIndex_);
+                UpdateCandidateWindow();
+                *eaten = TRUE;
+                return S_OK;
+            }
+        }
+
         const size_t totalPages = GetTotalPages();
         const bool canPageUp = pageIndex_ > 0;
         const bool canPageDown = totalPages > 0 && pageIndex_ + 1 < totalPages;
@@ -4575,6 +5549,7 @@ STDMETHODIMP TextService::OnKeyDown(ITfContext* context, WPARAM wParam, LPARAM l
             pageBoundaryDirection_ = 0;
             pageBoundaryHitCount_ = 0;
             *eaten = TRUE;
+            TraceLatencySample(L"keydown-page code=" + compositionCode_, keyDownStartCounter, QueryPerfCounterValue());
             return S_OK;
         }
 
@@ -4625,6 +5600,7 @@ STDMETHODIMP TextService::OnKeyDown(ITfContext* context, WPARAM wParam, LPARAM l
         }
 
         *eaten = TRUE;
+        TraceLatencySample(L"keydown-page-boundary code=" + compositionCode_, keyDownStartCounter, QueryPerfCounterValue());
         return S_OK;
     }
 
@@ -4660,13 +5636,17 @@ STDMETHODIMP TextService::OnKeyDown(ITfContext* context, WPARAM wParam, LPARAM l
                     ClearComposition();
                     candidateWindow_.Hide();
                     committed = true;
-                    Trace(L"punctuation fallback commit raw=" + rawCode);
+                    if (verboseKeyTrace) {
+                        Trace(L"punctuation fallback commit raw=" + rawCode);
+                    }
                 }
             }
 
             if (committed && hasPunctuation) {
                 CommitText(context, punctuationText);
-                Trace(L"punctuation after composition commit=" + punctuationText);
+                if (verboseKeyTrace) {
+                    Trace(L"punctuation after composition commit=" + punctuationText);
+                }
             }
 
             *eaten = TRUE;
@@ -4676,7 +5656,9 @@ STDMETHODIMP TextService::OnKeyDown(ITfContext* context, WPARAM wParam, LPARAM l
         if (compositionCode_.empty() && hasPunctuation) {
             if (CommitText(context, punctuationText)) {
                 *eaten = TRUE;
-                Trace(L"punctuation=" + punctuationText);
+                if (verboseKeyTrace) {
+                    Trace(L"punctuation=" + punctuationText);
+                }
             }
             return S_OK;
         }
@@ -4719,7 +5701,9 @@ STDMETHODIMP TextService::OnKeyDown(ITfContext* context, WPARAM wParam, LPARAM l
                     autoCommitted = CommitCandidateByGlobalIndex(context, commitIndex, 1);
                 }
                 if (autoCommitted) {
-                    Trace(L"auto-commit first candidate on 4-code overflow");
+                    if (verboseKeyTrace) {
+                        Trace(L"auto-commit first candidate on 4-code overflow");
+                    }
                 }
             }
 
@@ -4729,7 +5713,9 @@ STDMETHODIMP TextService::OnKeyDown(ITfContext* context, WPARAM wParam, LPARAM l
                     ClearComposition();
                     candidateWindow_.Hide();
                     autoCommitted = true;
-                    Trace(L"auto-commit raw code on 4-code overflow=" + rawCode);
+                    if (verboseKeyTrace) {
+                        Trace(L"auto-commit raw code on 4-code overflow=" + rawCode);
+                    }
                 }
             }
         }
@@ -4738,14 +5724,19 @@ STDMETHODIMP TextService::OnKeyDown(ITfContext* context, WPARAM wParam, LPARAM l
             size_t uniqueExactIndex = 0;
             if (compositionCode_.size() >= static_cast<size_t>(autoCommitMinCodeLength_) && TryFindUniqueExactCommitCandidateIndex(uniqueExactIndex)) {
                 if (CommitCandidateByGlobalIndex(context, uniqueExactIndex, 1)) {
-                    Trace(L"auto-commit exact before continue input");
+                    if (verboseKeyTrace) {
+                        Trace(L"auto-commit exact before continue input");
+                    }
                 }
             }
         }
         compositionCode_.push_back(ToLowerAlpha(key));
         RefreshCandidates();
         *eaten = TRUE;
-        Trace(L"code=" + compositionCode_ + L" candidates=" + std::to_wstring(allCandidates_.size()));
+        TraceLatencySample(L"keydown-alpha code=" + compositionCode_, keyDownStartCounter, QueryPerfCounterValue());
+        if (verboseKeyTrace) {
+            Trace(L"code=" + compositionCode_ + L" candidates=" + std::to_wstring(allCandidates_.size()));
+        }
         return S_OK;
     }
 
@@ -4794,6 +5785,19 @@ STDMETHODIMP TextService::OnKeyDown(ITfContext* context, WPARAM wParam, LPARAM l
     }
 
     if ((key == VK_OEM_6 || key == VK_OEM_PERIOD || key == VK_NEXT) && !compositionCode_.empty()) {
+        if (!candidatesFullyExpanded_) {
+            const size_t requestedPage = pageIndex_ + 1;
+            RefreshCandidates(true);
+            const size_t expandedTotalPages = GetTotalPages();
+            if (expandedTotalPages > 0 && requestedPage < expandedTotalPages) {
+                pageIndex_ = requestedPage;
+                selectedIndexInPage_ = FindPreferredSelectionIndexForPage(pageIndex_);
+                UpdateCandidateWindow();
+                *eaten = TRUE;
+                return S_OK;
+            }
+        }
+
         const size_t totalPages = GetTotalPages();
         if (totalPages > 0 && pageIndex_ + 1 < totalPages) {
             pageIndex_ += 1;
@@ -4824,9 +5828,17 @@ STDMETHODIMP TextService::OnKeyDown(ITfContext* context, WPARAM wParam, LPARAM l
 
     if (key == VK_BACK && !compositionCode_.empty()) {
         compositionCode_.pop_back();
-        RefreshCandidates();
+        if (compositionCode_.empty()) {
+            ClearComposition();
+            candidateWindow_.Hide();
+        } else if (!TryRestoreCachedCandidatesForCode(compositionCode_)) {
+            RefreshCandidates();
+        }
         *eaten = TRUE;
-        Trace(L"backspace code=" + compositionCode_);
+        TraceLatencySample(L"keydown-backspace code=" + compositionCode_, keyDownStartCounter, QueryPerfCounterValue());
+        if (verboseKeyTrace) {
+            Trace(L"backspace code=" + compositionCode_);
+        }
         return S_OK;
     }
 
@@ -4834,13 +5846,17 @@ STDMETHODIMP TextService::OnKeyDown(ITfContext* context, WPARAM wParam, LPARAM l
         ClearComposition();
         candidateWindow_.Hide();
         *eaten = TRUE;
-        Trace(L"composition cleared");
+        if (verboseKeyTrace) {
+            Trace(L"composition cleared");
+        }
         return S_OK;
     }
 
     selectionOffset = 0;
     if (TryMapSelectionInputToIndex(key, lParam, selectionOffset) && !compositionCode_.empty()) {
-        Trace(L"select: begin");
+        if (verboseKeyTrace) {
+            Trace(L"select: begin");
+        }
         const size_t pageCandidateCount = GetCurrentPageCandidateCount();
         if (selectionOffset < pageCandidateCount) {
             const size_t pageStart = pageIndex_ * pageSize_;
@@ -4861,9 +5877,13 @@ STDMETHODIMP TextService::OnKeyDown(ITfContext* context, WPARAM wParam, LPARAM l
                 ClearComposition();
                 candidateWindow_.Hide();
                 *eaten = TRUE;
-                Trace(L"commit=" + rawCode);
+                if (verboseKeyTrace) {
+                    Trace(L"commit=" + rawCode);
+                }
             } else {
-                Trace(L"commit failed text=" + rawCode);
+                if (verboseKeyTrace) {
+                    Trace(L"commit failed text=" + rawCode);
+                }
             }
         } else {
             if (key == VK_RETURN) {
@@ -4879,9 +5899,13 @@ STDMETHODIMP TextService::OnKeyDown(ITfContext* context, WPARAM wParam, LPARAM l
                             ClearComposition();
                             candidateWindow_.Hide();
                             *eaten = TRUE;
-                            Trace(L"commit(raw enter)=" + rawCode);
+                            if (verboseKeyTrace) {
+                                Trace(L"commit(raw enter)=" + rawCode);
+                            }
                         } else {
-                            Trace(L"commit(raw enter) failed text=" + rawCode);
+                            if (verboseKeyTrace) {
+                                Trace(L"commit(raw enter) failed text=" + rawCode);
+                            }
                         }
                     }
                 } else {
@@ -4911,6 +5935,7 @@ STDMETHODIMP TextService::OnKeyUp(ITfContext* context, WPARAM wParam, LPARAM lPa
     }
 
     const WPARAM key = NormalizeVirtualKey(wParam, lParam);
+    const bool verboseKeyTrace = IsVerboseKeyTraceEnabled();
     const bool ctrlPressed =
         (GetKeyState(VK_CONTROL) & 0x8000) != 0 ||
         (GetKeyState(VK_LCONTROL) & 0x8000) != 0 ||
@@ -4934,18 +5959,20 @@ STDMETHODIMP TextService::OnKeyUp(ITfContext* context, WPARAM wParam, LPARAM lPa
             nowTick >= leftShiftToggleDownTick_ &&
             (nowTick - leftShiftToggleDownTick_) <= kLeftShiftToggleTapThresholdMs;
         const bool shouldToggle = leftShiftTogglePending_ && withinTapWindow && !ctrlPressed && !altPressed && !winPressed;
-        wchar_t shiftUpLog[260] = {};
-        swprintf_s(
-            shiftUpLog,
-            L"OnKeyUp shift raw=0x%04X key=0x%04X pending=%d withinTap=%d shouldToggle=%d chinese=%d fullShape=%d",
-            static_cast<unsigned int>(wParam),
-            static_cast<unsigned int>(key),
-            leftShiftTogglePending_ ? 1 : 0,
-            withinTapWindow ? 1 : 0,
-            shouldToggle ? 1 : 0,
-            chineseMode_ ? 1 : 0,
-            fullShapeMode_ ? 1 : 0);
-        Trace(shiftUpLog);
+        if (verboseKeyTrace) {
+            wchar_t shiftUpLog[260] = {};
+            swprintf_s(
+                shiftUpLog,
+                L"OnKeyUp shift raw=0x%04X key=0x%04X pending=%d withinTap=%d shouldToggle=%d chinese=%d fullShape=%d",
+                static_cast<unsigned int>(wParam),
+                static_cast<unsigned int>(key),
+                leftShiftTogglePending_ ? 1 : 0,
+                withinTapWindow ? 1 : 0,
+                shouldToggle ? 1 : 0,
+                chineseMode_ ? 1 : 0,
+                fullShapeMode_ ? 1 : 0);
+            Trace(shiftUpLog);
+        }
         leftShiftTogglePending_ = false;
         leftShiftToggleDownTick_ = 0;
         if (shouldToggle) {

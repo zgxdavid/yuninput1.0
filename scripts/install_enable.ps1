@@ -181,6 +181,8 @@ $inspectScript = Join-Path $PSScriptRoot 'inspect_ime_state.ps1'
 
 $srcDll = Join-Path $projectRoot 'build\Release\yuninput.dll'
 $fallbackSrcDll = Join-Path $projectRoot 'bin\yuninput.dll'
+$srcBuilderExe = Join-Path $projectRoot 'build\Release\yuninput_user_dict_builder.exe'
+$fallbackSrcBuilderExe = Join-Path $projectRoot 'bin\yuninput_user_dict_builder.exe'
 $srcDataDir = Join-Path $projectRoot 'data'
 $srcConfigSource = Join-Path $projectRoot 'tools\YuninputConfig.cs'
 $srcConfigExe = Join-Path $projectRoot 'tools\yuninput_config.exe'
@@ -189,6 +191,7 @@ $fallbackSrcConfigExe = Join-Path $projectRoot 'yuninput_config.exe'
 $binDir = Join-Path $InstallRoot 'bin'
 $dataDir = Join-Path $InstallRoot 'data'
 $dllPath = Join-Path $binDir 'yuninput.dll'
+$builderExePath = Join-Path $binDir 'yuninput_user_dict_builder.exe'
 $settingsRoot = Join-Path $env:LOCALAPPDATA 'yuninput'
 $settingsPath = Join-Path $settingsRoot 'settings.json'
 
@@ -335,12 +338,20 @@ try {
         $srcDll = $fallbackSrcDll
     }
 
+    if (-not (Test-Path $srcBuilderExe) -and (Test-Path $fallbackSrcBuilderExe)) {
+        $srcBuilderExe = $fallbackSrcBuilderExe
+    }
+
     if (-not (Test-Path $srcConfigExe) -and (Test-Path $fallbackSrcConfigExe)) {
         $srcConfigExe = $fallbackSrcConfigExe
     }
 
     if (-not (Test-Path $srcDll)) {
         throw "Build output not found: $srcDll"
+    }
+
+    if (-not (Test-Path $srcBuilderExe)) {
+        throw "Builder output not found: $srcBuilderExe"
     }
 
     New-Item -ItemType Directory -Path $InstallRoot -Force | Out-Null
@@ -394,6 +405,11 @@ try {
     }
     else {
         Write-InstallLog "Using in-place DLL payload: $dllPath"
+    }
+
+    if (-not (Test-SameResolvedPath -Left $srcBuilderExe -Right $builderExePath)) {
+        Copy-WithRetry -Source $srcBuilderExe -Destination $builderExePath
+        Write-InstallLog "Copied builder to: $builderExePath"
     }
 
     if (Test-Path $srcDataDir) {

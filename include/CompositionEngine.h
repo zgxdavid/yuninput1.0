@@ -89,6 +89,7 @@ public:
     bool SaveUserDictionaryToFile(const std::wstring& filePath) const;
     std::string BuildFrequencyFileContent() const;
     std::string BuildUserDictionaryFileContent() const;
+    std::string BuildAutoPhraseDictionaryFileContent(size_t maxEntries = 0) const;
     std::string BuildBlockedEntriesFileContent() const;
     bool SaveAutoPhraseDictionaryToFile(const std::wstring& filePath) const;
     bool SaveBlockedEntriesToFile(const std::wstring& filePath) const;
@@ -102,6 +103,7 @@ public:
     bool HasEntry(const std::wstring& code, const std::wstring& text) const;
 
     std::vector<Entry> QueryCandidateEntries(const std::wstring& code, size_t maxCandidates) const;
+    std::vector<Entry> QueryCandidateEntriesFast(const std::wstring& code, size_t maxCandidates, size_t scanBudget) const;
     std::vector<std::wstring> QueryCandidates(const std::wstring& code, size_t maxCandidates) const;
     void RecordCommit(const std::wstring& code, const std::wstring& text, std::uint64_t boost = 1);
 
@@ -121,6 +123,11 @@ private:
     bool TryGetSingleCharCodeVariants(wchar_t ch, std::vector<std::wstring>& outCodes) const;
     bool TryBuildPhraseCodeFromConfiguredRules(const std::vector<std::wstring>& charCodes, std::wstring& outCode) const;
     std::pair<std::vector<size_t>::const_iterator, std::vector<size_t>::const_iterator> FindCandidateRange(const std::wstring& normalizedCode) const;
+    std::vector<Entry> QueryCandidateEntriesInRange(
+        const std::wstring& normalizedCode,
+        std::vector<size_t>::const_iterator begin,
+        std::vector<size_t>::const_iterator end,
+        size_t maxCandidates) const;
     int GetCommonCharRankCached(const std::wstring& text) const;
     void InvalidateQueryCache() const;
     bool EntryIndexLess(size_t left, size_t right) const;

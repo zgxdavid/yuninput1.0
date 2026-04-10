@@ -37,6 +37,10 @@ struct CandidateScore {
     bool preferredTwoCharPhrase = false;
     int twoCodePriorityTier = 3;
     bool hasSystemFiveCodePhrase = false;
+    int shortCodeRank = 100;
+    bool shortFullCode = false;
+    bool nonGb2312Single = false;
+    bool autoOnly = false;
 };
 
 bool IsGb2312SingleCandidate(const std::wstring& text) {
@@ -547,6 +551,34 @@ void PushUniqueCode(std::vector<std::wstring>& outCodes, const std::wstring& cod
     }
 }
 
+bool SelectShortestCodeVariant(
+    const std::vector<std::wstring>& variants,
+    size_t minLength,
+    std::wstring& outCode) {
+    outCode.clear();
+    for (const std::wstring& variant : variants) {
+        if (variant.size() >= minLength) {
+            outCode = variant;
+            return true;
+        }
+    }
+    return false;
+}
+
+bool SelectLongestCodeVariant(
+    const std::vector<std::wstring>& variants,
+    size_t minLength,
+    std::wstring& outCode) {
+    outCode.clear();
+    for (auto it = variants.rbegin(); it != variants.rend(); ++it) {
+        if (it->size() >= minLength) {
+            outCode = *it;
+            return true;
+        }
+    }
+    return false;
+}
+
 }  // namespace
 
 std::wstring CompositionEngine::Utf8ToWide(const std::string& input) {
@@ -929,11 +961,6 @@ bool CompositionEngine::TryBuildPhraseCodes(const std::wstring& text, std::vecto
         return false;
     }
 
-    std::wstring primaryCode;
-    if (TryBuildPhraseCode(text, primaryCode)) {
-        PushUniqueCode(outCodes, primaryCode);
-    }
-
     std::vector<std::vector<std::wstring>> charCodeVariants;
     charCodeVariants.reserve(text.size());
     for (wchar_t ch : text) {
@@ -950,6 +977,128 @@ bool CompositionEngine::TryBuildPhraseCodes(const std::wstring& text, std::vecto
     std::vector<PhraseCodePart> pattern;
     if (!TryResolvePhrasePattern(text.size(), pattern)) {
         return !outCodes.empty();
+    }
+
+    if (text.size() == 2) {
+        std::vector<std::wstring> selectedCodes(2);
+        if (!SelectLongestCodeVariant(charCodeVariants[0], 1, selectedCodes[0]) ||
+            !SelectLongestCodeVariant(charCodeVariants[1], 1, selectedCodes[1])) {
+            return false;
+        }
+
+        std::vector<PhraseCodePart> primaryPattern = pattern;
+        bool hasPrimaryPattern = false;
+        for (PhraseCodePart& part : primaryPattern) {
+            if (!part.noOp && !part.fromEnd && part.codeIndex == 1) {
+                part.codeIndex = 2;
+                hasPrimaryPattern = true;
+            }
+        }
+
+        std::wstring primaryCode;
+        if (hasPrimaryPattern && BuildPhraseCodeFromPattern(selectedCodes, primaryPattern, primaryCode)) {
+            PushUniqueCode(outCodes, primaryCode);
+        }
+
+        std::wstring compatibleCode;
+        if (BuildPhraseCodeFromPattern(selectedCodes, pattern, compatibleCode)) {
+            PushUniqueCode(outCodes, compatibleCode);
+        }
+
+        return !outCodes.empty();
+    }
+
+    if (text.size() == 3) {
+        std::vector<std::wstring> selectedCodes(3);
+        if (!SelectShortestCodeVariant(charCodeVariants[0], 1, selectedCodes[0]) ||
+            !SelectShortestCodeVariant(charCodeVariants[1], 1, selectedCodes[1]) ||
+            !SelectShortestCodeVariant(charCodeVariants[2], 1, selectedCodes[2])) {
+            return false;
+        }
+
+        std::wstring primaryCode;
+        if (BuildPhraseCodeFromPattern(selectedCodes, pattern, primaryCode)) {
+            PushUniqueCode(outCodes, primaryCode);
+        }
+
+        std::vector<PhraseCodePart> compatiblePattern = pattern;
+        bool hasCompatiblePattern = false;
+        for (PhraseCodePart& part : compatiblePattern) {
+            if (!part.noOp && !part.fromEnd && part.charIndex == 1 && part.codeIndex == 2) {
+                part.codeIndex = 1;
+                hasCompatiblePattern = true;
+                break;
+            }
+        }
+
+        if (hasCompatiblePattern) {
+            std::vector<std::wstring> compatibleCodes = selectedCodes;
+            std::wstring secondCharCompatibleCode;
+            if (SelectLongestCodeVariant(charCodeVariants[1], 2, secondCharCompatibleCode)) {
+                compatibleCodes[1] = std::move(secondCharCompatibleCode);
+                std::wstring compatibleCode;
+                if (BuildPhraseCodeFromPattern(compatibleCodes, compatiblePattern, compatibleCode)) {
+                    PushUniqueCode(outCodes, compatibleCode);
+                }
+            }
+        }
+
+        return !outCodes.empty();
+    }
+
+    if (text.size() == 4) {
+        std::vector<std::wstring> selectedCodes(4);
+        for (size_t index = 0; index < selectedCodes.size(); ++index) {
+            if (!SelectShortestCodeVariant(charCodeVariants[index], 1, selectedCodes[index])) {
+                return false;
+            }
+        }
+
+        std::wstring primaryCode;
+        if (BuildPhraseCodeFromPattern(selectedCodes, pattern, primaryCode)) {
+            PushUniqueCode(outCodes, primaryCode);
+        }
+
+        return !outCodes.empty();
+    }
+
+    if (text.size() >= 5 && text.size() <= 12) {
+        std::vector<std::wstring> selectedCodes(text.size());
+        for (size_t index = 0; index < selectedCodes.size(); ++index) {
+            if (!SelectShortestCodeVariant(charCodeVariants[index], 1, selectedCodes[index])) {
+                return false;
+            }
+        }
+
+        std::wstring primaryCode;
+        if (BuildPhraseCodeFromPattern(selectedCodes, pattern, primaryCode)) {
+            PushUniqueCode(outCodes, primaryCode);
+        }
+
+        std::vector<PhraseCodePart> compatiblePattern = pattern;
+        bool hasCompatiblePattern = false;
+        for (PhraseCodePart& part : compatiblePattern) {
+            if (!part.noOp && !part.fromEnd && part.charIndex == 3 && part.codeIndex == 0) {
+                part.fromEnd = true;
+                part.charIndex = 0;
+                hasCompatiblePattern = true;
+                break;
+            }
+        }
+
+        if (hasCompatiblePattern) {
+            std::wstring compatibleCode;
+            if (BuildPhraseCodeFromPattern(selectedCodes, compatiblePattern, compatibleCode)) {
+                PushUniqueCode(outCodes, compatibleCode);
+            }
+        }
+
+        return !outCodes.empty();
+    }
+
+    std::wstring primaryCode;
+    if (TryBuildPhraseCode(text, primaryCode)) {
+        PushUniqueCode(outCodes, primaryCode);
     }
 
     std::vector<std::vector<PhraseCodePart>> compatiblePatterns;
@@ -1502,11 +1651,32 @@ std::string CompositionEngine::BuildUserDictionaryFileContent() const {
             continue;
         }
 
-        output << WideToUtf8(entry.code) << ' ' << WideToUtf8(entry.text) << ' ' << entry.staticScore;
         if (entry.isAutoPhrase) {
-            output << " auto";
+            continue;
         }
+
+        output << WideToUtf8(entry.code) << ' ' << WideToUtf8(entry.text) << ' ' << entry.staticScore;
         output << '\n';
+    }
+
+    return output.str();
+}
+
+std::string CompositionEngine::BuildAutoPhraseDictionaryFileContent(size_t maxEntries) const {
+    std::ostringstream output;
+
+    size_t startIndex = 0;
+    if (maxEntries > 0 && autoPhraseEntryIndices_.size() > maxEntries) {
+        startIndex = autoPhraseEntryIndices_.size() - maxEntries;
+    }
+
+    for (size_t i = startIndex; i < autoPhraseEntryIndices_.size(); ++i) {
+        const Entry& entry = entries_[autoPhraseEntryIndices_[i]];
+        if (entry.code.empty() || entry.text.empty()) {
+            continue;
+        }
+
+        output << WideToUtf8(entry.code) << ' ' << WideToUtf8(entry.text) << ' ' << entry.staticScore << '\n';
     }
 
     return output.str();
@@ -1518,14 +1688,8 @@ bool CompositionEngine::SaveAutoPhraseDictionaryToFile(const std::wstring& fileP
         return false;
     }
 
-    for (size_t index : autoPhraseEntryIndices_) {
-        const Entry& entry = entries_[index];
-        if (entry.code.empty() || entry.text.empty()) {
-            continue;
-        }
-
-        output << WideToUtf8(entry.code) << ' ' << WideToUtf8(entry.text) << ' ' << entry.staticScore << '\n';
-    }
+    const std::string content = BuildAutoPhraseDictionaryFileContent();
+    output.write(content.data(), static_cast<std::streamsize>(content.size()));
 
     return true;
 }
@@ -1541,10 +1705,24 @@ bool CompositionEngine::AddUserEntry(const std::wstring& code, const std::wstrin
     for (Entry& entry : entries_) {
         if (entry.code == normalizedCode && entry.text == text) {
             const bool changed = !entry.isUser || entry.isAutoPhrase;
+            const bool wasAutoPhrase = entry.isAutoPhrase;
+            const bool wasUser = entry.isUser;
             entry.isUser = true;
             entry.isAutoPhrase = false;
             if (changed) {
-                RebuildIndex();
+                if (wasUser && wasAutoPhrase) {
+                    autoPhraseEntryIndices_.erase(
+                        std::remove_if(
+                            autoPhraseEntryIndices_.begin(),
+                            autoPhraseEntryIndices_.end(),
+                            [&](size_t index) {
+                                return &entries_[index] == &entry;
+                            }),
+                        autoPhraseEntryIndices_.end());
+                    InvalidateQueryCache();
+                } else {
+                    RebuildIndex();
+                }
             } else {
                 InvalidateQueryCache();
             }
@@ -1733,6 +1911,50 @@ std::vector<CompositionEngine::Entry> CompositionEngine::QueryCandidateEntries(c
         return result;
     }
 
+    result = QueryCandidateEntriesInRange(normalizedCode, begin, end, maxCandidates);
+
+    if (queryCache_.size() >= 256) {
+        queryCache_.clear();
+    }
+    queryCache_.emplace(cacheKey, result);
+    return result;
+}
+
+std::vector<CompositionEngine::Entry> CompositionEngine::QueryCandidateEntriesFast(
+    const std::wstring& code,
+    size_t maxCandidates,
+    size_t scanBudget) const {
+    std::vector<Entry> result;
+    if (code.empty() || maxCandidates == 0 || scanBudget == 0 || sortedIndices_.empty()) {
+        return result;
+    }
+
+    const std::wstring normalizedCode = NormalizeCode(code);
+    const auto range = FindCandidateRange(normalizedCode);
+    auto begin = range.first;
+    auto end = range.second;
+    if (begin == sortedIndices_.end() || begin == end) {
+        return result;
+    }
+
+    const size_t available = static_cast<size_t>(std::distance(begin, end));
+    if (available > scanBudget) {
+        end = begin + static_cast<std::ptrdiff_t>(scanBudget);
+    }
+
+    return QueryCandidateEntriesInRange(normalizedCode, begin, end, maxCandidates);
+}
+
+std::vector<CompositionEngine::Entry> CompositionEngine::QueryCandidateEntriesInRange(
+    const std::wstring& normalizedCode,
+    std::vector<size_t>::const_iterator begin,
+    std::vector<size_t>::const_iterator end,
+    size_t maxCandidates) const {
+    std::vector<Entry> result;
+    if (begin == end) {
+        return result;
+    }
+
     std::unordered_map<std::wstring, CandidateScore> bestScoreByText;
     bestScoreByText.reserve(static_cast<size_t>(std::distance(begin, end)));
 
@@ -1745,7 +1967,7 @@ std::vector<CompositionEngine::Entry> CompositionEngine::QueryCandidateEntries(c
         if (IsLikelyBrokenCandidate(item.text)) {
             continue;
         }
-        const bool frequencyEligible = IsFrequencyEligibleEntry(item.code, item.text);
+        const bool frequencyEligible = !item.isAutoPhrase && IsFrequencyEligibleEntry(item.code, item.text);
         const auto freqIt = frequency_.find(freqKey);
         const auto textFreqIt = textFrequency_.find(item.text);
         const std::uint64_t codeScore = (frequencyEligible && freqIt != frequency_.end()) ? freqIt->second : 0;
@@ -1782,6 +2004,10 @@ std::vector<CompositionEngine::Entry> CompositionEngine::QueryCandidateEntries(c
             candidate.preferredTwoCharPhrase = IsPreferredTwoCharPhraseCandidate(candidate, normalizedCode.size());
             candidate.twoCodePriorityTier = GetTwoCodePriorityTier(candidate, normalizedCode.size());
             candidate.hasSystemFiveCodePhrase = systemFiveCodePhrase;
+            candidate.shortCodeRank = GetSingleCharShortCodeRank(candidate);
+            candidate.shortFullCode = candidate.shortestCodeLength < 4;
+            candidate.nonGb2312Single = IsNonGb2312SingleCandidate(candidate);
+            candidate.autoOnly = candidate.hasAutoPhrase && !candidate.hasSystemSource && !candidate.hasManualUser;
             bestScoreByText.emplace(item.text, candidate);
             continue;
         }
@@ -1821,6 +2047,10 @@ std::vector<CompositionEngine::Entry> CompositionEngine::QueryCandidateEntries(c
             existing.preferredTwoCharPhrase = true;
         }
         existing.twoCodePriorityTier = GetTwoCodePriorityTier(existing, normalizedCode.size());
+        existing.shortCodeRank = GetSingleCharShortCodeRank(existing);
+        existing.shortFullCode = existing.shortestCodeLength < 4;
+        existing.nonGb2312Single = IsNonGb2312SingleCandidate(existing);
+        existing.autoOnly = existing.hasAutoPhrase && !existing.hasSystemSource && !existing.hasManualUser;
 
         const bool betterDisplayCode =
             existing.displayCode.empty() ||
@@ -1843,12 +2073,6 @@ std::vector<CompositionEngine::Entry> CompositionEngine::QueryCandidateEntries(c
     }
 
     const auto candidateLess = [](const auto& left, const auto& right) {
-            const int leftShortCodeRank = GetSingleCharShortCodeRank(left);
-            const int rightShortCodeRank = GetSingleCharShortCodeRank(right);
-            const bool leftShortFullCode = left.shortestCodeLength < 4;
-            const bool rightShortFullCode = right.shortestCodeLength < 4;
-            const bool leftNonGb2312Single = IsNonGb2312SingleCandidate(left);
-            const bool rightNonGb2312Single = IsNonGb2312SingleCandidate(right);
             if (left.exactCode != right.exactCode) {
                 return left.exactCode > right.exactCode;
             }
@@ -1867,11 +2091,11 @@ std::vector<CompositionEngine::Entry> CompositionEngine::QueryCandidateEntries(c
             if (left.preferredTwoCharPhrase != right.preferredTwoCharPhrase) {
                 return left.preferredTwoCharPhrase > right.preferredTwoCharPhrase;
             }
-            if (leftShortFullCode != rightShortFullCode) {
-                return leftShortFullCode > rightShortFullCode;
+            if (left.shortFullCode != right.shortFullCode) {
+                return left.shortFullCode > right.shortFullCode;
             }
-            if (leftShortCodeRank != rightShortCodeRank) {
-                return leftShortCodeRank < rightShortCodeRank;
+            if (left.shortCodeRank != right.shortCodeRank) {
+                return left.shortCodeRank < right.shortCodeRank;
             }
             if (left.commonCharRank != right.commonCharRank) {
                 return left.commonCharRank < right.commonCharRank;
@@ -1879,13 +2103,11 @@ std::vector<CompositionEngine::Entry> CompositionEngine::QueryCandidateEntries(c
             if (left.hasSystemFiveCodePhrase != right.hasSystemFiveCodePhrase) {
                 return left.hasSystemFiveCodePhrase < right.hasSystemFiveCodePhrase;
             }
-            if (leftNonGb2312Single != rightNonGb2312Single) {
-                return leftNonGb2312Single < rightNonGb2312Single;
+            if (left.nonGb2312Single != right.nonGb2312Single) {
+                return left.nonGb2312Single < right.nonGb2312Single;
             }
-            const bool leftAutoOnly = left.hasAutoPhrase && !left.hasSystemSource && !left.hasManualUser;
-            const bool rightAutoOnly = right.hasAutoPhrase && !right.hasSystemSource && !right.hasManualUser;
-            if (leftAutoOnly != rightAutoOnly) {
-                return leftAutoOnly < rightAutoOnly;
+            if (left.autoOnly != right.autoOnly) {
+                return left.autoOnly < right.autoOnly;
             }
             if (left.shortestCodeLength != right.shortestCodeLength) {
                 // Shorter code level should come first when user/learned signals tie.
@@ -1931,11 +2153,6 @@ std::vector<CompositionEngine::Entry> CompositionEngine::QueryCandidateEntries(c
             break;
         }
     }
-
-    if (queryCache_.size() >= 256) {
-        queryCache_.clear();
-    }
-    queryCache_.emplace(cacheKey, result);
     return result;
 }
 

@@ -9,6 +9,8 @@
 #include <set>
 #include <sstream>
 #include <string>
+#include <thread>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -20,6 +22,18 @@ struct DictEntry {
     size_t sourcePriority = 0;
     size_t sourceOrder = 0;
 };
+
+struct SessionSnapshot {
+    ULONGLONG bootTick = 0;
+    bool hasBootTick = false;
+    std::wstring history;
+};
+
+constexpr wchar_t kSessionAutoPhraseBreak = static_cast<wchar_t>(0xE000);
+constexpr size_t kSessionAutoPhraseMaxLength = 12;
+constexpr const wchar_t* kAutoPhraseHelperMutexName = L"Local\\Yuninput.AutoPhraseHelper.Singleton";
+constexpr const wchar_t* kAutoPhraseHelperWakeEventName = L"Local\\Yuninput.AutoPhraseHelper.Wake";
+constexpr DWORD kSessionWatchPollIntervalMs = 1500U;
 
 std::wstring Utf8ToWide(const std::string& input) {
     if (input.empty()) {
@@ -108,6 +122,27 @@ std::wstring NormalizeCode(const std::wstring& code) {
         }
     }
     return normalized;
+}
+
+bool IsHanCharacter(wchar_t ch) {
+    return (ch >= 0x3400 && ch <= 0x4DBF) ||
+           (ch >= 0x4E00 && ch <= 0x9FFF) ||
+           (ch >= 0xF900 && ch <= 0xFAFF);
+}
+
+std::wstring NormalizeSessionPhraseCode(std::wstring code) {
+    code.erase(
+        std::remove_if(
+            code.begin(),
+            code.end(),
+            [](wchar_t ch) {
+                return ch < L'a' || ch > L'z';
+            }),
+        code.end());
+    if (code.size() > 20) {
+        code.resize(20);
+    }
+    return code;
 }
 
 std::wstring MakeEntryKey(const std::wstring& code, const std::wstring& text) {
@@ -203,6 +238,206 @@ bool EnsureDictionaryFileExists(const std::wstring& filePath, const std::string&
     return true;
 }
 
+std::wstring QueryFileStampToken(const std::wstring& filePath) {
+    if (filePath.empty()) {
+        return L"-";
+    }
+
+    std::error_code ec;
+    const std::filesystem::path path(filePath);
+    const bool exists = std::filesystem::exists(path, ec);
+    if (ec || !exists) {
+        return L"0";
+    }
+
+    ec.clear();
+    const auto writeTime = std::filesystem::last_write_time(path, ec);
+    if (ec) {
+        return L"1";
+    }
+
+    return L"1:" + std::to_wstring(static_cast<long long>(writeTime.time_since_epoch().count()));
+}
+
+bool AppendAutoPhraseEntries(
+    const std::wstring& filePath,
+    const std::vector<std::pair<std::wstring, std::wstring>>& additions) {
+    if (filePath.empty()) {
+        return false;
+    }
+    if (additions.empty()) {
+        return true;
+    }
+
+    std::error_code ec;
+    const std::filesystem::path path(filePath);
+    const bool existed = std::filesystem::exists(path, ec);
+    if (path.has_parent_path()) {
+        std::filesystem::create_directories(path.parent_path(), ec);
+    }
+
+    std::ofstream output(path, std::ios::out | std::ios::binary | std::ios::app);
+    if (!output) {
+        return false;
+    }
+
+    if (!existed) {
+        output << "# helper runtime auto phrase dictionary\n";
+        output << "# format: code text score\n";
+    }
+
+    for (const auto& addition : additions) {
+        output << WideToUtf8(addition.first) << ' ' << WideToUtf8(addition.second) << " 1\n";
+    }
+
+    return output.good();
+}
+
+bool LoadBaseDictionary(CompositionEngine& engine, const std::wstring& primaryDictPath, const std::wstring& fallbackDictPath) {
+    bool loadedPrimary = false;
+    if (!primaryDictPath.empty() && std::filesystem::exists(primaryDictPath)) {
+        loadedPrimary = engine.LoadDictionaryFromFile(primaryDictPath);
+    }
+    if (!loadedPrimary && !fallbackDictPath.empty() && std::filesystem::exists(fallbackDictPath)) {
+        loadedPrimary = engine.LoadDictionaryFromFile(fallbackDictPath);
+    }
+    return loadedPrimary;
+}
+
+bool LoadPhraseSourceDictionary(
+    CompositionEngine& engine,
+    const std::wstring& phraseSourceDictPath,
+    const std::wstring& primaryDictPath,
+    const std::wstring& fallbackDictPath) {
+    bool loadedPhraseSource = false;
+    if (!phraseSourceDictPath.empty() && std::filesystem::exists(phraseSourceDictPath)) {
+        loadedPhraseSource = engine.LoadDictionaryFromFile(phraseSourceDictPath);
+    }
+    if (!loadedPhraseSource && !primaryDictPath.empty() && std::filesystem::exists(primaryDictPath)) {
+        loadedPhraseSource = engine.LoadDictionaryFromFile(primaryDictPath);
+    }
+    if (!loadedPhraseSource && !fallbackDictPath.empty() && std::filesystem::exists(fallbackDictPath)) {
+        loadedPhraseSource = engine.LoadDictionaryFromFile(fallbackDictPath);
+    }
+
+    if (loadedPhraseSource) {
+        if (!phraseSourceDictPath.empty()) {
+            engine.LoadDictionaryMetadataOnlyFromFile(phraseSourceDictPath);
+        }
+        if (!primaryDictPath.empty()) {
+            engine.LoadDictionaryMetadataOnlyFromFile(primaryDictPath);
+        }
+        if (!fallbackDictPath.empty()) {
+            engine.LoadDictionaryMetadataOnlyFromFile(fallbackDictPath);
+        }
+    }
+
+    return loadedPhraseSource;
+}
+
+bool CollectSessionAutoPhraseAdditions(
+    const SessionSnapshot& snapshot,
+    const std::wstring& primaryDictPath,
+    const std::wstring& fallbackDictPath,
+    const std::wstring& phraseSourceDictPath,
+    const std::wstring& userDictPath,
+    const std::wstring& extendDictPath,
+    const std::vector<std::wstring>& runtimeDictPaths,
+    std::vector<std::pair<std::wstring, std::wstring>>& outAdditions) {
+    outAdditions.clear();
+
+    CompositionEngine dedupeEngine;
+    if (!LoadBaseDictionary(dedupeEngine, primaryDictPath, fallbackDictPath)) {
+        return false;
+    }
+    if (!userDictPath.empty() && std::filesystem::exists(userDictPath)) {
+        dedupeEngine.LoadUserDictionaryFromFile(userDictPath);
+    }
+    if (!extendDictPath.empty() && std::filesystem::exists(extendDictPath)) {
+        dedupeEngine.LoadAutoPhraseDictionaryFromFile(extendDictPath);
+    }
+    for (const std::wstring& runtimeDictPath : runtimeDictPaths) {
+        if (!runtimeDictPath.empty() && std::filesystem::exists(runtimeDictPath)) {
+            dedupeEngine.LoadAutoPhraseDictionaryFromFile(runtimeDictPath);
+        }
+    }
+
+    CompositionEngine phraseEngine;
+    if (!LoadPhraseSourceDictionary(phraseEngine, phraseSourceDictPath, primaryDictPath, fallbackDictPath)) {
+        return false;
+    }
+
+    std::unordered_map<std::wstring, std::vector<std::wstring>> candidateCodes;
+    for (size_t segmentStart = 0; segmentStart < snapshot.history.size();) {
+        while (segmentStart < snapshot.history.size() && !IsHanCharacter(snapshot.history[segmentStart])) {
+            ++segmentStart;
+        }
+        if (segmentStart >= snapshot.history.size()) {
+            break;
+        }
+
+        size_t segmentEnd = segmentStart;
+        while (segmentEnd < snapshot.history.size() && IsHanCharacter(snapshot.history[segmentEnd])) {
+            ++segmentEnd;
+        }
+
+        const size_t segmentLength = segmentEnd - segmentStart;
+        if (segmentLength >= 2) {
+            const size_t maxPhraseLength = std::min(kSessionAutoPhraseMaxLength, segmentLength);
+            for (size_t start = 0; start + 2 <= segmentLength; ++start) {
+                const size_t remaining = segmentLength - start;
+                const size_t maxLengthForStart = std::min(maxPhraseLength, remaining);
+                for (size_t phraseLength = 2; phraseLength <= maxLengthForStart; ++phraseLength) {
+                    const std::wstring phraseText = snapshot.history.substr(segmentStart + start, phraseLength);
+                    std::vector<std::wstring> phraseCodes;
+                    if (!phraseEngine.TryBuildPhraseCodes(phraseText, phraseCodes) || phraseCodes.empty()) {
+                        continue;
+                    }
+
+                    auto& codes = candidateCodes[phraseText];
+                    for (std::wstring phraseCode : phraseCodes) {
+                        phraseCode = NormalizeSessionPhraseCode(std::move(phraseCode));
+                        if (phraseCode.empty() || dedupeEngine.HasEntry(phraseCode, phraseText)) {
+                            continue;
+                        }
+                        if (std::find(codes.begin(), codes.end(), phraseCode) != codes.end()) {
+                            continue;
+                        }
+                        codes.push_back(std::move(phraseCode));
+                    }
+
+                    if (codes.empty()) {
+                        candidateCodes.erase(phraseText);
+                    }
+                }
+            }
+        }
+
+        segmentStart = segmentEnd + 1;
+    }
+
+    for (auto& pair : candidateCodes) {
+        for (std::wstring& code : pair.second) {
+            outAdditions.emplace_back(code, pair.first);
+        }
+    }
+
+    std::sort(
+        outAdditions.begin(),
+        outAdditions.end(),
+        [](const auto& left, const auto& right) {
+            if (left.second.size() != right.second.size()) {
+                return left.second.size() > right.second.size();
+            }
+            if (left.second != right.second) {
+                return left.second < right.second;
+            }
+            return left.first < right.first;
+        });
+
+    return true;
+}
+
 bool ParseDictionaryFile(
     const std::wstring& filePath,
     size_t sourcePriority,
@@ -260,6 +495,100 @@ bool WriteDictionaryFile(const std::wstring& filePath, const std::vector<DictEnt
         }
         output << WideToUtf8(entry.code) << ' ' << WideToUtf8(entry.text) << '\n';
     }
+    return true;
+}
+
+bool LoadSessionSnapshot(const std::wstring& filePath, SessionSnapshot* outSnapshot) {
+    if (outSnapshot == nullptr) {
+        return false;
+    }
+
+    std::ifstream input(std::filesystem::path(filePath), std::ios::in | std::ios::binary);
+    if (!input) {
+        return false;
+    }
+
+    *outSnapshot = SessionSnapshot{};
+    std::string line;
+    while (std::getline(input, line)) {
+        if (line.empty()) {
+            continue;
+        }
+
+        std::istringstream iss(line);
+        std::string tag;
+        if (!std::getline(iss, tag, '\t')) {
+            continue;
+        }
+
+        if (tag == "boot_tick") {
+            std::string tickText;
+            if (std::getline(iss, tickText, '\t')) {
+                outSnapshot->bootTick = static_cast<ULONGLONG>(_strtoui64(tickText.c_str(), nullptr, 10));
+                outSnapshot->hasBootTick = true;
+            }
+            continue;
+        }
+
+        if (tag == "history") {
+            std::string historyUtf8;
+            if (std::getline(iss, historyUtf8, '\t')) {
+                outSnapshot->history = Utf8ToWide(historyUtf8);
+            }
+        }
+    }
+
+    return true;
+}
+
+bool WriteSessionSnapshot(
+    const std::wstring& filePath,
+    const SessionSnapshot& snapshot,
+    const std::vector<std::pair<std::wstring, std::vector<std::wstring>>>& entries) {
+    const std::filesystem::path path(filePath);
+    std::error_code ec;
+    if (path.has_parent_path()) {
+        std::filesystem::create_directories(path.parent_path(), ec);
+        ec.clear();
+    }
+
+    const std::filesystem::path tempPath = path.parent_path() / (path.filename().wstring() + L".tmp");
+    std::ofstream output(tempPath, std::ios::out | std::ios::binary | std::ios::trunc);
+    if (!output) {
+        return false;
+    }
+
+    if (snapshot.hasBootTick) {
+        output << "boot_tick\t" << snapshot.bootTick << '\n';
+    }
+    output << "history\t" << WideToUtf8(snapshot.history) << '\n';
+    for (const auto& entry : entries) {
+        if (entry.first.empty() || entry.second.empty()) {
+            continue;
+        }
+
+        output << "entry\t" << WideToUtf8(entry.first) << '\t';
+        for (size_t index = 0; index < entry.second.size(); ++index) {
+            if (index != 0) {
+                output << ',';
+            }
+            output << WideToUtf8(entry.second[index]);
+        }
+        output << "\t0\n";
+    }
+    output.close();
+    if (!output) {
+        return false;
+    }
+
+    std::filesystem::remove(path, ec);
+    ec.clear();
+    std::filesystem::rename(tempPath, path, ec);
+    if (ec) {
+        std::filesystem::remove(tempPath, ec);
+        return false;
+    }
+
     return true;
 }
 
@@ -413,11 +742,196 @@ int RunExtendCommand(int argc, char* argv[]) {
     return 0;
 }
 
+int RunSessionBuildCommand(int argc, char* argv[]) {
+    if (argc < 8) {
+        std::cerr << "usage: yuninput_user_dict_builder session-build <session-file> <primary-dict> <fallback-dict> <phrase-source-dict> <user-dict> <extend-dict>\n";
+        return 1;
+    }
+
+    const std::wstring sessionFilePath = Utf8ToWide(argv[2]);
+    const std::wstring primaryDictPath = Utf8ToWide(argv[3]);
+    const std::wstring fallbackDictPath = Utf8ToWide(argv[4]);
+    const std::wstring phraseSourceDictPath = Utf8ToWide(argv[5]);
+    const std::wstring userDictPath = Utf8ToWide(argv[6]);
+    const std::wstring extendDictPath = Utf8ToWide(argv[7]);
+
+    SessionSnapshot snapshot;
+    if (!LoadSessionSnapshot(sessionFilePath, &snapshot)) {
+        std::cerr << "failed to load session snapshot\n";
+        return 2;
+    }
+
+    CompositionEngine dedupeEngine;
+    if (!LoadBaseDictionary(dedupeEngine, primaryDictPath, fallbackDictPath)) {
+        std::cerr << "failed to load base dictionary\n";
+        return 3;
+    }
+    if (!userDictPath.empty() && std::filesystem::exists(userDictPath)) {
+        dedupeEngine.LoadUserDictionaryFromFile(userDictPath);
+    }
+    if (!extendDictPath.empty() && std::filesystem::exists(extendDictPath)) {
+        dedupeEngine.LoadAutoPhraseDictionaryFromFile(extendDictPath);
+    }
+
+    CompositionEngine phraseEngine;
+    if (!LoadPhraseSourceDictionary(phraseEngine, phraseSourceDictPath, primaryDictPath, fallbackDictPath)) {
+        std::cerr << "failed to load phrase source dictionary\n";
+        return 4;
+    }
+
+    std::unordered_map<std::wstring, std::vector<std::wstring>> candidateCodes;
+    for (size_t segmentStart = 0; segmentStart < snapshot.history.size();) {
+        while (segmentStart < snapshot.history.size() && !IsHanCharacter(snapshot.history[segmentStart])) {
+            ++segmentStart;
+        }
+        if (segmentStart >= snapshot.history.size()) {
+            break;
+        }
+
+        size_t segmentEnd = segmentStart;
+        while (segmentEnd < snapshot.history.size() && IsHanCharacter(snapshot.history[segmentEnd])) {
+            ++segmentEnd;
+        }
+
+        const size_t segmentLength = segmentEnd - segmentStart;
+        if (segmentLength >= 2) {
+            const size_t maxPhraseLength = std::min(kSessionAutoPhraseMaxLength, segmentLength);
+            for (size_t start = 0; start + 2 <= segmentLength; ++start) {
+                const size_t remaining = segmentLength - start;
+                const size_t maxLengthForStart = std::min(maxPhraseLength, remaining);
+                for (size_t phraseLength = 2; phraseLength <= maxLengthForStart; ++phraseLength) {
+                    const std::wstring phraseText = snapshot.history.substr(segmentStart + start, phraseLength);
+                    std::vector<std::wstring> phraseCodes;
+                    if (!phraseEngine.TryBuildPhraseCodes(phraseText, phraseCodes) || phraseCodes.empty()) {
+                        continue;
+                    }
+
+                    auto& codes = candidateCodes[phraseText];
+                    for (std::wstring phraseCode : phraseCodes) {
+                        phraseCode = NormalizeSessionPhraseCode(std::move(phraseCode));
+                        if (phraseCode.empty() || dedupeEngine.HasEntry(phraseCode, phraseText)) {
+                            continue;
+                        }
+                        if (std::find(codes.begin(), codes.end(), phraseCode) != codes.end()) {
+                            continue;
+                        }
+                        codes.push_back(std::move(phraseCode));
+                    }
+
+                    if (codes.empty()) {
+                        candidateCodes.erase(phraseText);
+                    }
+                }
+            }
+        }
+
+        segmentStart = segmentEnd + 1;
+    }
+
+    std::vector<std::pair<std::wstring, std::vector<std::wstring>>> entries;
+    entries.reserve(candidateCodes.size());
+    for (auto& pair : candidateCodes) {
+        if (!pair.first.empty() && !pair.second.empty()) {
+            std::sort(pair.second.begin(), pair.second.end());
+            entries.emplace_back(pair.first, std::move(pair.second));
+        }
+    }
+    std::sort(
+        entries.begin(),
+        entries.end(),
+        [](const auto& left, const auto& right) {
+            if (left.first.size() != right.first.size()) {
+                return left.first.size() > right.first.size();
+            }
+            return left.first < right.first;
+        });
+
+    if (!WriteSessionSnapshot(sessionFilePath, snapshot, entries)) {
+        std::cerr << "failed to write session snapshot\n";
+        return 5;
+    }
+
+    std::cout << "phrases_built=" << entries.size() << '\n';
+    std::cout << "output=" << WideToUtf8(sessionFilePath) << '\n';
+    return 0;
+}
+
+int RunSessionWatchCommand(int argc, char* argv[]) {
+    if (argc < 10) {
+        std::cerr << "usage: yuninput_user_dict_builder session-watch <session-file> <primary-dict> <fallback-dict> <phrase-source-dict> <user-dict> <extend-dict> <runtime-dict> <helper-dict>\n";
+        return 1;
+    }
+
+    const std::wstring sessionFilePath = Utf8ToWide(argv[2]);
+    const std::wstring primaryDictPath = Utf8ToWide(argv[3]);
+    const std::wstring fallbackDictPath = Utf8ToWide(argv[4]);
+    const std::wstring phraseSourceDictPath = Utf8ToWide(argv[5]);
+    const std::wstring userDictPath = Utf8ToWide(argv[6]);
+    const std::wstring extendDictPath = Utf8ToWide(argv[7]);
+    const std::wstring runtimeDictPath = Utf8ToWide(argv[8]);
+    const std::wstring helperDictPath = Utf8ToWide(argv[9]);
+
+    HANDLE helperMutex = CreateMutexW(nullptr, FALSE, kAutoPhraseHelperMutexName);
+    if (helperMutex == nullptr) {
+        std::cerr << "failed to create helper mutex\n";
+        return 2;
+    }
+    const bool helperAlreadyRunning = GetLastError() == ERROR_ALREADY_EXISTS;
+
+    HANDLE wakeEvent = CreateEventW(nullptr, FALSE, FALSE, kAutoPhraseHelperWakeEventName);
+    if (wakeEvent == nullptr) {
+        CloseHandle(helperMutex);
+        std::cerr << "failed to create helper wake event\n";
+        return 3;
+    }
+
+    if (helperAlreadyRunning) {
+        SetEvent(wakeEvent);
+        CloseHandle(wakeEvent);
+        CloseHandle(helperMutex);
+        return 0;
+    }
+
+    std::wstring lastSessionStamp;
+    for (;;) {
+        const std::wstring sessionStamp = QueryFileStampToken(sessionFilePath);
+        if (sessionStamp != lastSessionStamp) {
+            lastSessionStamp = sessionStamp;
+
+            SessionSnapshot snapshot;
+            if (LoadSessionSnapshot(sessionFilePath, &snapshot) && !snapshot.history.empty()) {
+                std::vector<std::pair<std::wstring, std::wstring>> additions;
+                const bool collected = CollectSessionAutoPhraseAdditions(
+                    snapshot,
+                    primaryDictPath,
+                    fallbackDictPath,
+                    phraseSourceDictPath,
+                    userDictPath,
+                    extendDictPath,
+                    {runtimeDictPath, helperDictPath},
+                    additions);
+                if (collected && !additions.empty() && !AppendAutoPhraseEntries(helperDictPath, additions)) {
+                    std::cerr << "failed to append helper auto phrase dictionary\n";
+                }
+            }
+        }
+
+        const DWORD waitResult = WaitForSingleObject(wakeEvent, kSessionWatchPollIntervalMs);
+        if (waitResult != WAIT_OBJECT_0 && waitResult != WAIT_TIMEOUT) {
+            break;
+        }
+    }
+
+    CloseHandle(wakeEvent);
+    CloseHandle(helperMutex);
+    return 0;
+}
+
 }  // namespace
 
 int main(int argc, char* argv[]) {
     if (argc < 2) {
-        std::cerr << "usage: yuninput_user_dict_builder <merge|extend> ...\n";
+        std::cerr << "usage: yuninput_user_dict_builder <merge|extend|session-build> ...\n";
         return 1;
     }
 
@@ -427,6 +941,12 @@ int main(int argc, char* argv[]) {
     }
     if (command == "extend") {
         return RunExtendCommand(argc, argv);
+    }
+    if (command == "session-build") {
+        return RunSessionBuildCommand(argc, argv);
+    }
+    if (command == "session-watch") {
+        return RunSessionWatchCommand(argc, argv);
     }
 
     std::cerr << "unknown command: " << command << '\n';

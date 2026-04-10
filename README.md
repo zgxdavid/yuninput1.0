@@ -60,7 +60,7 @@ English README: README.en.md
 
 - 支持 CMake + MSVC 全量构建 yuninput.dll、sort_probe、user_dict_builder 等 C++ 产物
 - 支持单独构建 C# 配置工具 yuninput_config.exe
-- 支持 WiX v4 生成 MSI，产物默认输出到仓库上级目录的 Yuninput1.0.msi
+- 支持 WiX v4 生成 MSI，产物默认输出到仓库根目录的 Yuninput1.2.msi
 - MSI 已打包主 DLL、配置工具、安装/卸载脚本、默认词库、用户词库模板和规则文件
 
 ## 快速开始
@@ -92,12 +92,12 @@ Set-ExecutionPolicy -Scope Process Bypass
 
 ```powershell
 Set-ExecutionPolicy -Scope Process Bypass
-./scripts/build_msi_wrapper.ps1 -Version 1.0.0 -SkipDictionaryGeneration
+./scripts/build_msi_wrapper.ps1 -Version 1.2.0 -OutputName Yuninput1.2.msi -SkipDictionaryGeneration
 ```
 
 默认输出：
 
-- ../Yuninput1.0.msi
+- ./Yuninput1.2.msi
 
 说明：当前 scripts/generate_user_dict.ps1 在 Extend User Dictionary Variants 阶段仍可能卡住，因此现阶段打包通常使用 -SkipDictionaryGeneration，直接复用仓库内已有词库产物。
 

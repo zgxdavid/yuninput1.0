@@ -67,6 +67,7 @@ private:
         bool sortOneCodeSingle = false;
         bool sortOneCodeSingleUsed = false;
         bool sortTwoCodeSingleOrPhrase = false;
+        bool sortPreferredPhrase = false;
         std::uint8_t sortPrimaryTier = 7;
         std::uint8_t sortShortCodeTier = 3;
         size_t consumedLength = 0;
@@ -76,6 +77,11 @@ private:
         std::wstring text;
         std::vector<std::wstring> codes;
         ULONGLONG lastTick = 0;
+    };
+
+    struct HelperAutoPhraseEntry {
+        std::wstring text;
+        std::wstring code;
     };
 
     struct CommitHistoryItem {
@@ -98,6 +104,11 @@ private:
         std::uint64_t completedGeneration = 0;
     };
 
+    struct CachedCandidateState {
+        std::vector<CandidateItem> candidates;
+        bool fullyExpanded = false;
+    };
+
     enum class ToggleHotkey {
         F8,
         F9,
@@ -113,7 +124,8 @@ private:
 
     ~TextService();
 
-    void RefreshCandidates();
+    void RefreshCandidates(bool expandAll = false);
+    bool EnsureRuntimeReady();
     bool ReloadActiveDictionaries();
     bool LoadConfiguredDictionaries();
     bool SwitchDictionaryProfile(DictionaryProfile profile);
@@ -123,6 +135,10 @@ private:
     size_t GetCurrentPageCandidateCount() const;
     void InvalidatePageCandidatesCache();
     size_t GetTotalPages() const;
+    void ScheduleDeferredCandidateExpansion();
+    void RunDeferredCandidateExpansion();
+    bool TryRestoreCachedCandidatesForCode(const std::wstring& code);
+    void CacheCurrentCandidatesForCode();
     void ClearComposition();
     void LoadSettings();
     bool PersistDictionaryProfileSetting() const;
@@ -136,21 +152,28 @@ private:
     bool ReloadUserDataIfChanged(bool force);
     void MarkAutoPhraseDictionaryDirty();
     void MarkFrequencyDataDirty();
-    void FlushPendingUserDataIfNeeded(bool force);
+    void FlushPendingUserDataIfNeeded(bool force, bool waitForCompletion = true);
     void StartUserDataWriteWorker();
     void StopUserDataWriteWorker(bool waitForPending);
     void UserDataWriteWorkerMain();
     void QueueAutoPhraseSessionWrite();
     void QueueManualPhraseReviewAppend(const std::string& line);
     bool WaitForUserDataWrites(bool includeSessionWrite);
+    bool HasPendingTrackedUserDataWrites();
     static bool WriteUtf8FileSnapshot(const std::wstring& filePath, const std::string& content, bool deleteIfEmpty, bool append);
     std::string BuildAutoPhraseSessionStateSnapshot(bool& deleteFile) const;
+    bool ReloadAutoPhraseSessionStateIfChanged(bool force);
+    bool ReloadHelperAutoPhraseEntriesIfChanged(bool force);
+    bool ReapAutoPhraseBuilderProcess(bool reloadSessionState);
+    bool LaunchAutoPhraseBuilderProcess();
     std::string BuildContextAssociationFileContent() const;
     bool SaveAutoPhraseSessionState() const;
     bool LoadAutoPhraseSessionState();
+    bool LoadHelperAutoPhraseEntries();
     void UpdateSessionAutoPhraseHistory(const std::wstring& committedText, ULONGLONG now);
     void RecordSessionAutoPhraseBreak();
     void CollectSessionAutoPhraseCandidatesForTail(ULONGLONG now);
+    bool PruneSessionAutoPhraseEntries();
     void MergeSessionAutoPhraseCandidates();
     bool PromoteSessionAutoPhrase(const std::wstring& text);
     static bool IsHanCharacter(wchar_t ch);
@@ -185,6 +208,7 @@ private:
     bool keyEventSinkAdvised_;
     bool threadMgrEventSinkAdvised_;
     DWORD threadMgrEventSinkCookie_;
+    bool runtimeReady_;
 
     CompositionEngine engine_;
     CompositionEngine phraseBuildEngine_;
@@ -215,12 +239,17 @@ private:
     std::wstring userFreqPath_;
     std::wstring userDictPath_;
     std::wstring autoPhraseDictPath_;
+    std::wstring autoPhraseUserPath_;
+    std::wstring autoPhraseHelperPath_;
     std::wstring autoPhraseSessionPath_;
+    std::wstring autoPhraseBuilderPath_;
     std::wstring blockedEntriesPath_;
     std::wstring contextAssocPath_;
     std::wstring contextAssocBlacklistPath_;
     std::wstring manualPhraseReviewPath_;
     std::wstring userDataFilesStamp_;
+    std::wstring autoPhraseSessionStamp_;
+    std::wstring helperAutoPhraseStamp_;
 
     std::wstring compositionCode_;
     std::vector<CandidateItem> allCandidates_;
@@ -235,6 +264,7 @@ private:
     std::unordered_map<std::wstring, PendingPhraseStat> pendingPhraseStats_;
     std::wstring autoPhraseHistoryText_;
     std::unordered_map<std::wstring, SessionAutoPhraseEntry> sessionAutoPhraseEntries_;
+    std::unordered_map<std::wstring, std::vector<HelperAutoPhraseEntry>> helperAutoPhraseEntriesByCode_;
     std::wstring lastAutoPhraseSelectedKey_;
     int autoPhraseSelectedStreak_;
     ULONGLONG autoPhraseSelectedTick_;
@@ -242,17 +272,25 @@ private:
     bool userFrequencyDirty_;
     ULONGLONG userDataFirstDirtyTick_;
     ULONGLONG userDataLastFlushTick_;
+    ULONGLONG lastUserDataReloadCheckTick_;
+    ULONGLONG lastHelperAutoPhraseReloadCheckTick_;
+    ULONGLONG lastAutoPhraseBuilderLaunchTick_;
+    ULONGLONG lastAutoPhraseHistoryUpdateTick_;
+    bool autoPhraseBuilderPending_;
+    HANDLE autoPhraseBuilderProcess_;
     std::thread userDataWriteThread_;
     std::mutex userDataWriteMutex_;
     std::condition_variable userDataWriteCv_;
     bool userDataWriteStopRequested_;
     std::uint64_t nextUserDataWriteGeneration_;
     PendingAsyncFileWrite pendingUserDictWrite_;
+    PendingAsyncFileWrite pendingAutoPhraseDictWrite_;
     PendingAsyncFileWrite pendingUserFreqWrite_;
     PendingAsyncFileWrite pendingContextAssocWrite_;
     PendingAsyncFileWrite pendingBlockedEntriesWrite_;
     PendingAsyncFileWrite pendingAutoPhraseSessionWrite_;
     PendingAsyncFileWrite pendingManualPhraseReviewWrite_;
+    bool userDataStampRefreshPending_;
     std::unordered_map<std::wstring, std::uint64_t> contextAssociationScores_;
     std::unordered_set<std::wstring> contextAssociationBlacklist_;
     std::unordered_map<wchar_t, std::wstring> singleCharZhengmaCodeHints_;
@@ -262,6 +300,11 @@ private:
     mutable size_t pageCandidatesCachePageSize_;
     mutable std::wstring pageCandidatesCacheCode_;
     mutable std::vector<CandidateWindow::DisplayCandidate> pageCandidatesCache_;
+    bool candidatesFullyExpanded_;
+    std::unordered_map<std::wstring, CachedCandidateState> compositionCandidateCache_;
+    std::deque<std::wstring> compositionCandidateCacheOrder_;
+    std::wstring deferredExpansionCode_;
+    ULONGLONG deferredExpansionDueTick_;
 };
 
 HRESULT CreateTextServiceClassFactory(REFIID riid, void** ppv);

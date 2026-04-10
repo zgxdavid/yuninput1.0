@@ -10,10 +10,10 @@ $projectRoot = Split-Path -Parent $PSScriptRoot
 $workspaceRoot = Split-Path -Parent $projectRoot
 
 if ([string]::IsNullOrWhiteSpace($MsiSource)) {
-    $candidates = Get-ChildItem -Path $workspaceRoot -Filter 'Yuninput1.0*.msi' -File |
+    $candidates = Get-ChildItem -Path $projectRoot -Filter 'Yuninput*.msi' -File |
         Sort-Object LastWriteTime -Descending
     if ($candidates.Count -eq 0) {
-        throw "No MSI found under workspace root: $workspaceRoot"
+        throw "No MSI found under project root: $projectRoot"
     }
     $MsiSource = $candidates[0].FullName
 }

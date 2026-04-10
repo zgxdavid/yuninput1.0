@@ -27,8 +27,8 @@ $publicSourceDir = Join-Path $PublicRoot 'source'
 $publicArtifactsDir = Join-Path $PublicRoot 'artifacts'
 $privateSnapshotDir = Join-Path $PrivateArchiveRoot ("snapshot_" + $stamp)
 
-$msiPath = Join-Path $workspaceRoot 'Yuninput1.0.msi'
-$sourceListPath = Join-Path $projectRoot 'docs\public-source-file-list-1.0.txt'
+$msiPath = Join-Path $projectRoot ("Yuninput" + $VersionTag + '.msi')
+$sourceListPath = Join-Path $projectRoot ('docs\public-source-file-list-' + $VersionTag + '.txt')
 
 function Remove-IfExists {
     param([string]$Path)
@@ -88,7 +88,7 @@ $excludeFiles = @(
     'yuninput_user.dict',
     'yuninput_setup.msi',
     'yuninput_setup.wixpdb',
-    'Yuninput1.0.msi'
+    ('Yuninput' + $VersionTag + '.msi')
 )
 
 $robocopyArgs = @(
@@ -121,7 +121,7 @@ if ($rc -ge 8) {
 }
 
 if (Test-Path $msiPath) {
-    Copy-Item -Force $msiPath (Join-Path $publicArtifactsDir 'Yuninput1.0.msi')
+    Copy-Item -Force $msiPath (Join-Path $publicArtifactsDir ("Yuninput" + $VersionTag + '.msi'))
 }
 
 $allPublicFiles = Get-ChildItem -Recurse -File $publicSourceDir |
@@ -143,7 +143,7 @@ $header = @(
 
 ($header + $allPublicFiles) | Set-Content -Encoding utf8 $sourceListPath
 
-$publicSourceListPath = Join-Path $publicSourceDir 'docs\public-source-file-list-1.0.txt'
+$publicSourceListPath = Join-Path $publicSourceDir ('docs\public-source-file-list-' + $VersionTag + '.txt')
 Ensure-Dir (Split-Path -Parent $publicSourceListPath)
 Copy-Item -Force $sourceListPath $publicSourceListPath
 
@@ -165,6 +165,6 @@ $publicReadme = Join-Path $PublicRoot 'PUBLIC_RELEASE_README.txt'
 ) | Set-Content -Encoding utf8 $publicReadme
 
 Get-Item $sourceListPath | Select-Object FullName, Length, LastWriteTime | Format-List
-if (Test-Path (Join-Path $publicArtifactsDir 'Yuninput1.0.msi')) {
-    Get-Item (Join-Path $publicArtifactsDir 'Yuninput1.0.msi') | Select-Object FullName, Length, LastWriteTime | Format-List
+if (Test-Path (Join-Path $publicArtifactsDir ("Yuninput" + $VersionTag + '.msi'))) {
+    Get-Item (Join-Path $publicArtifactsDir ("Yuninput" + $VersionTag + '.msi')) | Select-Object FullName, Length, LastWriteTime | Format-List
 }
