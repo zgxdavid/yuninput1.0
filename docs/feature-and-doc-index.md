@@ -1,6 +1,6 @@
 # 匀码输入法功能与文档总索引
 
-更新时间：2026-03-24
+更新时间：2026-04-10
 
 ## 1. 功能总览
 
@@ -45,7 +45,7 @@
 ### 2.3 模式验证
 - docs/mode-e2e-checklist.md：两模式验收流程
 - docs/mode_samples.tsv：模式样本数据
-- docs/multi-monitor-candidate-window-checklist.md：候选窗多显示器定位回归清单
+- docs/multi-monitor-candidate-window-checklist.md：候选窗多显示器定位与稳定性回归清单
 - docs/multi-monitor-candidate-window-test-log-template.tsv：多显示器回归记录模板（含 Result/Notes/IssueID）
 - docs/multi-monitor-candidate-window-test-log-template.csv：多显示器回归记录模板 CSV 版（便于 Excel 直接打开）
 

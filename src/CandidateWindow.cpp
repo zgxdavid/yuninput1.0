@@ -19,6 +19,7 @@ constexpr int kCodeColumnWidthPx = 74;
 constexpr int kWindowBaseWidthPx = 116;
 constexpr int kWindowMinWidthPx = 280;
 constexpr int kWindowMaxWidthPx = 430;
+constexpr int kPositionSnapThresholdPx = 3;
 
 bool AreDisplayCandidatesEqual(
     const std::vector<CandidateWindow::DisplayCandidate>& left,
@@ -353,7 +354,7 @@ void CandidateWindow::Update(
     for (size_t i = 0; i < visibleRowCount; ++i) {
         const auto& candidate = candidates_[i];
         const size_t visibleChars = std::min(candidate.text.size(), kMaxCandidateWidthChars);
-        const int charWidth = (i == selectedIndex_) ? kSelectedCharWidthPx : kNormalCharWidthPx;
+        const int charWidth = std::max(kNormalCharWidthPx, kSelectedCharWidthPx);
         int mainWidth = static_cast<int>(visibleChars) * charWidth;
         if (candidate.text.size() > kMaxCandidateWidthChars) {
             mainWidth += 10;
@@ -399,6 +400,13 @@ void CandidateWindow::Update(
         y = std::max(static_cast<int>(workArea.top), std::min(y, maxY));
     }
 
+    if (hasLastWindowRect_ &&
+        std::abs(x - lastX_) <= kPositionSnapThresholdPx &&
+        std::abs(y - lastY_) <= kPositionSnapThresholdPx) {
+        x = lastX_;
+        y = lastY_;
+    }
+
     const bool sizeChanged =
         !hasLastWindowRect_ ||
         width != lastWidth_ ||
@@ -419,7 +427,7 @@ void CandidateWindow::Update(
     }
 
     if (contentChanged || sizeChanged || !IsVisible()) {
-        InvalidateRect(hwnd_, nullptr, TRUE);
+        InvalidateRect(hwnd_, nullptr, FALSE);
     }
 }
 
@@ -464,6 +472,45 @@ void CandidateWindow::OnPaint() {
 
     RECT rc = {};
     GetClientRect(hwnd_, &rc);
+
+    const int width = rc.right - rc.left;
+    const int height = rc.bottom - rc.top;
+    if (width <= 0 || height <= 0) {
+        EndPaint(hwnd_, &ps);
+        return;
+    }
+
+    HDC memoryDc = CreateCompatibleDC(hdc);
+    HBITMAP bitmap = nullptr;
+    HGDIOBJ oldBitmap = nullptr;
+    if (memoryDc != nullptr) {
+        bitmap = CreateCompatibleBitmap(hdc, width, height);
+        if (bitmap != nullptr) {
+            oldBitmap = SelectObject(memoryDc, bitmap);
+            PaintContent(memoryDc, rc);
+            BitBlt(hdc, 0, 0, width, height, memoryDc, 0, 0, SRCCOPY);
+            SelectObject(memoryDc, oldBitmap);
+        } else {
+            DeleteDC(memoryDc);
+            memoryDc = nullptr;
+        }
+    }
+
+    if (memoryDc == nullptr) {
+        PaintContent(hdc, rc);
+    }
+
+    if (bitmap != nullptr) {
+        DeleteObject(bitmap);
+    }
+    if (memoryDc != nullptr) {
+        DeleteDC(memoryDc);
+    }
+
+    EndPaint(hwnd_, &ps);
+}
+
+void CandidateWindow::PaintContent(HDC hdc, const RECT& rc) const {
 
     const COLORREF bgTop = RGB(246, 239, 226);
     const COLORREF bgBottom = RGB(236, 244, 248);
@@ -626,7 +673,6 @@ void CandidateWindow::OnPaint() {
     DrawTextW(hdc, footer.c_str(), static_cast<int>(footer.size()), &footerRc, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
 
     SelectObject(hdc, oldFont);
-    EndPaint(hwnd_, &ps);
 }
 
 LRESULT CALLBACK CandidateWindow::WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {

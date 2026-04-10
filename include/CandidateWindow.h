@@ -45,6 +45,7 @@ public:
 private:
     static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
     void OnPaint();
+    void PaintContent(HDC hdc, const RECT& rc) const;
     bool EnsureFonts();
     void ReleaseFonts();
 
