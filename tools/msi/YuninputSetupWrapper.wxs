@@ -96,8 +96,8 @@
         <File Id="filConfigExe" Source="$(var.ProductSourceDir)\tools\yuninput_config.exe" KeyPath="yes" />
       </Component>
 
-      <Component Id="cmpReadme" Directory="INSTALLROOT" Guid="*">
-        <File Id="filReadme" Source="$(var.ProductSourceDir)\README.md" KeyPath="yes" />
+      <Component Id="cmpManual" Directory="INSTALLROOT" Guid="*">
+        <File Id="filManual" Name="匀码输入法说明书.md" Source="$(var.ProductSourceDir)\YuninputManual.zh-CN.md" KeyPath="yes" />
       </Component>
 
       <Component Id="cmpLicense" Directory="INSTALLROOT" Guid="*">

@@ -34,6 +34,7 @@ internal sealed class CandidateEntryItem
     public string Text;
     public string RawLine;
     public bool IsAutoPhrase;
+    public int Score = 1;
 
     public override string ToString()
     {
@@ -69,6 +70,12 @@ internal sealed class PhraseReviewLogItem
 
 public class ConfigForm : Form
 {
+    private static readonly Color PanelBackColor = Color.FromArgb(247, 248, 250);
+    private static readonly Color AccentColor = Color.FromArgb(31, 95, 168);
+    private static readonly Color BorderColor = Color.FromArgb(214, 219, 226);
+    private static readonly Color AlternateRowColor = Color.FromArgb(250, 252, 255);
+    private static readonly Color SelectedRowColor = Color.FromArgb(220, 235, 252);
+
     private CheckBox chkChinese;
     private CheckBox chkFull;
     private CheckBox chkChinesePunctuation;
@@ -106,11 +113,14 @@ public class ConfigForm : Form
     public ConfigForm()
     {
         Text = "\u5300\u7801\u8f93\u5165\u6cd5 \u914d\u7f6e\u4e0e\u8bcd\u6761\u7ba1\u7406";
-        Width = 860;
-        Height = 600;
-        MinimumSize = new Size(860, 600);
+        ClientSize = new Size(996, 748);
+        MinimumSize = new Size(980, 720);
         StartPosition = FormStartPosition.CenterScreen;
         Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath);
+        Font = new Font("Microsoft YaHei UI", 9F, FontStyle.Regular, GraphicsUnit.Point);
+        BackColor = PanelBackColor;
+        AutoScaleMode = AutoScaleMode.Dpi;
+        EnableEscapeClose(this);
 
         localRoot = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "yuninput");
         roamingRoot = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "yuninput");
@@ -119,7 +129,7 @@ public class ConfigForm : Form
 
         cfgPath = Path.Combine(localRoot, "settings.json");
         userDictPath = Path.Combine(roamingRoot, "yuninput_user.dict");
-        autoPhraseDictPath = userDictPath;
+    autoPhraseDictPath = Path.Combine(roamingRoot, "auto_phrase_runtime.dict");
         userFreqPath = Path.Combine(roamingRoot, "user_freq.txt");
         blockedPath = Path.Combine(roamingRoot, "blocked_entries.txt");
         contextAssocPath = Path.Combine(roamingRoot, "context_assoc.txt");
@@ -130,8 +140,8 @@ public class ConfigForm : Form
         var tabs = new TabControl();
         tabs.Left = 16;
         tabs.Top = 16;
-        tabs.Width = 812;
-        tabs.Height = 480;
+        tabs.Width = 964;
+        tabs.Height = 646;
         tabs.Anchor = AnchorStyles.Top | AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right;
         Controls.Add(tabs);
 
@@ -146,11 +156,24 @@ public class ConfigForm : Form
         BuildDataTab(dataTab);
         BuildContextTab(contextTab);
 
-        var btnSave = new Button { Left = 462, Top = 514, Width = 86, Text = "\u4fdd\u5b58", Anchor = AnchorStyles.Right | AnchorStyles.Bottom };
-        var btnRefresh = new Button { Left = 558, Top = 514, Width = 86, Text = "\u5237\u65b0", Anchor = AnchorStyles.Right | AnchorStyles.Bottom };
-        var btnOpenFolder = new Button { Left = 654, Top = 514, Width = 86, Text = "\u6253\u5f00\u76ee\u5f55", Anchor = AnchorStyles.Right | AnchorStyles.Bottom };
-        var btnClose = new Button { Left = 750, Top = 514, Width = 78, Text = "\u5173\u95ed", Anchor = AnchorStyles.Right | AnchorStyles.Bottom };
+        var bottomBar = new Panel
+        {
+            Left = 16,
+            Top = 676,
+            Width = 964,
+            Height = 40,
+            BackColor = PanelBackColor,
+            Anchor = AnchorStyles.Left | AnchorStyles.Right | AnchorStyles.Bottom
+        };
+        Controls.Add(bottomBar);
 
+        var btnHelp = new Button { Left = 428, Top = 3, Width = 126, Height = 34, Text = "\u6253\u5f00\u8bf4\u660e\u4e66", Anchor = AnchorStyles.Right | AnchorStyles.Bottom };
+        var btnSave = new Button { Left = 568, Top = 3, Width = 92, Height = 34, Text = "\u4fdd\u5b58", Anchor = AnchorStyles.Right | AnchorStyles.Bottom };
+        var btnRefresh = new Button { Left = 670, Top = 3, Width = 92, Height = 34, Text = "\u5237\u65b0", Anchor = AnchorStyles.Right | AnchorStyles.Bottom };
+        var btnOpenFolder = new Button { Left = 772, Top = 3, Width = 110, Height = 34, Text = "\u6253\u5f00\u76ee\u5f55", Anchor = AnchorStyles.Right | AnchorStyles.Bottom };
+        var btnClose = new Button { Left = 892, Top = 3, Width = 72, Height = 34, Text = "\u5173\u95ed", Anchor = AnchorStyles.Right | AnchorStyles.Bottom, DialogResult = DialogResult.Cancel };
+
+        btnHelp.Click += (s, e) => OpenManualInNotepad();
         btnSave.Click += (s, e) => SaveConfig(true);
         btnRefresh.Click += (s, e) =>
         {
@@ -161,140 +184,437 @@ public class ConfigForm : Form
         btnOpenFolder.Click += (s, e) => Process.Start(new ProcessStartInfo { FileName = roamingRoot, UseShellExecute = true });
         btnClose.Click += (s, e) => Close();
 
-        Controls.Add(btnSave);
-        Controls.Add(btnRefresh);
-        Controls.Add(btnOpenFolder);
-        Controls.Add(btnClose);
+        bottomBar.Controls.Add(btnHelp);
+        bottomBar.Controls.Add(btnSave);
+        bottomBar.Controls.Add(btnRefresh);
+        bottomBar.Controls.Add(btnOpenFolder);
+        bottomBar.Controls.Add(btnClose);
+
+        AcceptButton = btnSave;
+        CancelButton = btnClose;
 
         LoadConfig();
         RefreshDataLists();
         RefreshContextAssocLists();
     }
 
+    protected override bool ProcessCmdKey(ref Message msg, Keys keyData)
+    {
+        if (keyData == Keys.Escape)
+        {
+            Close();
+            return true;
+        }
+
+        return base.ProcessCmdKey(ref msg, keyData);
+    }
+
+    private string ResolveManualPath()
+    {
+        string baseDir = AppDomain.CurrentDomain.BaseDirectory;
+        string[] candidates = new[]
+        {
+            Path.Combine(baseDir, "\u5300\u7801\u8f93\u5165\u6cd5\u8bf4\u660e\u4e66.md"),
+            Path.GetFullPath(Path.Combine(baseDir, "..", "\u5300\u7801\u8f93\u5165\u6cd5\u8bf4\u660e\u4e66.md")),
+            Path.GetFullPath(Path.Combine(baseDir, "..", "README.md")),
+            Path.Combine(baseDir, "README.md")
+        };
+
+        foreach (string candidate in candidates)
+        {
+            if (File.Exists(candidate))
+            {
+                return candidate;
+            }
+        }
+
+        return string.Empty;
+    }
+
+    private void OpenManualInNotepad()
+    {
+        string manualPath = ResolveManualPath();
+        if (string.IsNullOrEmpty(manualPath))
+        {
+            MessageBox.Show("未找到本地说明书文件，请确认安装目录中的《匀码输入法说明书.md》是否存在。", "匀码输入法", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+
+        Process.Start(new ProcessStartInfo
+        {
+            FileName = "notepad.exe",
+            Arguments = "\"" + manualPath + "\"",
+            UseShellExecute = true
+        });
+    }
+
+    private static void EnableEscapeClose(Form form)
+    {
+        form.KeyPreview = true;
+        form.KeyDown += (s, e) =>
+        {
+            if (e.KeyCode != Keys.Escape)
+            {
+                return;
+            }
+
+            form.Close();
+            e.Handled = true;
+        };
+    }
+
+    private static string BuildEntryLine(CandidateEntryItem item)
+    {
+        int score = item == null || item.Score <= 0 ? 1 : item.Score;
+        if (item == null)
+        {
+            return string.Empty;
+        }
+
+        return item.Code + " " + item.Text + " " + score + (item.IsAutoPhrase ? " auto" : string.Empty);
+    }
+
+    private List<CandidateEntryItem> ReadManagedDictionaryItems()
+    {
+        var merged = new Dictionary<string, CandidateEntryItem>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (CandidateEntryItem item in ReadEntryFile(autoPhraseDictPath))
+        {
+            item.IsAutoPhrase = true;
+            merged[item.Code + "\t" + item.Text] = item;
+        }
+
+        foreach (CandidateEntryItem item in ReadEntryFile(userDictPath))
+        {
+            item.IsAutoPhrase = false;
+            merged[item.Code + "\t" + item.Text] = item;
+        }
+
+        var result = new List<CandidateEntryItem>(merged.Values);
+        result.Sort((left, right) =>
+        {
+            if (left.IsAutoPhrase != right.IsAutoPhrase)
+            {
+                return left.IsAutoPhrase ? 1 : -1;
+            }
+
+            int codeComparison = string.Compare(left.Code, right.Code, StringComparison.OrdinalIgnoreCase);
+            if (codeComparison != 0)
+            {
+                return codeComparison;
+            }
+
+            return string.Compare(left.Text, right.Text, StringComparison.Ordinal);
+        });
+        return result;
+    }
+
+    private void WriteManagedDictionaryItems(IList<CandidateEntryItem> items)
+    {
+        var manualLines = new List<string>();
+        var autoLines = new List<string>();
+        foreach (CandidateEntryItem item in items)
+        {
+            string line = BuildEntryLine(item);
+            if (string.IsNullOrEmpty(line))
+            {
+                continue;
+            }
+
+            if (item.IsAutoPhrase)
+            {
+                autoLines.Add(line);
+            }
+            else
+            {
+                manualLines.Add(line);
+            }
+        }
+
+        Directory.CreateDirectory(Path.GetDirectoryName(userDictPath));
+        Directory.CreateDirectory(Path.GetDirectoryName(autoPhraseDictPath));
+        File.WriteAllLines(userDictPath, manualLines.ToArray(), Encoding.UTF8);
+        File.WriteAllLines(autoPhraseDictPath, autoLines.ToArray(), Encoding.UTF8);
+    }
+
+    private GroupBox CreateGroupBox(TabPage tab, string title, int left, int top, int width, int height)
+    {
+        var box = new GroupBox
+        {
+            Left = left,
+            Top = top,
+            Width = width,
+            Height = height,
+            Text = title,
+            BackColor = Color.White,
+            ForeColor = AccentColor
+        };
+        tab.Controls.Add(box);
+        return box;
+    }
+
+    private ListBox CreateStyledListBox(int left, int top, int width, int height)
+    {
+        var listBox = new ListBox
+        {
+            Left = left,
+            Top = top,
+            Width = width,
+            Height = height,
+            DrawMode = DrawMode.OwnerDrawFixed,
+            IntegralHeight = false,
+            ItemHeight = 30,
+            BorderStyle = BorderStyle.FixedSingle,
+            BackColor = Color.White,
+            HorizontalScrollbar = false
+        };
+        listBox.DrawItem += DrawStyledListBoxItem;
+        return listBox;
+    }
+
+    private void DrawStyledListBoxItem(object sender, DrawItemEventArgs e)
+    {
+        if (e.Index < 0)
+        {
+            return;
+        }
+
+        var listBox = sender as ListBox;
+        if (listBox == null)
+        {
+            return;
+        }
+
+        object item = listBox.Items[e.Index];
+        bool selected = (e.State & DrawItemState.Selected) == DrawItemState.Selected;
+        Color rowColor = selected ? SelectedRowColor : (e.Index % 2 == 0 ? Color.White : AlternateRowColor);
+        using (var backBrush = new SolidBrush(rowColor))
+        {
+            e.Graphics.FillRectangle(backBrush, e.Bounds);
+        }
+
+        Rectangle inner = new Rectangle(e.Bounds.Left + 8, e.Bounds.Top + 5, e.Bounds.Width - 16, e.Bounds.Height - 10);
+        TextFormatFlags flags = TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis;
+        Color textColor = selected ? Color.FromArgb(15, 47, 82) : Color.FromArgb(36, 41, 47);
+
+        CandidateEntryItem entry = item as CandidateEntryItem;
+        if (entry != null)
+        {
+            Rectangle codeRect = new Rectangle(inner.Left, inner.Top, 102, inner.Height);
+            Rectangle textRect = new Rectangle(inner.Left + 110, inner.Top, Math.Max(80, inner.Width - 178), inner.Height);
+            Rectangle tagRect = new Rectangle(inner.Right - 60, inner.Top, 60, inner.Height);
+            TextRenderer.DrawText(e.Graphics, entry.Code ?? string.Empty, Font, codeRect, AccentColor, flags);
+            TextRenderer.DrawText(e.Graphics, entry.Text ?? string.Empty, Font, textRect, textColor, flags);
+
+            if (entry.IsAutoPhrase)
+            {
+                TextRenderer.DrawText(e.Graphics, "自动", Font, tagRect, Color.FromArgb(181, 112, 24), TextFormatFlags.Right | TextFormatFlags.VerticalCenter);
+            }
+        }
+        else
+        {
+            ContextAssocItem assoc = item as ContextAssocItem;
+            if (assoc != null)
+            {
+                Rectangle prevRect = new Rectangle(inner.Left, inner.Top, 72, inner.Height);
+                Rectangle arrowRect = new Rectangle(inner.Left + 76, inner.Top, 30, inner.Height);
+                Rectangle nextRect = new Rectangle(inner.Left + 108, inner.Top, Math.Max(80, inner.Width - 190), inner.Height);
+                Rectangle scoreRect = new Rectangle(inner.Right - 84, inner.Top, 84, inner.Height);
+                TextRenderer.DrawText(e.Graphics, assoc.PrevText ?? string.Empty, Font, prevRect, AccentColor, flags);
+                TextRenderer.DrawText(e.Graphics, "->", Font, arrowRect, Color.FromArgb(122, 128, 138), flags);
+                TextRenderer.DrawText(e.Graphics, assoc.NextText ?? string.Empty, Font, nextRect, textColor, flags);
+                TextRenderer.DrawText(e.Graphics, assoc.Score.ToString(), Font, scoreRect, Color.FromArgb(97, 103, 112), TextFormatFlags.Right | TextFormatFlags.VerticalCenter);
+            }
+            else
+            {
+                PhraseReviewLogItem review = item as PhraseReviewLogItem;
+                if (review != null)
+                {
+                    Rectangle codeRect = new Rectangle(inner.Left, inner.Top, 90, inner.Height);
+                    Rectangle textRect = new Rectangle(inner.Left + 98, inner.Top, 90, inner.Height);
+                    Rectangle sourceRect = new Rectangle(inner.Left + 194, inner.Top, 92, inner.Height);
+                    Rectangle timeRect = new Rectangle(inner.Left + 290, inner.Top, Math.Max(80, inner.Width - 290), inner.Height);
+                    TextRenderer.DrawText(e.Graphics, review.Code ?? string.Empty, Font, codeRect, AccentColor, flags);
+                    TextRenderer.DrawText(e.Graphics, review.Text ?? string.Empty, Font, textRect, textColor, flags);
+                    TextRenderer.DrawText(e.Graphics, review.Source ?? string.Empty, Font, sourceRect, Color.FromArgb(181, 112, 24), flags);
+                    TextRenderer.DrawText(e.Graphics, review.Time ?? string.Empty, Font, timeRect, Color.FromArgb(97, 103, 112), flags);
+                }
+                else
+                {
+                    TextRenderer.DrawText(e.Graphics, Convert.ToString(item), Font, inner, textColor, flags);
+                }
+            }
+        }
+
+        using (var linePen = new Pen(BorderColor))
+        {
+            e.Graphics.DrawLine(linePen, e.Bounds.Left + 1, e.Bounds.Bottom - 1, e.Bounds.Right - 1, e.Bounds.Bottom - 1);
+        }
+
+        e.DrawFocusRectangle();
+    }
+
     private void BuildGeneralTab(TabPage tab)
     {
-        var lblIntro = new Label { Left = 20, Top = 18, Width = 720, Text = "\u8fd9\u91cc\u63a7\u5236\u9ed8\u8ba4\u6a21\u5f0f\u3001\u5019\u9009\u884c\u4e3a\u548c\u4e2d\u6587\u6807\u70b9\u7b56\u7565\u3002" };
+        tab.BackColor = PanelBackColor;
+        var lblIntro = new Label { Left = 20, Top = 18, Width = 840, Height = 24, Text = "这里集中管理默认状态、候选行为、词库模式和常用维护入口。按 Esc 可直接关闭窗口。" };
+        lblIntro.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right;
         tab.Controls.Add(lblIntro);
+        var behaviorGroup = CreateGroupBox(tab, "输入与候选行为", 20, 52, 404, 262);
+        behaviorGroup.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Bottom;
+        var behaviorPanel = new FlowLayoutPanel
+        {
+            Left = 16,
+            Top = 28,
+            Width = 368,
+            Height = 214,
+            FlowDirection = FlowDirection.TopDown,
+            WrapContents = false,
+            BackColor = Color.White
+        };
+        behaviorPanel.Anchor = AnchorStyles.Top | AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right;
 
-        chkChinese = new CheckBox { Left = 24, Top = 56, Width = 220, Text = "\u9ed8\u8ba4\u4e2d\u6587\u6a21\u5f0f" };
-        chkFull = new CheckBox { Left = 24, Top = 88, Width = 220, Text = "\u9ed8\u8ba4\u5168\u89d2\u6a21\u5f0f" };
-        chkChinesePunctuation = new CheckBox { Left = 24, Top = 120, Width = 320, Text = "\u4e2d\u6587\u6a21\u5f0f\u4e0b\u81ea\u52a8\u8f93\u51fa\u4e2d\u6587\u6807\u70b9" };
-        chkSmartSymbolPairs = new CheckBox { Left = 24, Top = 152, Width = 320, Text = "\u667a\u80fd\u5f15\u53f7\u4e0e\u4e66\u540d\u53f7\u6620\u5c04" };
-        chkAutoCommitUniqueExact = new CheckBox { Left = 24, Top = 184, Width = 360, Text = "\u552f\u4e00\u7cbe\u786e\u5019\u9009\u5728\u7ee7\u7eed\u8f93\u5165\u65f6\u81ea\u52a8\u9876\u5c4f" };
-        chkEmptyCandidateBeep = new CheckBox { Left = 24, Top = 216, Width = 360, Text = "\u65e0\u5019\u9009\u65f6\u7ed9\u51fa\u4e00\u6b21\u63d0\u793a\u97f3" };
-        chkTabNavigation = new CheckBox { Left = 24, Top = 248, Width = 360, Text = "\u542f\u7528 Tab/Shift+Tab \u5019\u9009\u5bfc\u822a" };
-        chkEnterExactPriority = new CheckBox { Left = 24, Top = 280, Width = 360, Text = "\u56de\u8f66\u952e\u4f18\u5148\u7cbe\u786e\u5019\u9009\u5426\u5219\u539f\u7801\u76f4\u51fa" };
-        chkContextAssociationEnabled = new CheckBox { Left = 24, Top = 312, Width = 360, Text = "\u542f\u7528\u4e0a\u4e0b\u6587\u5b66\u4e60\u6301\u4e45\u5316" };
+        chkChinese = new CheckBox { Width = 330, Text = "默认中文模式" };
+        chkFull = new CheckBox { Width = 330, Text = "默认全角模式" };
+        chkChinesePunctuation = new CheckBox { Width = 330, Text = "中文模式下自动输出中文标点" };
+        chkSmartSymbolPairs = new CheckBox { Width = 330, Text = "智能引号与书名号映射" };
+        chkAutoCommitUniqueExact = new CheckBox { Width = 330, Text = "唯一精确候选继续输入时自动顶屏" };
+        chkEmptyCandidateBeep = new CheckBox { Width = 330, Text = "无候选时给出一次提示音" };
+        chkTabNavigation = new CheckBox { Width = 330, Text = "启用 Tab/Shift+Tab 候选导航" };
+        chkEnterExactPriority = new CheckBox { Width = 330, Text = "回车优先精确候选，否则原码直出" };
+        chkContextAssociationEnabled = new CheckBox { Width = 330, Text = "启用上下文学习持久化" };
+        behaviorPanel.Controls.Add(chkChinese);
+        behaviorPanel.Controls.Add(chkFull);
+        behaviorPanel.Controls.Add(chkChinesePunctuation);
+        behaviorPanel.Controls.Add(chkSmartSymbolPairs);
+        behaviorPanel.Controls.Add(chkAutoCommitUniqueExact);
+        behaviorPanel.Controls.Add(chkEmptyCandidateBeep);
+        behaviorPanel.Controls.Add(chkTabNavigation);
+        behaviorPanel.Controls.Add(chkEnterExactPriority);
+        behaviorPanel.Controls.Add(chkContextAssociationEnabled);
+        behaviorGroup.Controls.Add(behaviorPanel);
 
-        tab.Controls.Add(chkChinese);
-        tab.Controls.Add(chkFull);
-        tab.Controls.Add(chkChinesePunctuation);
-        tab.Controls.Add(chkSmartSymbolPairs);
-        tab.Controls.Add(chkAutoCommitUniqueExact);
-        tab.Controls.Add(chkEmptyCandidateBeep);
-        tab.Controls.Add(chkTabNavigation);
-        tab.Controls.Add(chkEnterExactPriority);
-        tab.Controls.Add(chkContextAssociationEnabled);
+        var profileGroup = CreateGroupBox(tab, "词库与参数", 440, 52, 420, 262);
+        profileGroup.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right;
+        var lblPage = new Label { Left = 18, Top = 38, Width = 170, Text = "每页候选数" };
+        numPage = new NumericUpDown { Left = 214, Top = 34, Width = 136, Minimum = ConfigDefaults.MinPageSize, Maximum = ConfigDefaults.MaxPageSize, Value = ConfigDefaults.DefaultPageSize };
 
-        tab.Controls.Add(new Label { Left = 420, Top = 56, Width = 170, Text = "\u6bcf\u9875\u5019\u9009\u6570" });
-        numPage = new NumericUpDown { Left = 598, Top = 52, Width = 90, Minimum = ConfigDefaults.MinPageSize, Maximum = ConfigDefaults.MaxPageSize, Value = ConfigDefaults.DefaultPageSize };
-        tab.Controls.Add(numPage);
-
-        tab.Controls.Add(new Label { Left = 420, Top = 92, Width = 170, Text = "\u4e2d\u82f1\u5207\u6362\u70ed\u952e" });
-        cmbHotkey = new ComboBox { Left = 598, Top = 88, Width = 150, DropDownStyle = ComboBoxStyle.DropDownList };
+        var lblHotkey = new Label { Left = 18, Top = 76, Width = 170, Text = "中英切换热键" };
+        cmbHotkey = new ComboBox { Left = 214, Top = 72, Width = 136, DropDownStyle = ComboBoxStyle.DropDownList };
         cmbHotkey.Items.Add("F9");
         cmbHotkey.Items.Add("F8");
         cmbHotkey.Items.Add("Ctrl+Space");
         cmbHotkey.SelectedIndex = 0;
-        tab.Controls.Add(cmbHotkey);
 
-        tab.Controls.Add(new Label { Left = 420, Top = 124, Width = 170, Text = "\u7801\u8868\u6a21\u5f0f" });
-        cmbDictionaryProfile = new ComboBox { Left = 598, Top = 120, Width = 170, DropDownStyle = ComboBoxStyle.DropDownList };
+        var lblProfile = new Label { Left = 18, Top = 114, Width = 170, Text = "码表模式" };
+        cmbDictionaryProfile = new ComboBox { Left = 214, Top = 110, Width = 170, DropDownStyle = ComboBoxStyle.DropDownList };
         cmbDictionaryProfile.Items.Add("zhengma-all");
         cmbDictionaryProfile.Items.Add("zhengma-large-pinyin");
         cmbDictionaryProfile.SelectedItem = ConfigDefaults.DefaultDictionaryProfile;
-        tab.Controls.Add(cmbDictionaryProfile);
 
-        tab.Controls.Add(new Label { Left = 420, Top = 156, Width = 170, Text = "\u81ea\u52a8\u9876\u5c4f\u6700\u77ed\u7801\u957f" });
+        var lblAutoCommitMin = new Label { Left = 18, Top = 152, Width = 170, Text = "自动顶屏最短码长" };
         numAutoCommitMinCodeLength = new NumericUpDown
         {
-            Left = 598,
-            Top = 152,
-            Width = 90,
+            Left = 214,
+            Top = 148,
+            Width = 136,
             Minimum = ConfigDefaults.MinAutoCommitCodeLength,
             Maximum = ConfigDefaults.MaxAutoCommitCodeLength,
             Value = ConfigDefaults.DefaultAutoCommitCodeLength
         };
-        tab.Controls.Add(numAutoCommitMinCodeLength);
 
-        tab.Controls.Add(new Label { Left = 420, Top = 192, Width = 170, Text = "\u4e0a\u4e0b\u6587\u5173\u8054\u6700\u5927\u6761\u76ee" });
+        var lblAssocMax = new Label { Left = 18, Top = 190, Width = 170, Text = "上下文关联最大条目" };
         numContextAssociationMaxEntries = new NumericUpDown
         {
-            Left = 598,
-            Top = 188,
-            Width = 110,
+            Left = 214,
+            Top = 186,
+            Width = 136,
             Minimum = ConfigDefaults.MinContextAssociationMaxEntries,
             Maximum = ConfigDefaults.MaxContextAssociationMaxEntries,
             Value = ConfigDefaults.DefaultContextAssociationMaxEntries,
             Increment = 500
         };
-        tab.Controls.Add(numContextAssociationMaxEntries);
+        profileGroup.Controls.Add(lblPage);
+        profileGroup.Controls.Add(numPage);
+        profileGroup.Controls.Add(lblHotkey);
+        profileGroup.Controls.Add(cmbHotkey);
+        profileGroup.Controls.Add(lblProfile);
+        profileGroup.Controls.Add(cmbDictionaryProfile);
+        profileGroup.Controls.Add(lblAutoCommitMin);
+        profileGroup.Controls.Add(numAutoCommitMinCodeLength);
+        profileGroup.Controls.Add(lblAssocMax);
+        profileGroup.Controls.Add(numContextAssociationMaxEntries);
 
         var btnOpenAutoPhraseFromGeneral = new Button
         {
-            Left = 420,
-            Top = 232,
-            Width = 300,
+            Left = 18,
+            Top = 216,
+            Width = 170,
             Height = 30,
-            Text = "\u7ba1\u7406\u81ea\u9020\u8bcd\uff08yuninput_user.dict\uff09"
+            Text = "管理用户词典"
         };
         btnOpenAutoPhraseFromGeneral.Click += (s, e) => OpenAutoPhraseManagerDialog();
-        tab.Controls.Add(btnOpenAutoPhraseFromGeneral);
 
         var btnOpenPhraseReviewFromGeneral = new Button
         {
-            Left = 420,
-            Top = 268,
-            Width = 300,
+            Left = 198,
+            Top = 216,
+            Width = 186,
             Height = 30,
-            Text = "\u6253\u5f00\u9020\u8bcd\u96c6\u4e2d\u5ba1\u9605\u9762\u677f"
+            Text = "打开造词审阅日志"
         };
         btnOpenPhraseReviewFromGeneral.Click += (s, e) => OpenPhraseReviewDialog();
-        tab.Controls.Add(btnOpenPhraseReviewFromGeneral);
+        profileGroup.Controls.Add(btnOpenAutoPhraseFromGeneral);
+        profileGroup.Controls.Add(btnOpenPhraseReviewFromGeneral);
 
-        tab.Controls.Add(new Label
+        var strategyGroup = CreateGroupBox(tab, "当前策略说明", 20, 328, 840, 148);
+        strategyGroup.Anchor = AnchorStyles.Left | AnchorStyles.Right | AnchorStyles.Bottom;
+        var txtStrategy = new TextBox
         {
-            Left = 24,
-            Top = 348,
-            Width = 720,
-            Height = 128,
-            Text = "\u7b56\u7565\u8bf4\u660e:\r\n- \u6807\u70b9\u6620\u5c04\u63a7\u5236 , . / ; : ! ? \u4e0e\u5f15\u53f7\u3001\u4e66\u540d\u53f7\u7684\u8f93\u51fa\r\n- \u552f\u4e00\u7cbe\u786e\u5019\u9009\u81ea\u52a8\u9876\u5c4f\u53ef\u964d\u4f4e\u8fde\u7eed\u8f93\u5165\u6309\u952e\u6210\u672c\r\n- \u56de\u8f66\u7b56\u7565\u53ef\u9009\uff1a\u4f18\u5148\u7cbe\u786e\u5019\u9009\u6216\u4f7f\u7528\u5f53\u524d\u9ad8\u4eae\u5019\u9009\r\n- Ctrl+1-9 \u53ef\u7f6e\u9876\u5019\u9009\uff0cCtrl+Delete \u53ef\u5c4f\u853d\u5f53\u524d\u5019\u9009"
-        });
+            Left = 16,
+            Top = 28,
+            Width = 808,
+            Height = 102,
+            Multiline = true,
+            ReadOnly = true,
+            BorderStyle = BorderStyle.None,
+            BackColor = Color.White,
+            Text = "1. 标点映射覆盖常用中英文符号、引号、书名号，连续录入时不需要再额外切换半角全角。\r\n2. 唯一精确候选支持按最短码长自动顶屏，目标是在快速拆字时减少一次确认动作。\r\n3. 回车策略可在 精确候选优先 与 当前高亮优先 之间切换，兼顾严谨录入和连续上屏两种习惯。\r\n4. 上下文学习会记录前后字搭配，帮助下一拍排序更贴近日常词序；用户可随时导出、裁剪、拉黑或重建。\r\n5. 用户词典同时承载手工置顶、自动造词和屏蔽词，主程序会延迟合并写回，尽量避开连续输入时段。"
+        };
+        txtStrategy.Anchor = AnchorStyles.Top | AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right;
+        strategyGroup.Controls.Add(txtStrategy);
     }
 
     private void BuildDataTab(TabPage tab)
     {
-        var grpPinned = new GroupBox { Left = 18, Top = 18, Width = 370, Height = 400, Text = "\u5df2\u7f6e\u9876\u8bcd\u6761" };
-        var grpBlocked = new GroupBox { Left = 402, Top = 18, Width = 370, Height = 400, Text = "\u5df2\u5c4f\u853d\u8bcd\u6761" };
-        tab.Controls.Add(grpPinned);
-        tab.Controls.Add(grpBlocked);
+        tab.BackColor = PanelBackColor;
+        var hint = new Label { Left = 20, Top = 18, Width = 840, Height = 24, Text = "这里管理用户词典中的置顶词、自动造词和屏蔽词。列表按列展示，方便直接比对编码和词条。" };
+        hint.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right;
+        tab.Controls.Add(hint);
 
-        lstPinned = new ListBox { Left = 14, Top = 26, Width = 340, Height = 296 };
-        lstBlocked = new ListBox { Left = 14, Top = 26, Width = 340, Height = 296 };
+        var grpPinned = CreateGroupBox(tab, "已置顶词条", 20, 52, 410, 422);
+        var grpBlocked = CreateGroupBox(tab, "已屏蔽词条", 450, 52, 410, 422);
+        grpPinned.Anchor = AnchorStyles.Top | AnchorStyles.Bottom | AnchorStyles.Left;
+        grpBlocked.Anchor = AnchorStyles.Top | AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right;
+
+        lstPinned = CreateStyledListBox(14, 28, 382, 304);
+        lstBlocked = CreateStyledListBox(14, 28, 382, 304);
+        lstPinned.Anchor = AnchorStyles.Top | AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right;
+        lstBlocked.Anchor = AnchorStyles.Top | AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right;
         grpPinned.Controls.Add(lstPinned);
         grpBlocked.Controls.Add(lstBlocked);
 
-        var btnRemovePinned = new Button { Left = 14, Top = 334, Width = 120, Text = "\u79fb\u9664\u7f6e\u9876" };
-        var btnRefreshPinned = new Button { Left = 144, Top = 334, Width = 88, Text = "\u5237\u65b0" };
-        var btnUnblock = new Button { Left = 14, Top = 334, Width = 120, Text = "\u53d6\u6d88\u5c4f\u853d" };
-        var btnRefreshBlocked = new Button { Left = 144, Top = 334, Width = 88, Text = "\u5237\u65b0" };
+        var btnRemovePinned = new Button { Left = 14, Top = 346, Width = 120, Text = "移除置顶" };
+        var btnRefreshPinned = new Button { Left = 144, Top = 346, Width = 88, Text = "刷新" };
+        var btnUnblock = new Button { Left = 14, Top = 346, Width = 120, Text = "取消屏蔽" };
+        var btnRefreshBlocked = new Button { Left = 144, Top = 346, Width = 88, Text = "刷新" };
         grpPinned.Controls.Add(btnRemovePinned);
         grpPinned.Controls.Add(btnRefreshPinned);
         grpBlocked.Controls.Add(btnUnblock);
         grpBlocked.Controls.Add(btnRefreshBlocked);
 
-        lblPinnedPath = new Label { Left = 14, Top = 366, Width = 340, Height = 26 };
-        lblBlockedPath = new Label { Left = 14, Top = 366, Width = 340, Height = 26 };
+        lblPinnedPath = new Label { Left = 14, Top = 382, Width = 382, Height = 32, ForeColor = Color.FromArgb(97, 103, 112), Anchor = AnchorStyles.Left | AnchorStyles.Right | AnchorStyles.Bottom };
+        lblBlockedPath = new Label { Left = 14, Top = 382, Width = 382, Height = 32, ForeColor = Color.FromArgb(97, 103, 112), Anchor = AnchorStyles.Left | AnchorStyles.Right | AnchorStyles.Bottom };
         grpPinned.Controls.Add(lblPinnedPath);
         grpBlocked.Controls.Add(lblBlockedPath);
 
@@ -303,9 +623,10 @@ public class ConfigForm : Form
         btnUnblock.Click += (s, e) => RemoveBlockedSelected();
         btnRefreshBlocked.Click += (s, e) => RefreshDataLists();
 
-        var btnManageAutoPhrase = new Button { Left = 20, Top = 458, Width = 180, Text = "\u7ba1\u7406\u81ea\u542f\u9020\u8bcd\uff08\u81ea\u52a8\u9020\u8bcd\uff09" };
-        var btnOpenAutoPhraseFolder = new Button { Left = 208, Top = 458, Width = 164, Text = "\u6253\u5f00\u7528\u6237\u8bcd\u5178\u76ee\u5f55" };
-        var btnOpenPhraseReview = new Button { Left = 380, Top = 458, Width = 130, Text = "\u9020\u8bcd\u96c6\u4e2d\u5ba1\u9605" };
+        var btnManageAutoPhrase = new Button { Left = 20, Top = 490, Width = 168, Height = 32, Text = "管理用户词典", Anchor = AnchorStyles.Left | AnchorStyles.Bottom };
+        var btnOpenAutoPhraseFolder = new Button { Left = 198, Top = 490, Width = 168, Height = 32, Text = "打开用户词典目录" };
+        btnOpenAutoPhraseFolder.Anchor = AnchorStyles.Left | AnchorStyles.Bottom;
+        var btnOpenPhraseReview = new Button { Left = 376, Top = 490, Width = 156, Height = 32, Text = "打开造词审阅日志", Anchor = AnchorStyles.Left | AnchorStyles.Bottom };
         btnManageAutoPhrase.Click += (s, e) => OpenAutoPhraseManagerDialog();
         btnOpenAutoPhraseFolder.Click += (s, e) =>
         {
@@ -320,19 +641,22 @@ public class ConfigForm : Form
         tab.Controls.Add(new Label
         {
             Left = 20,
-            Top = 432,
-            Width = 740,
+            Top = 532,
+            Width = 840,
             Height = 24,
-            Text = "\u8fd9\u91cc\u53ea\u7ba1\u7406 yuninput_user.dict \u91cc\u7684\u7528\u6237\u8bcd\u6761\uff1a\u624b\u5de5\u7f6e\u9876\u8bcd\u3001\u81ea\u52a8\u9020\u8bcd\u548c\u5c4f\u853d\u8bcd\u3002\u914d\u7f6e\u5de5\u5177\u4e0d\u5bf9\u7cfb\u7edf\u8bcd\u5e93 zhengma-all.dict \u6216 yuninput_user-extend.dict \u63d0\u4f9b\u589e\u5220\u6539\u67e5\u3002"
+            Anchor = AnchorStyles.Left | AnchorStyles.Right | AnchorStyles.Bottom,
+            Text = "这里只管理 yuninput_user.dict 相关的用户词条：手工置顶、自动造词和屏蔽词。系统词库本身不在此处直接编辑。"
         });
 
         tab.Controls.Add(new Label
         {
-            Left = 450,
-            Top = 462,
-            Width = 320,
-            Height = 20,
-            Text = "\u7528\u6237\u8bcd\u5178\u6587\u4ef6: " + userDictPath
+            Left = 548,
+            Top = 496,
+            Width = 312,
+            Height = 36,
+            Anchor = AnchorStyles.Right | AnchorStyles.Bottom,
+            ForeColor = Color.FromArgb(97, 103, 112),
+            Text = "用户词典文件: " + userDictPath + "\r\n自动造词文件: " + autoPhraseDictPath
         });
     }
 
@@ -359,95 +683,122 @@ public class ConfigForm : Form
 
     private string ResolveAutoPhrasePath()
     {
-        return userDictPath;
+        return autoPhraseDictPath;
     }
 
     private void OpenAutoPhraseManagerDialog()
     {
-        string path = ResolveAutoPhrasePath();
-        string directory = Path.GetDirectoryName(path);
-        if (!string.IsNullOrEmpty(directory))
+        string autoPath = ResolveAutoPhrasePath();
+        Directory.CreateDirectory(Path.GetDirectoryName(userDictPath));
+        Directory.CreateDirectory(Path.GetDirectoryName(autoPath));
+        if (!File.Exists(userDictPath))
         {
-            Directory.CreateDirectory(directory);
+            File.WriteAllText(userDictPath, string.Empty, Encoding.UTF8);
+        }
+        if (!File.Exists(autoPath))
+        {
+            File.WriteAllText(autoPath, string.Empty, Encoding.UTF8);
         }
 
-        if (!File.Exists(path))
-        {
-            var initLines = new[]
-            {
-                "# yuninput_user.dict",
-                "# format: code phrase [optional_score] [optional_source_tag:auto]",
-                "# delete unwanted lines and save"
-            };
-            File.WriteAllLines(path, initLines, Encoding.UTF8);
-        }
+        var workingEntries = ReadManagedDictionaryItems();
+        bool dirty = false;
 
         var dialog = new Form
         {
-            Text = "自造词管理（yuninput_user.dict）",
-            Width = 760,
-            Height = 560,
+            Text = "管理用户词典",
+            ClientSize = new Size(880, 640),
+            MinimumSize = new Size(860, 620),
             StartPosition = FormStartPosition.CenterParent,
-            MinimizeBox = false,
-            MaximizeBox = false
+            BackColor = PanelBackColor,
+            Font = Font
+        };
+        EnableEscapeClose(dialog);
+
+        var lblFilter = new Label { Left = 18, Top = 18, Width = 40, Height = 24, Text = "查询:" };
+        var txtFilter = new TextBox { Left = 62, Top = 14, Width = 286, Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right };
+        var lblSource = new Label { Left = 360, Top = 18, Width = 52, Height = 24, Text = "类型:" };
+        var cmbSource = new ComboBox { Left = 414, Top = 14, Width = 134, DropDownStyle = ComboBoxStyle.DropDownList, Anchor = AnchorStyles.Top | AnchorStyles.Right };
+        cmbSource.Items.Add("全部词条");
+        cmbSource.Items.Add("仅手工词条");
+        cmbSource.Items.Add("仅自动造词");
+        cmbSource.SelectedIndex = 0;
+        var btnReload = new Button { Left = 562, Top = 12, Width = 78, Height = 30, Text = "重载", Anchor = AnchorStyles.Top | AnchorStyles.Right };
+        var btnSave = new Button { Left = 646, Top = 12, Width = 90, Height = 30, Text = "保存", Anchor = AnchorStyles.Top | AnchorStyles.Right };
+        var btnClose = new Button { Left = 742, Top = 12, Width = 120, Height = 30, Text = "关闭", Anchor = AnchorStyles.Top | AnchorStyles.Right, DialogResult = DialogResult.Cancel };
+
+        var lstEntries = CreateStyledListBox(18, 54, 844, 378);
+        lstEntries.Anchor = AnchorStyles.Top | AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right;
+        lstEntries.SelectionMode = SelectionMode.MultiExtended;
+
+        var editorGroup = new GroupBox
+        {
+            Left = 18,
+            Top = 444,
+            Width = 844,
+            Height = 144,
+            Text = "编辑词条",
+            BackColor = Color.White,
+            ForeColor = AccentColor,
+            Anchor = AnchorStyles.Left | AnchorStyles.Right | AnchorStyles.Bottom
         };
 
-        var lblFilter = new Label { Left = 16, Top = 18, Width = 58, Height = 22, Text = "查询:" };
-        var txtFilter = new TextBox { Left = 72, Top = 14, Width = 488 };
-        var btnRefresh = new Button { Left = 568, Top = 12, Width = 80, Text = "刷新" };
-        var btnOpenFile = new Button { Left = 654, Top = 12, Width = 88, Text = "打开文件" };
-        var lstAuto = new ListBox { Left = 16, Top = 44, Width = 726, Height = 338, SelectionMode = SelectionMode.MultiExtended };
+        var lblCode = new Label { Left = 18, Top = 34, Width = 44, Height = 24, Text = "编码:" };
+        var txtCode = new TextBox { Left = 66, Top = 30, Width = 186 };
+        var lblText = new Label { Left = 270, Top = 34, Width = 44, Height = 24, Text = "词条:" };
+        var txtText = new TextBox { Left = 318, Top = 30, Width = 186 };
+        var lblType = new Label { Left = 522, Top = 34, Width = 44, Height = 24, Text = "类型:" };
+        var cmbEntryType = new ComboBox { Left = 570, Top = 30, Width = 136, DropDownStyle = ComboBoxStyle.DropDownList };
+        cmbEntryType.Items.Add("手工用户词条");
+        cmbEntryType.Items.Add("自动造词");
+        cmbEntryType.SelectedIndex = 0;
+        var lblScore = new Label { Left = 724, Top = 34, Width = 44, Height = 24, Text = "分值:" };
+        var numScore = new NumericUpDown { Left = 772, Top = 30, Width = 54, Minimum = 1, Maximum = 9999, Value = 1 };
 
-        var lblCode = new Label { Left = 16, Top = 392, Width = 58, Height = 22, Text = "编码:" };
-        var txtCode = new TextBox { Left = 72, Top = 388, Width = 224 };
-        var lblText = new Label { Left = 312, Top = 392, Width = 58, Height = 22, Text = "词条:" };
-        var txtText = new TextBox { Left = 364, Top = 388, Width = 222 };
+        var btnAdd = new Button { Left = 18, Top = 82, Width = 92, Height = 30, Text = "新增" };
+        var btnUpdate = new Button { Left = 118, Top = 82, Width = 92, Height = 30, Text = "修改" };
+        var btnDelete = new Button { Left = 218, Top = 82, Width = 92, Height = 30, Text = "删除选中" };
+        var btnOpenManual = new Button { Left = 470, Top = 82, Width = 140, Height = 30, Text = "打开手工词典" };
+        var btnOpenAuto = new Button { Left = 618, Top = 82, Width = 140, Height = 30, Text = "打开自动造词文件" };
+        var btnOpenFolder = new Button { Left = 766, Top = 82, Width = 60, Height = 30, Text = "目录" };
+        var lblStatus = new Label { Left = 18, Top = 116, Width = 808, Height = 22, ForeColor = Color.FromArgb(97, 103, 112) };
 
-        var btnAdd = new Button { Left = 16, Top = 424, Width = 104, Text = "新增" };
-        var btnUpdate = new Button { Left = 126, Top = 424, Width = 104, Text = "修改" };
-        var btnDelete = new Button { Left = 236, Top = 424, Width = 104, Text = "删除" };
-        var btnClose = new Button { Left = 638, Top = 486, Width = 104, Text = "关闭" };
+        editorGroup.Controls.Add(lblCode);
+        editorGroup.Controls.Add(txtCode);
+        editorGroup.Controls.Add(lblText);
+        editorGroup.Controls.Add(txtText);
+        editorGroup.Controls.Add(lblType);
+        editorGroup.Controls.Add(cmbEntryType);
+        editorGroup.Controls.Add(lblScore);
+        editorGroup.Controls.Add(numScore);
+        editorGroup.Controls.Add(btnAdd);
+        editorGroup.Controls.Add(btnUpdate);
+        editorGroup.Controls.Add(btnDelete);
+        editorGroup.Controls.Add(btnOpenManual);
+        editorGroup.Controls.Add(btnOpenAuto);
+        editorGroup.Controls.Add(btnOpenFolder);
+        editorGroup.Controls.Add(lblStatus);
 
-        var lblPath = new Label { Left = 16, Top = 458, Width = 726, Height = 22, Text = "文件: " + path };
+        var lblPaths = new Label
+        {
+            Left = 18,
+            Top = 596,
+            Width = 844,
+            Height = 36,
+            ForeColor = Color.FromArgb(97, 103, 112),
+            Anchor = AnchorStyles.Left | AnchorStyles.Right | AnchorStyles.Bottom,
+            Text = "手工词典: " + userDictPath + "\r\n自动造词: " + autoPath
+        };
 
         dialog.Controls.Add(lblFilter);
         dialog.Controls.Add(txtFilter);
-        dialog.Controls.Add(btnRefresh);
-        dialog.Controls.Add(btnOpenFile);
-        dialog.Controls.Add(lstAuto);
-        dialog.Controls.Add(lblCode);
-        dialog.Controls.Add(txtCode);
-        dialog.Controls.Add(lblText);
-        dialog.Controls.Add(txtText);
-        dialog.Controls.Add(btnAdd);
-        dialog.Controls.Add(btnUpdate);
-        dialog.Controls.Add(btnDelete);
-        dialog.Controls.Add(lblPath);
+        dialog.Controls.Add(lblSource);
+        dialog.Controls.Add(cmbSource);
+        dialog.Controls.Add(btnReload);
+        dialog.Controls.Add(btnSave);
         dialog.Controls.Add(btnClose);
-
-        Action refresh = () =>
-        {
-            string keyword = (txtFilter.Text ?? string.Empty).Trim();
-            lstAuto.BeginUpdate();
-            lstAuto.Items.Clear();
-            foreach (CandidateEntryItem item in ReadEntryFile(path))
-            {
-                if (!item.IsAutoPhrase)
-                {
-                    continue;
-                }
-
-                if (!string.IsNullOrEmpty(keyword) &&
-                    item.Code.IndexOf(keyword, StringComparison.OrdinalIgnoreCase) < 0 &&
-                    item.Text.IndexOf(keyword, StringComparison.OrdinalIgnoreCase) < 0)
-                {
-                    continue;
-                }
-
-                lstAuto.Items.Add(item);
-            }
-            lstAuto.EndUpdate();
-        };
+        dialog.Controls.Add(lstEntries);
+        dialog.Controls.Add(editorGroup);
+        dialog.Controls.Add(lblPaths);
 
         Func<string, string, bool> validateInput = (code, text) =>
         {
@@ -466,16 +817,74 @@ public class ConfigForm : Form
             return true;
         };
 
-        lstAuto.SelectedIndexChanged += (s, e) =>
+        Action refresh = () =>
         {
-            if (lstAuto.SelectedItems.Count != 1)
+            string keyword = (txtFilter.Text ?? string.Empty).Trim();
+            lstEntries.BeginUpdate();
+            lstEntries.Items.Clear();
+            int manualCount = 0;
+            int autoCount = 0;
+
+            foreach (CandidateEntryItem item in workingEntries)
+            {
+                if (item.IsAutoPhrase)
+                {
+                    autoCount++;
+                }
+                else
+                {
+                    manualCount++;
+                }
+
+                if (cmbSource.SelectedIndex == 1 && item.IsAutoPhrase)
+                {
+                    continue;
+                }
+                if (cmbSource.SelectedIndex == 2 && !item.IsAutoPhrase)
+                {
+                    continue;
+                }
+                if (!string.IsNullOrEmpty(keyword) &&
+                    item.Code.IndexOf(keyword, StringComparison.OrdinalIgnoreCase) < 0 &&
+                    item.Text.IndexOf(keyword, StringComparison.OrdinalIgnoreCase) < 0)
+                {
+                    continue;
+                }
+
+                lstEntries.Items.Add(item);
+            }
+
+            lstEntries.EndUpdate();
+            lblStatus.Text = "当前共 " + workingEntries.Count + " 条，其中手工词条 " + manualCount + " 条，自动造词 " + autoCount + " 条" + (dirty ? "，有未保存修改" : string.Empty);
+        };
+
+        Action reload = () =>
+        {
+            workingEntries = ReadManagedDictionaryItems();
+            dirty = false;
+            refresh();
+        };
+
+        Action save = () =>
+        {
+            WriteManagedDictionaryItems(workingEntries);
+            dirty = false;
+            RefreshDataLists();
+            refresh();
+        };
+
+        lstEntries.SelectedIndexChanged += (s, e) =>
+        {
+            if (lstEntries.SelectedItems.Count != 1)
             {
                 txtCode.Text = string.Empty;
                 txtText.Text = string.Empty;
+                cmbEntryType.SelectedIndex = 0;
+                numScore.Value = 1;
                 return;
             }
 
-            CandidateEntryItem item = lstAuto.SelectedItem as CandidateEntryItem;
+            CandidateEntryItem item = lstEntries.SelectedItem as CandidateEntryItem;
             if (item == null)
             {
                 return;
@@ -483,6 +892,8 @@ public class ConfigForm : Form
 
             txtCode.Text = item.Code;
             txtText.Text = item.Text;
+            cmbEntryType.SelectedIndex = item.IsAutoPhrase ? 1 : 0;
+            numScore.Value = item.Score > 0 ? item.Score : 1;
         };
 
         btnAdd.Click += (s, e) =>
@@ -494,80 +905,84 @@ public class ConfigForm : Form
                 return;
             }
 
-            bool exists = false;
-            foreach (CandidateEntryItem item in ReadEntryFile(path))
+            bool isAuto = cmbEntryType.SelectedIndex == 1;
+            foreach (CandidateEntryItem item in workingEntries)
             {
                 if (string.Equals(item.Code, code, StringComparison.OrdinalIgnoreCase) && string.Equals(item.Text, text, StringComparison.Ordinal))
                 {
-                    exists = true;
-                    break;
+                    item.IsAutoPhrase = isAuto;
+                    item.Score = (int)numScore.Value;
+                    dirty = true;
+                    refresh();
+                    return;
                 }
             }
 
-            if (!exists)
+            workingEntries.Add(new CandidateEntryItem
             {
-                File.AppendAllText(path, code + " " + text + " 1 auto" + Environment.NewLine, Encoding.UTF8);
-            }
+                Code = code,
+                Text = text,
+                IsAutoPhrase = isAuto,
+                Score = (int)numScore.Value,
+                RawLine = string.Empty
+            });
+            workingEntries.Sort((left, right) =>
+            {
+                if (left.IsAutoPhrase != right.IsAutoPhrase)
+                {
+                    return left.IsAutoPhrase ? 1 : -1;
+                }
 
+                int codeComparison = string.Compare(left.Code, right.Code, StringComparison.OrdinalIgnoreCase);
+                if (codeComparison != 0)
+                {
+                    return codeComparison;
+                }
+
+                return string.Compare(left.Text, right.Text, StringComparison.Ordinal);
+            });
+            dirty = true;
             refresh();
         };
 
         btnUpdate.Click += (s, e) =>
         {
-            if (lstAuto.SelectedItems.Count != 1)
+            if (lstEntries.SelectedItems.Count != 1)
             {
                 MessageBox.Show("请先单选一条要修改的词条", "匀码输入法", MessageBoxButtons.OK, MessageBoxIcon.Information);
                 return;
             }
 
-            CandidateEntryItem selected = lstAuto.SelectedItem as CandidateEntryItem;
+            CandidateEntryItem selected = lstEntries.SelectedItem as CandidateEntryItem;
             if (selected == null)
             {
-                MessageBox.Show("请先选择要修改的词条", "匀码输入法", MessageBoxButtons.OK, MessageBoxIcon.Information);
                 return;
             }
 
-            string newCode = (txtCode.Text ?? string.Empty).Trim().ToLowerInvariant();
-            string newText = (txtText.Text ?? string.Empty).Trim();
-            if (!validateInput(newCode, newText))
+            string code = (txtCode.Text ?? string.Empty).Trim().ToLowerInvariant();
+            string text = (txtText.Text ?? string.Empty).Trim();
+            if (!validateInput(code, text))
             {
                 return;
             }
 
-            string newLine = newCode + " " + newText + " 1 auto";
-            var lines = new List<string>();
-            bool replaced = false;
-            foreach (string line in File.ReadAllLines(path, Encoding.UTF8))
-            {
-                if (!replaced)
-                {
-                    string[] parts = line.Trim().Split(new[] { ' ', '\t' }, StringSplitOptions.RemoveEmptyEntries);
-                    if (parts.Length >= 2 &&
-                        string.Equals(parts[0], selected.Code, StringComparison.OrdinalIgnoreCase) &&
-                        string.Equals(parts[1], selected.Text, StringComparison.Ordinal))
-                    {
-                        lines.Add(newLine);
-                        replaced = true;
-                        continue;
-                    }
-                }
-
-                lines.Add(line);
-            }
-
-            if (!replaced)
-            {
-                lines.Add(newLine);
-            }
-
-            File.WriteAllLines(path, lines.ToArray(), Encoding.UTF8);
+            selected.Code = code;
+            selected.Text = text;
+            selected.IsAutoPhrase = cmbEntryType.SelectedIndex == 1;
+            selected.Score = (int)numScore.Value;
+            dirty = true;
             refresh();
         };
 
         btnDelete.Click += (s, e) =>
         {
+            if (lstEntries.SelectedItems.Count == 0)
+            {
+                return;
+            }
+
             var selectedItems = new List<CandidateEntryItem>();
-            foreach (object selectedItem in lstAuto.SelectedItems)
+            foreach (object selectedItem in lstEntries.SelectedItems)
             {
                 CandidateEntryItem item = selectedItem as CandidateEntryItem;
                 if (item != null)
@@ -576,19 +991,43 @@ public class ConfigForm : Form
                 }
             }
 
-            if (selectedItems.Count == 0)
+            foreach (CandidateEntryItem item in selectedItems)
             {
-                return;
+                workingEntries.Remove(item);
             }
 
-            RemoveEntryItemsFromFile(path, selectedItems);
+            dirty = true;
             refresh();
         };
 
         txtFilter.TextChanged += (s, e) => refresh();
-        btnRefresh.Click += (s, e) => refresh();
-        btnOpenFile.Click += (s, e) => Process.Start(new ProcessStartInfo { FileName = "notepad.exe", Arguments = "\"" + path + "\"", UseShellExecute = true });
+        cmbSource.SelectedIndexChanged += (s, e) => refresh();
+        btnReload.Click += (s, e) => reload();
+        btnSave.Click += (s, e) => save();
+        btnOpenManual.Click += (s, e) => Process.Start(new ProcessStartInfo { FileName = "notepad.exe", Arguments = "\"" + userDictPath + "\"", UseShellExecute = true });
+        btnOpenAuto.Click += (s, e) => Process.Start(new ProcessStartInfo { FileName = "notepad.exe", Arguments = "\"" + autoPath + "\"", UseShellExecute = true });
+        btnOpenFolder.Click += (s, e) => Process.Start(new ProcessStartInfo { FileName = roamingRoot, UseShellExecute = true });
         btnClose.Click += (s, e) => dialog.Close();
+        dialog.AcceptButton = btnSave;
+        dialog.CancelButton = btnClose;
+        dialog.FormClosing += (s, e) =>
+        {
+            if (!dirty)
+            {
+                return;
+            }
+
+            DialogResult result = MessageBox.Show("当前有未保存的用户词典修改，是否先保存？", "匀码输入法", MessageBoxButtons.YesNoCancel, MessageBoxIcon.Question);
+            if (result == DialogResult.Cancel)
+            {
+                e.Cancel = true;
+                return;
+            }
+            if (result == DialogResult.Yes)
+            {
+                save();
+            }
+        };
 
         refresh();
         dialog.ShowDialog(this);
@@ -708,65 +1147,63 @@ public class ConfigForm : Form
 
         var dialog = new Form
         {
-            Text = "\u9020\u8bcd\u5ba1\u9605\u9762\u677f",
-            Width = 920,
-            Height = 560,
+            Text = "造词审阅日志",
+            ClientSize = new Size(980, 620),
+            MinimumSize = new Size(940, 600),
             StartPosition = FormStartPosition.CenterParent,
-            MinimizeBox = false,
-            MaximizeBox = false
+            BackColor = PanelBackColor,
+            Font = Font
         };
+        EnableEscapeClose(dialog);
 
-        var grpAuto = new GroupBox { Left = 14, Top = 12, Width = 430, Height = 458, Text = "\u81ea\u52a8\u9020\u8bcd\uff08\u5b58\u4e8e yuninput_user.dict\uff09" };
-        var grpManual = new GroupBox { Left = 456, Top = 12, Width = 430, Height = 458, Text = "\u624b\u5de5\u9020\u8bcd\u65e5\u5fd7\uff08manual_phrase_review.txt\uff09" };
+        var grpAuto = new GroupBox { Left = 16, Top = 16, Width = 456, Height = 520, Text = "自动造词快照（只读）", BackColor = Color.White, ForeColor = AccentColor, Anchor = AnchorStyles.Top | AnchorStyles.Bottom | AnchorStyles.Left };
+        var grpManual = new GroupBox { Left = 488, Top = 16, Width = 476, Height = 520, Text = "手工造词日志（manual_phrase_review.txt）", BackColor = Color.White, ForeColor = AccentColor, Anchor = AnchorStyles.Top | AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right };
         dialog.Controls.Add(grpAuto);
         dialog.Controls.Add(grpManual);
 
-        var lstAuto = new ListBox { Left = 12, Top = 24, Width = 404, Height = 300, SelectionMode = SelectionMode.MultiExtended };
-        var lstManual = new ListBox { Left = 12, Top = 56, Width = 404, Height = 328, SelectionMode = SelectionMode.MultiExtended };
-        var lblAutoCode = new Label { Left = 12, Top = 332, Width = 36, Height = 22, Text = "\u7801:" };
-        var txtAutoCode = new TextBox { Left = 52, Top = 328, Width = 120 };
-        var lblAutoText = new Label { Left = 180, Top = 332, Width = 36, Height = 22, Text = "\u8bcd:" };
-        var txtAutoText = new TextBox { Left = 220, Top = 328, Width = 126 };
-        var btnAutoAdd = new Button { Left = 352, Top = 327, Width = 64, Text = "\u6dfb\u52a0" };
-        var lblSourceFilter = new Label { Left = 12, Top = 28, Width = 52, Height = 20, Text = "\u6765\u6e90:" };
-        var cmbSourceFilter = new ComboBox { Left = 68, Top = 24, Width = 132, DropDownStyle = ComboBoxStyle.DropDownList };
-        var chkSortNewestFirst = new CheckBox { Left = 214, Top = 26, Width = 198, Text = "\u6309\u65f6\u95f4\u5012\u5e8f\uff08\u6700\u65b0\u5728\u524d\uff09" };
+        var lstAuto = CreateStyledListBox(14, 28, 428, 398);
+        lstAuto.Anchor = AnchorStyles.Top | AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right;
+        var lblSourceFilter = new Label { Left = 14, Top = 30, Width = 44, Height = 22, Text = "来源:" };
+        var cmbSourceFilter = new ComboBox { Left = 62, Top = 26, Width = 136, DropDownStyle = ComboBoxStyle.DropDownList };
+        var chkSortNewestFirst = new CheckBox { Left = 210, Top = 28, Width = 216, Text = "按时间倒序（最新在前）" };
+        var lstManual = CreateStyledListBox(14, 58, 448, 368);
+        lstManual.Anchor = AnchorStyles.Top | AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right;
         cmbSourceFilter.Items.Add("\u5168\u90e8\u6765\u6e90");
         cmbSourceFilter.Items.Add("\u4ec5\u81ea\u52a8\u9020\u8bcd");
         cmbSourceFilter.Items.Add("\u4ec5\u624b\u5de5\u9020\u8bcd");
         cmbSourceFilter.SelectedIndex = 0;
         chkSortNewestFirst.Checked = true;
         grpAuto.Controls.Add(lstAuto);
-        grpAuto.Controls.Add(lblAutoCode);
-        grpAuto.Controls.Add(txtAutoCode);
-        grpAuto.Controls.Add(lblAutoText);
-        grpAuto.Controls.Add(txtAutoText);
-        grpAuto.Controls.Add(btnAutoAdd);
         grpManual.Controls.Add(lblSourceFilter);
         grpManual.Controls.Add(cmbSourceFilter);
         grpManual.Controls.Add(chkSortNewestFirst);
         grpManual.Controls.Add(lstManual);
 
-        var lblAutoPath = new Label { Left = 12, Top = 388, Width = 404, Height = 28, Text = "\u6587\u4ef6: " + autoPhrasePath };
-        var lblManualPath = new Label { Left = 12, Top = 388, Width = 404, Height = 28, Text = "\u6587\u4ef6: " + manualPhraseReviewPath };
+        var lblAutoSummary = new Label { Left = 14, Top = 436, Width = 428, Height = 24, ForeColor = Color.FromArgb(97, 103, 112), Anchor = AnchorStyles.Left | AnchorStyles.Right | AnchorStyles.Bottom };
+        var lblAutoPath = new Label { Left = 14, Top = 462, Width = 428, Height = 40, Text = "文件: " + autoPhrasePath, ForeColor = Color.FromArgb(97, 103, 112), Anchor = AnchorStyles.Left | AnchorStyles.Right | AnchorStyles.Bottom };
+        var lblManualPath = new Label { Left = 14, Top = 436, Width = 448, Height = 40, Text = "文件: " + manualPhraseReviewPath, ForeColor = Color.FromArgb(97, 103, 112), Anchor = AnchorStyles.Left | AnchorStyles.Right | AnchorStyles.Bottom };
+        grpAuto.Controls.Add(lblAutoSummary);
         grpAuto.Controls.Add(lblAutoPath);
         grpManual.Controls.Add(lblManualPath);
 
-        var btnAutoDelete = new Button { Left = 12, Top = 422, Width = 110, Text = "\u5220\u9664\u9009\u4e2d\u81ea\u52a8\u8bcd" };
-        var btnManualDelete = new Button { Left = 12, Top = 422, Width = 110, Text = "\u5220\u9664\u9009\u4e2d\u65e5\u5fd7" };
-        var btnRefresh = new Button { Left = 680, Top = 482, Width = 86, Text = "\u5237\u65b0" };
-        var btnOpenFiles = new Button { Left = 736, Top = 482, Width = 150, Text = "\u6253\u5f00\u7528\u6237\u8bcd\u5178\u4e0e\u65e5\u5fd7" };
-        var btnClose = new Button { Left = 588, Top = 482, Width = 86, Text = "\u5173\u95ed" };
-        grpAuto.Controls.Add(btnAutoDelete);
+        var btnManageDictionary = new Button { Left = 14, Top = 470, Width = 134, Height = 30, Text = "管理用户词典", Anchor = AnchorStyles.Left | AnchorStyles.Bottom };
+        var btnOpenAutoFile = new Button { Left = 156, Top = 470, Width = 134, Height = 30, Text = "打开自动造词文件", Anchor = AnchorStyles.Left | AnchorStyles.Bottom };
+        var btnManualDelete = new Button { Left = 14, Top = 476, Width = 118, Height = 30, Text = "删除选中日志", Anchor = AnchorStyles.Left | AnchorStyles.Bottom };
+        var btnOpenLog = new Button { Left = 140, Top = 476, Width = 120, Height = 30, Text = "打开日志文件", Anchor = AnchorStyles.Left | AnchorStyles.Bottom };
+        var btnRefresh = new Button { Left = 776, Top = 548, Width = 86, Height = 32, Text = "刷新", Anchor = AnchorStyles.Right | AnchorStyles.Bottom };
+        var btnClose = new Button { Left = 878, Top = 548, Width = 86, Height = 32, Text = "关闭", Anchor = AnchorStyles.Right | AnchorStyles.Bottom, DialogResult = DialogResult.Cancel };
+        grpAuto.Controls.Add(btnManageDictionary);
+        grpAuto.Controls.Add(btnOpenAutoFile);
         grpManual.Controls.Add(btnManualDelete);
+        grpManual.Controls.Add(btnOpenLog);
         dialog.Controls.Add(btnRefresh);
-        dialog.Controls.Add(btnOpenFiles);
         dialog.Controls.Add(btnClose);
 
         Action refresh = () =>
         {
             lstAuto.BeginUpdate();
             lstAuto.Items.Clear();
+            int autoCount = 0;
             foreach (CandidateEntryItem item in ReadEntryFile(autoPhrasePath))
             {
                 if (!item.IsAutoPhrase)
@@ -775,8 +1212,10 @@ public class ConfigForm : Form
                 }
 
                 lstAuto.Items.Add(item);
+                autoCount++;
             }
             lstAuto.EndUpdate();
+            lblAutoSummary.Text = "当前自动造词快照共 " + autoCount + " 条。编辑和保存请回到“管理用户词典”。";
 
             lstManual.BeginUpdate();
             lstManual.Items.Clear();
@@ -815,83 +1254,6 @@ public class ConfigForm : Form
             lstManual.EndUpdate();
         };
 
-        btnAutoDelete.Click += (s, e) =>
-        {
-            var selectedItems = new List<CandidateEntryItem>();
-            foreach (object selectedItem in lstAuto.SelectedItems)
-            {
-                CandidateEntryItem item = selectedItem as CandidateEntryItem;
-                if (item != null)
-                {
-                    selectedItems.Add(item);
-                }
-            }
-
-            if (selectedItems.Count == 0)
-            {
-                return;
-            }
-
-            RemoveEntryItemsFromFile(autoPhrasePath, selectedItems);
-            refresh();
-        };
-
-        lstAuto.SelectedIndexChanged += (s, e) =>
-        {
-            if (lstAuto.SelectedItems.Count != 1)
-            {
-                txtAutoCode.Text = string.Empty;
-                txtAutoText.Text = string.Empty;
-                return;
-            }
-
-            CandidateEntryItem item = lstAuto.SelectedItem as CandidateEntryItem;
-            if (item == null)
-            {
-                return;
-            }
-
-            txtAutoCode.Text = item.Code;
-            txtAutoText.Text = item.Text;
-        };
-
-        btnAutoAdd.Click += (s, e) =>
-        {
-            string code = (txtAutoCode.Text ?? string.Empty).Trim().ToLowerInvariant();
-            string text = (txtAutoText.Text ?? string.Empty).Trim();
-            if (string.IsNullOrWhiteSpace(code) || string.IsNullOrWhiteSpace(text))
-            {
-                MessageBox.Show("\u8bf7\u5148\u586b\u5199\u7f16\u7801\u548c\u8bcd\u6761", "\u5300\u7801\u8f93\u5165\u6cd5", MessageBoxButtons.OK, MessageBoxIcon.Information);
-                return;
-            }
-            if (code.IndexOfAny(new[] { ' ', '\t' }) >= 0 || text.IndexOfAny(new[] { ' ', '\t' }) >= 0)
-            {
-                MessageBox.Show("\u7f16\u7801\u548c\u8bcd\u6761\u4e0d\u80fd\u5305\u542b\u7a7a\u767d\u5b57\u7b26", "\u5300\u7801\u8f93\u5165\u6cd5", MessageBoxButtons.OK, MessageBoxIcon.Warning);
-                return;
-            }
-
-            bool exists = false;
-            foreach (CandidateEntryItem item in ReadEntryFile(autoPhrasePath))
-            {
-                if (!item.IsAutoPhrase)
-                {
-                    continue;
-                }
-
-                if (string.Equals(item.Code, code, StringComparison.OrdinalIgnoreCase) && string.Equals(item.Text, text, StringComparison.Ordinal))
-                {
-                    exists = true;
-                    break;
-                }
-            }
-            if (!exists)
-            {
-                File.AppendAllText(autoPhrasePath, code + " " + text + " 1 auto" + Environment.NewLine, Encoding.UTF8);
-            }
-
-            refresh();
-        };
-
         btnManualDelete.Click += (s, e) =>
         {
             var selectedLines = new List<string>();
@@ -916,12 +1278,11 @@ public class ConfigForm : Form
         btnRefresh.Click += (s, e) => refresh();
         cmbSourceFilter.SelectedIndexChanged += (s, e) => refresh();
         chkSortNewestFirst.CheckedChanged += (s, e) => refresh();
-        btnOpenFiles.Click += (s, e) =>
-        {
-            Process.Start(new ProcessStartInfo { FileName = "notepad.exe", Arguments = "\"" + autoPhrasePath + "\"", UseShellExecute = true });
-            Process.Start(new ProcessStartInfo { FileName = "notepad.exe", Arguments = "\"" + manualPhraseReviewPath + "\"", UseShellExecute = true });
-        };
+        btnManageDictionary.Click += (s, e) => OpenAutoPhraseManagerDialog();
+        btnOpenAutoFile.Click += (s, e) => Process.Start(new ProcessStartInfo { FileName = "notepad.exe", Arguments = "\"" + autoPhrasePath + "\"", UseShellExecute = true });
+        btnOpenLog.Click += (s, e) => Process.Start(new ProcessStartInfo { FileName = "notepad.exe", Arguments = "\"" + manualPhraseReviewPath + "\"", UseShellExecute = true });
         btnClose.Click += (s, e) => dialog.Close();
+        dialog.CancelButton = btnClose;
 
         refresh();
         dialog.ShowDialog(this);
@@ -929,25 +1290,32 @@ public class ConfigForm : Form
 
     private void BuildContextTab(TabPage tab)
     {
-        var grpAssoc = new GroupBox { Left = 18, Top = 18, Width = 516, Height = 412, Text = "\u4e0a\u4e0b\u6587\u5173\u8054\u5b66\u4e60\u6761\u76ee" };
-        var grpBlacklist = new GroupBox { Left = 544, Top = 18, Width = 228, Height = 412, Text = "\u4e0a\u4e0b\u6587\u9ed1\u540d\u5355" };
-        tab.Controls.Add(grpAssoc);
-        tab.Controls.Add(grpBlacklist);
+        tab.BackColor = PanelBackColor;
+        var hint = new Label { Left = 20, Top = 18, Width = 840, Height = 24, Text = "上下文学习会影响候选排序。你可以在这里查看高频搭配、导出、裁剪、拉黑或重建。" };
+        hint.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right;
+        tab.Controls.Add(hint);
 
-        lstContextAssoc = new ListBox { Left = 14, Top = 26, Width = 486, Height = 276 };
+        var grpAssoc = CreateGroupBox(tab, "上下文关联学习条目", 20, 52, 560, 434);
+        var grpBlacklist = CreateGroupBox(tab, "上下文黑名单", 600, 52, 260, 434);
+        grpAssoc.Anchor = AnchorStyles.Top | AnchorStyles.Bottom | AnchorStyles.Left;
+        grpBlacklist.Anchor = AnchorStyles.Top | AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right;
+
+        lstContextAssoc = CreateStyledListBox(14, 28, 532, 286);
+        lstContextAssoc.Anchor = AnchorStyles.Top | AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right;
         grpAssoc.Controls.Add(lstContextAssoc);
 
-        lstContextAssocBlacklist = new ListBox { Left = 14, Top = 26, Width = 198, Height = 276 };
+        lstContextAssocBlacklist = CreateStyledListBox(14, 28, 232, 286);
+        lstContextAssocBlacklist.Anchor = AnchorStyles.Top | AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right;
         grpBlacklist.Controls.Add(lstContextAssocBlacklist);
 
-        var btnRefreshAssoc = new Button { Left = 14, Top = 312, Width = 72, Text = "\u5237\u65b0" };
-        var btnClearAssoc = new Button { Left = 92, Top = 312, Width = 72, Text = "\u6e05\u7a7a" };
-        var btnExportAssoc = new Button { Left = 170, Top = 312, Width = 72, Text = "\u5bfc\u51fa" };
-        var btnTrimAssoc = new Button { Left = 248, Top = 312, Width = 90, Text = "\u6309\u5206\u88c1\u526a" };
-        var lblTrim = new Label { Left = 344, Top = 317, Width = 54, Text = "\u6700\u4f4e\u5206" };
-        var numTrimMinScore = new NumericUpDown { Left = 400, Top = 312, Width = 64, Minimum = 1, Maximum = 999999, Value = 2 };
-        var btnBlacklistSelected = new Button { Left = 14, Top = 344, Width = 120, Text = "\u52a0\u5165\u9ed1\u540d\u5355" };
-        var btnRebuildAssoc = new Button { Left = 140, Top = 344, Width = 126, Text = "\u4e00\u952e\u91cd\u5efa\u5173\u8054" };
+        var btnRefreshAssoc = new Button { Left = 14, Top = 326, Width = 72, Text = "刷新" };
+        var btnClearAssoc = new Button { Left = 92, Top = 326, Width = 72, Text = "清空" };
+        var btnExportAssoc = new Button { Left = 170, Top = 326, Width = 72, Text = "导出" };
+        var btnTrimAssoc = new Button { Left = 248, Top = 326, Width = 90, Text = "按分裁剪" };
+        var lblTrim = new Label { Left = 344, Top = 331, Width = 54, Text = "最低分" };
+        var numTrimMinScore = new NumericUpDown { Left = 400, Top = 326, Width = 74, Minimum = 1, Maximum = 999999, Value = 2 };
+        var btnBlacklistSelected = new Button { Left = 14, Top = 362, Width = 120, Text = "加入黑名单" };
+        var btnRebuildAssoc = new Button { Left = 140, Top = 362, Width = 126, Text = "一键重建关联" };
         grpAssoc.Controls.Add(btnRefreshAssoc);
         grpAssoc.Controls.Add(btnClearAssoc);
         grpAssoc.Controls.Add(btnExportAssoc);
@@ -957,13 +1325,13 @@ public class ConfigForm : Form
         grpAssoc.Controls.Add(btnBlacklistSelected);
         grpAssoc.Controls.Add(btnRebuildAssoc);
 
-        var btnRefreshBlacklist = new Button { Left = 14, Top = 312, Width = 72, Text = "\u5237\u65b0" };
-        var btnRemoveBlacklist = new Button { Left = 92, Top = 312, Width = 120, Text = "\u79fb\u51fa\u9ed1\u540d\u5355" };
+        var btnRefreshBlacklist = new Button { Left = 14, Top = 326, Width = 72, Text = "刷新" };
+        var btnRemoveBlacklist = new Button { Left = 92, Top = 326, Width = 120, Text = "移出黑名单" };
         grpBlacklist.Controls.Add(btnRefreshBlacklist);
         grpBlacklist.Controls.Add(btnRemoveBlacklist);
 
-        lblContextAssocPath = new Label { Left = 14, Top = 374, Width = 486, Height = 30 };
-        lblContextAssocBlacklistPath = new Label { Left = 14, Top = 374, Width = 198, Height = 30 };
+        lblContextAssocPath = new Label { Left = 14, Top = 396, Width = 532, Height = 32, ForeColor = Color.FromArgb(97, 103, 112), Anchor = AnchorStyles.Left | AnchorStyles.Right | AnchorStyles.Bottom };
+        lblContextAssocBlacklistPath = new Label { Left = 14, Top = 396, Width = 232, Height = 32, ForeColor = Color.FromArgb(97, 103, 112), Anchor = AnchorStyles.Left | AnchorStyles.Right | AnchorStyles.Bottom };
         grpAssoc.Controls.Add(lblContextAssocPath);
         grpBlacklist.Controls.Add(lblContextAssocBlacklistPath);
 
@@ -1022,10 +1390,11 @@ public class ConfigForm : Form
         tab.Controls.Add(new Label
         {
             Left = 20,
-            Top = 438,
-            Width = 740,
+            Top = 500,
+            Width = 840,
             Height = 24,
-            Text = "\u8bf4\u660e\uff1a\u53ef\u4ece user_dict/user_freq \u4e00\u952e\u91cd\u5efa\u5173\u8054\uff0c\u9ed1\u540d\u5355\u7ec4\u5408\u4e0d\u53c2\u4e0e\u63d0\u6743\u3002"
+            Anchor = AnchorStyles.Left | AnchorStyles.Right | AnchorStyles.Bottom,
+            Text = "说明：可从 user_dict 与 user_freq 一键重建关联；黑名单中的前后字组合不会再参与提权。"
         });
     }
 
@@ -1199,11 +1568,28 @@ public class ConfigForm : Form
                 Code = parts[0],
                 Text = parts[1],
                 RawLine = line,
-                IsAutoPhrase = HasAutoPhraseTag(parts)
+                IsAutoPhrase = HasAutoPhraseTag(parts),
+                Score = ParseEntryScore(parts)
             });
         }
 
         return result;
+    }
+
+    private static int ParseEntryScore(string[] parts)
+    {
+        if (parts == null || parts.Length < 3)
+        {
+            return 1;
+        }
+
+        int parsed;
+        if (int.TryParse(parts[2], out parsed) && parsed > 0)
+        {
+            return parsed;
+        }
+
+        return 1;
     }
 
     private static bool HasAutoPhraseTag(string[] parts)

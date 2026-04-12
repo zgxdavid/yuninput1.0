@@ -13,13 +13,18 @@ constexpr size_t kMaxVisibleRows = 6;
 constexpr const wchar_t* kIndexLabels[] = {L"1", L"2", L"3", L"4", L"5", L"6", L"7", L"8", L"9"};
 constexpr UINT_PTR kAsyncPollTimerId = 1;
 constexpr size_t kMaxCandidateWidthChars = 12;
-constexpr int kNormalCharWidthPx = 17;
-constexpr int kSelectedCharWidthPx = 19;
-constexpr int kCodeColumnWidthPx = 74;
-constexpr int kWindowBaseWidthPx = 116;
-constexpr int kWindowMinWidthPx = 280;
-constexpr int kWindowMaxWidthPx = 430;
+constexpr int kNormalCharWidthPx = 16;
+constexpr int kSelectedCharWidthPx = 17;
+constexpr int kCodeColumnWidthPx = 58;
+constexpr int kWindowBaseWidthPx = 82;
+constexpr int kWindowMinWidthPx = 236;
+constexpr int kWindowMaxWidthPx = 360;
 constexpr int kPositionSnapThresholdPx = 3;
+constexpr int kHeaderTopPaddingPx = 6;
+constexpr int kHeaderHeightPx = 18;
+constexpr int kHeaderBottomGapPx = 6;
+constexpr int kBodyBottomPaddingPx = 8;
+constexpr int kEmptyBodyHeightPx = 24;
 
 bool AreDisplayCandidatesEqual(
     const std::vector<CandidateWindow::DisplayCandidate>& left,
@@ -346,11 +351,19 @@ void CandidateWindow::Update(
         fullShapeMode_ = fullShapeMode;
     }
 
-    const size_t visibleRowCount = std::max<size_t>(1, std::min(candidates_.size(), kMaxVisibleRows));
-    const int rowHeight = 42;
+    const size_t visibleRowCount = std::min(candidates_.size(), kMaxVisibleRows);
+    const int rowHeight = 34;
     int width = kWindowMinWidthPx;
-    const int height = 94 + static_cast<int>(visibleRowCount) * rowHeight + 42;
-    int measuredWidth = 312;
+    const int bodyHeight = visibleRowCount == 0
+        ? kEmptyBodyHeightPx
+        : static_cast<int>(visibleRowCount) * rowHeight;
+    const int height =
+        kHeaderTopPaddingPx +
+        kHeaderHeightPx +
+        kHeaderBottomGapPx +
+        bodyHeight +
+        kBodyBottomPaddingPx;
+    int measuredWidth = 256;
     for (size_t i = 0; i < visibleRowCount; ++i) {
         const auto& candidate = candidates_[i];
         const size_t visibleChars = std::min(candidate.text.size(), kMaxCandidateWidthChars);
@@ -511,48 +524,30 @@ void CandidateWindow::OnPaint() {
 }
 
 void CandidateWindow::PaintContent(HDC hdc, const RECT& rc) const {
+    const COLORREF panelBg = RGB(246, 241, 229);
+    const COLORREF border = RGB(168, 145, 112);
+    const COLORREF metaText = RGB(112, 96, 76);
+    const COLORREF selectedBg = RGB(220, 202, 166);
+    const COLORREF selectedText = RGB(32, 25, 17);
+    const int codeColumnWidth = 58;
 
-    const COLORREF bgTop = RGB(246, 239, 226);
-    const COLORREF bgBottom = RGB(236, 244, 248);
-    const COLORREF panelBg = RGB(255, 252, 246);
-    const COLORREF border = RGB(153, 130, 101);
-    const COLORREF softBorder = RGB(210, 191, 167);
-    const COLORREF textMain = RGB(44, 37, 28);
-    const COLORREF textMeta = RGB(102, 91, 79);
-    const COLORREF titleAccent = RGB(78, 117, 165);
-    const COLORREF selectedBgTop = RGB(66, 118, 186);
-    const COLORREF selectedBgBottom = RGB(43, 82, 136);
-    const COLORREF selectedBorder = RGB(27, 58, 102);
-    const int codeColumnWidth = 74;
+    FillSolidRect(hdc, rc, panelBg);
 
-    FillVerticalGradient(hdc, rc, bgTop, bgBottom);
-
-    RECT panelRc = rc;
-    panelRc.left += 4;
-    panelRc.top += 4;
-    panelRc.right -= 4;
-    panelRc.bottom -= 4;
-    DrawRoundedRect(hdc, panelRc, 18, 18, panelBg, border);
-
-    RECT titleStrip = panelRc;
-    titleStrip.left += 1;
-    titleStrip.top += 1;
-    titleStrip.right -= 1;
-    titleStrip.bottom = titleStrip.top + 34;
-    FillVerticalGradient(hdc, titleStrip, RGB(255, 249, 238), RGB(241, 231, 214));
+    HGDIOBJ oldPen = SelectObject(hdc, GetStockObject(DC_PEN));
+    HGDIOBJ oldBrush = SelectObject(hdc, GetStockObject(NULL_BRUSH));
+    SetDCPenColor(hdc, border);
+    Rectangle(hdc, rc.left, rc.top, rc.right, rc.bottom);
+    SelectObject(hdc, oldBrush);
+    SelectObject(hdc, oldPen);
 
     SetBkMode(hdc, TRANSPARENT);
-    HGDIOBJ oldFont = SelectObject(hdc, titleFont_ != nullptr ? titleFont_ : static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT)));
+    HGDIOBJ oldFont = SelectObject(hdc, smallFont_ != nullptr ? smallFont_ : static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT)));
 
-    RECT headerRc = panelRc;
-    headerRc.left += 14;
-    headerRc.right -= 14;
-    headerRc.top += 7;
-    headerRc.bottom = headerRc.top + 22;
-    SetTextColor(hdc, titleAccent);
-    const std::wstring title = L"Yuninput \u5019\u9009";
-    DrawTextW(hdc, title.c_str(), static_cast<int>(title.size()), &headerRc, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-
+    RECT headerRc = rc;
+    headerRc.left += 10;
+    headerRc.right -= 10;
+    headerRc.top += kHeaderTopPaddingPx;
+    headerRc.bottom = headerRc.top + kHeaderHeightPx;
     wchar_t pageText[96] = {};
     swprintf_s(
         pageText,
@@ -560,35 +555,22 @@ void CandidateWindow::PaintContent(HDC hdc, const RECT& rc) const {
         totalPages_ == 0 ? static_cast<size_t>(0) : (pageIndex_ + 1),
         totalPages_,
         totalCandidateCount_);
-    SetTextColor(hdc, textMeta);
-    DrawTextW(hdc, pageText, -1, &headerRc, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+    SetTextColor(hdc, metaText);
+    DrawTextW(hdc, pageText, -1, &headerRc, DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
 
-    SelectObject(hdc, codeFont_ != nullptr ? codeFont_ : titleFont_);
-    RECT codeRc = panelRc;
-    codeRc.left += 14;
-    codeRc.right -= 14;
-    codeRc.top = headerRc.bottom + 8;
-    codeRc.bottom = codeRc.top + 28;
-    DrawRoundedRect(hdc, codeRc, 14, 14, RGB(247, 242, 232), softBorder);
-    const std::wstring codeLine = std::wstring(L"Code  ") + code_;
-    RECT codeTextRc = codeRc;
-    codeTextRc.left += 12;
-    SetTextColor(hdc, textMain);
-    DrawTextW(hdc, codeLine.c_str(), static_cast<int>(codeLine.size()), &codeTextRc, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
-
-    int y = codeRc.bottom + 10;
-    const int rowHeight = 42;
-    const int rowLeft = panelRc.left + 14;
-    const int rowRight = panelRc.right - 14;
+    int y = headerRc.bottom + kHeaderBottomGapPx;
+    const int rowHeight = 34;
+    const int rowLeft = rc.left + 8;
+    const int rowRight = rc.right - 8;
     const size_t rowCount = std::min(candidates_.size(), kMaxVisibleRows);
 
     if (rowCount == 0) {
-        RECT emptyRc = panelRc;
-        emptyRc.left += 14;
-        emptyRc.right -= 14;
+        RECT emptyRc = rc;
+        emptyRc.left += 10;
+        emptyRc.right -= 10;
         emptyRc.top = y;
         emptyRc.bottom = emptyRc.top + 24;
-        SetTextColor(hdc, textMeta);
+        SetTextColor(hdc, metaText);
         const std::wstring empty = L"\u6ca1\u6709\u53ef\u7528\u5019\u9009";
         DrawTextW(hdc, empty.c_str(), static_cast<int>(empty.size()), &emptyRc, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
     } else {
@@ -597,80 +579,34 @@ void CandidateWindow::PaintContent(HDC hdc, const RECT& rc) const {
             const bool isSelected = i == selectedIndex_;
             RECT rowRc = {rowLeft, y, rowRight, y + rowHeight};
             if (isSelected) {
-                DrawRoundedRect(hdc, rowRc, 14, 14, selectedBgBottom, selectedBorder);
-                RECT selectedHighlight = rowRc;
-                selectedHighlight.left += 1;
-                selectedHighlight.top += 1;
-                selectedHighlight.right -= 1;
-                selectedHighlight.bottom = selectedHighlight.top + (rowHeight / 2);
-                FillVerticalGradient(hdc, selectedHighlight, selectedBgTop, selectedBgBottom);
-            } else {
-                const COLORREF rowFill = BlendColor(panelBg, RGB(240, 234, 224), (i % 2 == 0) ? 0.14 : 0.28);
-                DrawRoundedRect(hdc, rowRc, 14, 14, rowFill, softBorder);
+                FillSolidRect(hdc, rowRc, selectedBg);
             }
 
             RECT indexRc = rowRc;
-            indexRc.left += 8;
-            indexRc.top += 8;
-            indexRc.right = indexRc.left + 28;
-            indexRc.bottom = indexRc.top + 24;
-            DrawRoundedRect(
-                hdc,
-                indexRc,
-                12,
-                12,
-                isSelected ? RGB(255, 248, 232) : RGB(233, 223, 208),
-                isSelected ? RGB(255, 214, 140) : RGB(191, 176, 153));
-            SetTextColor(hdc, RGB(83, 62, 35));
-            SelectObject(hdc, titleFont_ != nullptr ? titleFont_ : oldFont);
+            indexRc.left += 4;
+            indexRc.right = indexRc.left + 20;
+            SetTextColor(hdc, isSelected ? selectedText : metaText);
+            SelectObject(hdc, smallFont_ != nullptr ? smallFont_ : oldFont);
             const wchar_t* indexText = (i < _countof(kIndexLabels)) ? kIndexLabels[i] : L"-";
-            DrawTextW(hdc, indexText, -1, &indexRc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            DrawTextW(hdc, indexText, -1, &indexRc, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
 
             RECT textRc = rowRc;
-            textRc.left = indexRc.right + 10;
-            textRc.top += 9;
-            textRc.right = rowRc.right - codeColumnWidth - 16;
-            textRc.bottom = textRc.top + 22;
-            SetTextColor(hdc, GetCandidateTextColor(candidate, isSelected));
+            textRc.left = indexRc.right + 8;
+            textRc.right = rowRc.right - codeColumnWidth - 10;
+            SetTextColor(hdc, isSelected ? selectedText : GetCandidateTextColor(candidate, false));
             SelectObject(hdc, isSelected ? selectedTextFont_ : textFont_);
             DrawTextW(hdc, candidate.text.c_str(), static_cast<int>(candidate.text.size()), &textRc, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
 
             RECT codeHintRc = rowRc;
             codeHintRc.left = rowRc.right - codeColumnWidth;
-            codeHintRc.right -= 10;
-            codeHintRc.top += 10;
-            codeHintRc.bottom = codeHintRc.top + 18;
-            SetTextColor(hdc, isSelected ? RGB(216, 230, 255) : titleAccent);
+            codeHintRc.right -= 2;
+            SetTextColor(hdc, isSelected ? selectedText : metaText);
             SelectObject(hdc, codeFont_ != nullptr ? codeFont_ : smallFont_);
             DrawTextW(hdc, candidate.code.c_str(), static_cast<int>(candidate.code.size()), &codeHintRc, DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
 
-            RECT metaRc = rowRc;
-            metaRc.left = rowRc.right - codeColumnWidth;
-            metaRc.right -= 10;
-            metaRc.top = rowRc.top + 25;
-            metaRc.bottom = metaRc.top + 14;
-            SetTextColor(hdc, isSelected ? RGB(238, 243, 249) : textMeta);
-            SelectObject(hdc, smallFont_ != nullptr ? smallFont_ : textFont_);
-            if (candidate.consumedLength > 0 && candidate.consumedLength < code_.size()) {
-                std::wstringstream meta;
-                meta << L"\u4f59\u7801 " << (code_.size() - candidate.consumedLength);
-                const std::wstring metaText = meta.str();
-                DrawTextW(hdc, metaText.c_str(), static_cast<int>(metaText.size()), &metaRc, DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
-            }
-
-            y += rowHeight + 6;
+            y += rowHeight;
         }
     }
-
-    SelectObject(hdc, smallFont_ != nullptr ? smallFont_ : textFont_);
-    RECT footerRc = panelRc;
-    footerRc.left += 14;
-    footerRc.right -= 14;
-    footerRc.bottom -= 10;
-    footerRc.top = footerRc.bottom - 20;
-    SetTextColor(hdc, textMeta);
-    const std::wstring footer = L"Space/Enter \u4e0a\u5c4f  \u6570\u5b57\u76f4\u9009  \u4e0a\u4e0b\u79fb\u52a8  PgUp/PgDn \u7ffb\u9875";
-    DrawTextW(hdc, footer.c_str(), static_cast<int>(footer.size()), &footerRc, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
 
     SelectObject(hdc, oldFont);
 }

@@ -37,6 +37,7 @@ $requiredFiles = @(
     (Join-Path $projectRoot 'build\Release\yuninput.dll'),
     (Join-Path $projectRoot 'build\Release\yuninput_user_dict_builder.exe'),
     (Join-Path $projectRoot 'assets\icon_yun.ico'),
+    (Join-Path $projectRoot 'YuninputManual.zh-CN.md'),
     (Join-Path $projectRoot 'scripts\install_enable.ps1'),
     (Join-Path $projectRoot 'scripts\register_ime.ps1'),
     (Join-Path $projectRoot 'scripts\unregister_ime.ps1'),

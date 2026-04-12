@@ -124,7 +124,7 @@ private:
 
     ~TextService();
 
-    void RefreshCandidates(bool expandAll = false);
+    void RefreshCandidates(bool expandAll = false, bool prioritizeInput = true);
     bool EnsureRuntimeReady();
     bool ReloadActiveDictionaries();
     bool LoadConfiguredDictionaries();
@@ -135,8 +135,13 @@ private:
     size_t GetCurrentPageCandidateCount() const;
     void InvalidatePageCandidatesCache();
     size_t GetTotalPages() const;
+    void CancelDeferredCandidateExpansion();
     void ScheduleDeferredCandidateExpansion();
     void RunDeferredCandidateExpansion();
+    void ScheduleDeferredMaintenance();
+    void ProcessDeferredUiTasks();
+    void ScheduleNextDeferredUiTask();
+    bool IsInputPriorityActive(ULONGLONG now) const;
     bool TryRestoreCachedCandidatesForCode(const std::wstring& code);
     void CacheCurrentCandidatesForCode();
     void ClearComposition();
@@ -150,8 +155,10 @@ private:
     std::wstring GetSingleCharZhengmaCodeHint(const std::wstring& text) const;
     void SyncUserDataFilesStamp();
     bool ReloadUserDataIfChanged(bool force);
+    void MarkUserDictionaryDirty();
     void MarkAutoPhraseDictionaryDirty();
     void MarkFrequencyDataDirty();
+    void MarkContextAssociationDirty();
     void FlushPendingUserDataIfNeeded(bool force, bool waitForCompletion = true);
     void StartUserDataWriteWorker();
     void StopUserDataWriteWorker(bool waitForPending);
@@ -268,8 +275,10 @@ private:
     std::wstring lastAutoPhraseSelectedKey_;
     int autoPhraseSelectedStreak_;
     ULONGLONG autoPhraseSelectedTick_;
+    bool userDictionaryDirty_;
     bool autoPhraseDictionaryDirty_;
     bool userFrequencyDirty_;
+    bool contextAssociationDirty_;
     ULONGLONG userDataFirstDirtyTick_;
     ULONGLONG userDataLastFlushTick_;
     ULONGLONG lastUserDataReloadCheckTick_;
@@ -305,6 +314,11 @@ private:
     std::deque<std::wstring> compositionCandidateCacheOrder_;
     std::wstring deferredExpansionCode_;
     ULONGLONG deferredExpansionDueTick_;
+    ULONGLONG deferredMaintenanceDueTick_;
+    ULONGLONG lastInteractiveInputTick_;
+    std::uint64_t inputPriorityGeneration_;
+    std::uint64_t deferredExpansionGeneration_;
+    ULONGLONG lastCompletedCompositionCommitTick_;
 };
 
 HRESULT CreateTextServiceClassFactory(REFIID riid, void** ppv);
