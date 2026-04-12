@@ -4,6 +4,7 @@ using System.Diagnostics;
 using System.Drawing;
 using System.Globalization;
 using System.IO;
+using System.Runtime.InteropServices;
 using System.Text;
 using System.Windows.Forms;
 
@@ -70,6 +71,82 @@ internal sealed class PhraseReviewLogItem
 
 public class ConfigForm : Form
 {
+    private static class NativeMethods
+    {
+        [DllImport("user32.dll")]
+        internal static extern short GetAsyncKeyState(int vKey);
+    }
+
+    private sealed class EscapeCloseMessageFilter : IMessageFilter
+    {
+        private const int WmKeyDown = 0x0100;
+        private const int WmSysKeyDown = 0x0104;
+
+        public bool PreFilterMessage(ref Message m)
+        {
+            if (m.Msg != WmKeyDown && m.Msg != WmSysKeyDown)
+            {
+                return false;
+            }
+
+            Keys keyData = (Keys)(int)m.WParam & Keys.KeyCode;
+            if (keyData != Keys.Escape)
+            {
+                return false;
+            }
+
+            if ((Control.ModifierKeys & (Keys.Control | Keys.Alt)) != Keys.None)
+            {
+                return false;
+            }
+
+            Form targetForm = ResolveTargetForm(m.HWnd);
+            if (targetForm == null || targetForm.IsDisposed)
+            {
+                return false;
+            }
+
+            lock (EscapeCloseForms)
+            {
+                if (!EscapeCloseForms.Contains(targetForm))
+                {
+                    return false;
+                }
+            }
+
+            targetForm.Close();
+            return true;
+        }
+
+        private static Form ResolveTargetForm(IntPtr hwnd)
+        {
+            Control sourceControl = null;
+            if (hwnd != IntPtr.Zero)
+            {
+                sourceControl = Control.FromChildHandle(hwnd);
+                if (sourceControl == null)
+                {
+                    sourceControl = Control.FromHandle(hwnd);
+                }
+            }
+
+            if (sourceControl != null)
+            {
+                Form ownerForm = sourceControl.FindForm();
+                if (ownerForm != null)
+                {
+                    return ownerForm;
+                }
+            }
+
+            return Form.ActiveForm;
+        }
+    }
+
+    private static readonly HashSet<Form> EscapeCloseForms = new HashSet<Form>();
+    private static readonly HashSet<Control> EscapeCloseControls = new HashSet<Control>();
+    internal static readonly IMessageFilter EscapeCloseFilter = new EscapeCloseMessageFilter();
+
     private static readonly Color PanelBackColor = Color.FromArgb(247, 248, 250);
     private static readonly Color AccentColor = Color.FromArgb(31, 95, 168);
     private static readonly Color BorderColor = Color.FromArgb(214, 219, 226);
@@ -129,7 +206,7 @@ public class ConfigForm : Form
 
         cfgPath = Path.Combine(localRoot, "settings.json");
         userDictPath = Path.Combine(roamingRoot, "yuninput_user.dict");
-    autoPhraseDictPath = Path.Combine(roamingRoot, "auto_phrase_runtime.dict");
+        autoPhraseDictPath = Path.Combine(roamingRoot, "auto_phrase_runtime.dict");
         userFreqPath = Path.Combine(roamingRoot, "user_freq.txt");
         blockedPath = Path.Combine(roamingRoot, "blocked_entries.txt");
         contextAssocPath = Path.Combine(roamingRoot, "context_assoc.txt");
@@ -209,6 +286,19 @@ public class ConfigForm : Form
         return base.ProcessCmdKey(ref msg, keyData);
     }
 
+    protected override bool ProcessDialogKey(Keys keyData)
+    {
+        Keys keyCode = keyData & Keys.KeyCode;
+        Keys modifiers = keyData & Keys.Modifiers;
+        if (keyCode == Keys.Escape && (modifiers & (Keys.Control | Keys.Alt)) == Keys.None)
+        {
+            Close();
+            return true;
+        }
+
+        return base.ProcessDialogKey(keyData);
+    }
+
     private string ResolveManualPath()
     {
         string baseDir = AppDomain.CurrentDomain.BaseDirectory;
@@ -250,6 +340,9 @@ public class ConfigForm : Form
 
     private static void EnableEscapeClose(Form form)
     {
+        RegisterEscapeCloseForm(form);
+        AttachEscapeCloseHandlers(form, form);
+        AttachEscapeClosePolling(form);
         form.KeyPreview = true;
         form.KeyDown += (s, e) =>
         {
@@ -260,6 +353,116 @@ public class ConfigForm : Form
 
             form.Close();
             e.Handled = true;
+        };
+    }
+
+    private static void AttachEscapeClosePolling(Form form)
+    {
+        if (form == null)
+        {
+            return;
+        }
+
+        const int vkEscape = 0x1B;
+        bool escapeWasDown = false;
+        var timer = new Timer();
+        timer.Interval = 40;
+        timer.Tick += (s, e) =>
+        {
+            if (form.IsDisposed)
+            {
+                timer.Stop();
+                timer.Dispose();
+                return;
+            }
+
+            bool escapeDown = (NativeMethods.GetAsyncKeyState(vkEscape) & 0x8000) != 0;
+            bool modifiersDown = (Control.ModifierKeys & (Keys.Control | Keys.Alt)) != Keys.None;
+            bool formActive = Form.ActiveForm == form || form.ContainsFocus;
+            if (formActive && escapeDown && !escapeWasDown && !modifiersDown)
+            {
+                form.Close();
+            }
+
+            escapeWasDown = escapeDown;
+        };
+        timer.Start();
+
+        form.FormClosed += (s, e) =>
+        {
+            timer.Stop();
+            timer.Dispose();
+        };
+    }
+
+    private static void AttachEscapeCloseHandlers(Control control, Form ownerForm)
+    {
+        if (control == null || ownerForm == null)
+        {
+            return;
+        }
+
+        lock (EscapeCloseControls)
+        {
+            if (!EscapeCloseControls.Add(control))
+            {
+                return;
+            }
+        }
+
+        control.PreviewKeyDown += (s, e) =>
+        {
+            if (e.KeyCode == Keys.Escape)
+            {
+                e.IsInputKey = true;
+            }
+        };
+
+        control.KeyDown += (s, e) =>
+        {
+            if (e.KeyCode != Keys.Escape)
+            {
+                return;
+            }
+
+            ownerForm.Close();
+            e.Handled = true;
+            e.SuppressKeyPress = true;
+        };
+
+        control.ControlAdded += (s, e) => AttachEscapeCloseHandlers(e.Control, ownerForm);
+        control.Disposed += (s, e) =>
+        {
+            lock (EscapeCloseControls)
+            {
+                EscapeCloseControls.Remove(control);
+            }
+        };
+
+        foreach (Control child in control.Controls)
+        {
+            AttachEscapeCloseHandlers(child, ownerForm);
+        }
+    }
+
+    private static void RegisterEscapeCloseForm(Form form)
+    {
+        if (form == null)
+        {
+            return;
+        }
+
+        lock (EscapeCloseForms)
+        {
+            EscapeCloseForms.Add(form);
+        }
+
+        form.FormClosed += (s, e) =>
+        {
+            lock (EscapeCloseForms)
+            {
+                EscapeCloseForms.Remove(form);
+            }
         };
     }
 
@@ -2089,6 +2292,7 @@ static class Program
 
         Application.EnableVisualStyles();
         Application.SetCompatibleTextRenderingDefault(false);
+        Application.AddMessageFilter(ConfigForm.EscapeCloseFilter);
         Application.Run(new ConfigForm());
     }
 }
