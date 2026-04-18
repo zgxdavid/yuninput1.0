@@ -3,6 +3,7 @@
 #include "Globals.h"
 
 #include <Windows.h>
+#include <objerror.h>
 #include <shellapi.h>
 
 #include <algorithm>
@@ -18,9 +19,11 @@
 
 namespace {
 
-constexpr const wchar_t* kBuildMarker = L"cw-r4-20260411-yuninput1-ui-lite-v2";
+constexpr const wchar_t* kBuildMarker = L"cw-r6-20260416-yuninput1-anchor-follow-fix";
 constexpr ULONGLONG kAnchorReuseWindowMs = 2500ULL;
 constexpr ULONGLONG kAnchorFastReuseWindowMs = 120ULL;
+constexpr ULONGLONG kFocusStartupFastWindowMs = 220ULL;
+constexpr ULONGLONG kDeferredAnchorRefreshDelayMs = 18ULL;
 constexpr ULONGLONG kUserDictionaryFlushIntervalMs = 3000ULL;
 constexpr ULONGLONG kAutoPhraseFlushIntervalMs = 3000ULL;
 constexpr ULONGLONG kUserFrequencyFlushIntervalMs = 12000ULL;
@@ -43,6 +46,8 @@ constexpr wchar_t kSessionAutoPhraseBreak = static_cast<wchar_t>(0xE000);
 constexpr size_t kRuntimeLogMaxQueuedLines = 512;
 constexpr ULONGLONG kPostCommitStartupFastWindowMs = 180ULL;
 constexpr ULONGLONG kInputPriorityWindowMs = 160ULL;
+constexpr HRESULT kConnectEAdviseLimit = static_cast<HRESULT>(0x80040201L);
+constexpr HRESULT kConnectENoConnection = static_cast<HRESULT>(0x80040200L);
 
 std::mutex g_runtimeLogMutex;
 std::condition_variable g_runtimeLogCv;
@@ -75,6 +80,68 @@ bool CopyFileIfMissing(const std::filesystem::path& sourcePath, const std::files
     }
 
     return std::filesystem::copy_file(sourcePath, targetPath, std::filesystem::copy_options::skip_existing, ec);
+}
+
+bool IsRemoteExecutablePath(const std::filesystem::path& path) {
+    if (path.empty()) {
+        return false;
+    }
+
+    const std::wstring native = path.wstring();
+    if (native.size() >= 2 && native[0] == L'\\' && native[1] == L'\\') {
+        return true;
+    }
+
+    if (native.size() < 2 || native[1] != L':') {
+        return false;
+    }
+
+    wchar_t rootPath[] = { native[0], L':', L'\\', L'\0' };
+    const UINT driveType = GetDriveTypeW(rootPath);
+    return driveType == DRIVE_REMOTE;
+}
+
+std::wstring GetLocalAutoPhraseBuilderStagePath(const std::filesystem::path& sourcePath) {
+    if (sourcePath.empty()) {
+        return L"";
+    }
+
+    std::error_code ec;
+    const auto lastWriteTime = std::filesystem::last_write_time(sourcePath, ec);
+    if (ec) {
+        ec.clear();
+    }
+
+    std::wstring tempDir;
+    tempDir.resize(MAX_PATH);
+    const DWORD tempLength = GetTempPathW(static_cast<DWORD>(tempDir.size()), tempDir.data());
+    if (tempLength == 0) {
+        return L"";
+    }
+    tempDir.resize(tempLength);
+    while (!tempDir.empty() && tempDir.back() == L'\0') {
+        tempDir.pop_back();
+    }
+
+    std::filesystem::path stageDir = std::filesystem::path(tempDir) / L"yuninput" / L"staging";
+    std::filesystem::create_directories(stageDir, ec);
+    ec.clear();
+
+    std::wstring stagedName = L"yuninput_user_dict_builder_" +
+        std::to_wstring(static_cast<unsigned long long>(lastWriteTime.time_since_epoch().count())) +
+        L".exe";
+    const std::filesystem::path stagedPath = stageDir / stagedName;
+    if (std::filesystem::exists(stagedPath, ec)) {
+        return stagedPath.wstring();
+    }
+    ec.clear();
+
+    std::filesystem::copy_file(sourcePath, stagedPath, std::filesystem::copy_options::overwrite_existing, ec);
+    if (ec) {
+        return L"";
+    }
+
+    return stagedPath.wstring();
 }
 
 bool FileContainsAutoPhraseTag(const std::wstring& filePath) {
@@ -240,13 +307,50 @@ bool FileContainsLegacyFrequencyNoise(const std::wstring& filePath) {
     return false;
 }
 
+struct KeyboardModifierState {
+    bool ctrlPressed = false;
+    bool shiftPressed = false;
+    bool altPressed = false;
+    bool winPressed = false;
+    bool leftShiftPressed = false;
+    bool rightShiftPressed = false;
+};
+
+bool IsVirtualKeyPressed(int virtualKey) {
+    return (GetKeyState(virtualKey) & 0x8000) != 0 ||
+           (GetAsyncKeyState(virtualKey) & 0x8000) != 0;
+}
+
+template <size_t N>
+bool AreAnyVirtualKeysPressed(const int (&virtualKeys)[N]) {
+    for (int virtualKey : virtualKeys) {
+        if (IsVirtualKeyPressed(virtualKey)) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+KeyboardModifierState QueryKeyboardModifierState() {
+    static constexpr int kCtrlKeys[] = {VK_CONTROL, VK_LCONTROL, VK_RCONTROL};
+    static constexpr int kShiftKeys[] = {VK_SHIFT, VK_LSHIFT, VK_RSHIFT};
+    static constexpr int kAltKeys[] = {VK_MENU, VK_LMENU, VK_RMENU};
+    static constexpr int kWinKeys[] = {VK_LWIN, VK_RWIN};
+
+    KeyboardModifierState state;
+    state.ctrlPressed = AreAnyVirtualKeysPressed(kCtrlKeys);
+    state.leftShiftPressed = IsVirtualKeyPressed(VK_LSHIFT);
+    state.rightShiftPressed = IsVirtualKeyPressed(VK_RSHIFT);
+    state.shiftPressed = state.leftShiftPressed || state.rightShiftPressed || AreAnyVirtualKeysPressed(kShiftKeys);
+    state.altPressed = AreAnyVirtualKeysPressed(kAltKeys);
+    state.winPressed = AreAnyVirtualKeysPressed(kWinKeys);
+    return state;
+}
+
 bool IsShiftPressed() {
-    return (GetKeyState(VK_SHIFT) & 0x8000) != 0 ||
-           (GetKeyState(VK_LSHIFT) & 0x8000) != 0 ||
-           (GetKeyState(VK_RSHIFT) & 0x8000) != 0 ||
-           (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0 ||
-           (GetAsyncKeyState(VK_LSHIFT) & 0x8000) != 0 ||
-           (GetAsyncKeyState(VK_RSHIFT) & 0x8000) != 0;
+    static constexpr int kShiftKeys[] = {VK_SHIFT, VK_LSHIFT, VK_RSHIFT};
+    return AreAnyVirtualKeysPressed(kShiftKeys);
 }
 
 bool IsAsciiCodeToken(const std::string& token) {
@@ -1190,9 +1294,16 @@ bool LaunchRuntimeLogFile() {
     return reinterpret_cast<INT_PTR>(hInst) > 32;
 }
 
-class ConfigLangBarButton final : public ITfLangBarItemButton {
+}  // namespace
+
+class ConfigLangBarButton final : public ITfLangBarItemButton, public ITfSource {
 public:
-    ConfigLangBarButton() : refCount_(1) {
+    ConfigLangBarButton()
+        : refCount_(1),
+          sinkCookie_(TF_INVALID_COOKIE),
+          itemSink_(nullptr),
+          chineseMode_(true),
+                    chineseIcon_(nullptr) {
         info_.clsidService = CLSID_YunmaTextService;
         info_.guidItem = GUID_LBI_YUNINPUT_CONFIG;
         info_.dwStyle = TF_LBI_STYLE_SHOWNINTRAY | TF_LBI_STYLE_TEXTCOLORICON;
@@ -1208,6 +1319,12 @@ public:
         *ppvObj = nullptr;
         if (riid == IID_IUnknown || riid == IID_ITfLangBarItem || riid == IID_ITfLangBarItemButton) {
             *ppvObj = static_cast<ITfLangBarItemButton*>(this);
+            AddRef();
+            return S_OK;
+        }
+
+        if (riid == IID_ITfSource) {
+            *ppvObj = static_cast<ITfSource*>(this);
             AddRef();
             return S_OK;
         }
@@ -1256,7 +1373,7 @@ public:
             return E_INVALIDARG;
         }
 
-        *tooltip = SysAllocString(L"Left click: open full config; Right click: quick menu");
+        *tooltip = SysAllocString(L"Yuninput. Left click: open full config; Right click: quick menu");
         return (*tooltip != nullptr) ? S_OK : E_OUTOFMEMORY;
     }
 
@@ -1325,7 +1442,7 @@ public:
             return E_INVALIDARG;
         }
 
-        *icon = static_cast<HICON>(LoadImageW(g_moduleHandle, MAKEINTRESOURCEW(1), IMAGE_ICON, 16, 16, LR_DEFAULTCOLOR));
+        *icon = EnsureChineseIcon();
         if (*icon == nullptr) {
             *icon = LoadIconW(nullptr, IDI_APPLICATION);
         }
@@ -1341,12 +1458,199 @@ public:
         return (*text != nullptr) ? S_OK : E_OUTOFMEMORY;
     }
 
+    STDMETHODIMP AdviseSink(REFIID riid, IUnknown* punk, DWORD* cookie) override {
+        if (cookie == nullptr || punk == nullptr) {
+            return E_INVALIDARG;
+        }
+
+        if (riid != IID_ITfLangBarItemSink) {
+            return E_NOINTERFACE;
+        }
+
+        if (itemSink_ != nullptr) {
+            return kConnectEAdviseLimit;
+        }
+
+        ITfLangBarItemSink* sink = nullptr;
+        const HRESULT hr = punk->QueryInterface(IID_ITfLangBarItemSink, reinterpret_cast<void**>(&sink));
+        if (FAILED(hr) || sink == nullptr) {
+            return FAILED(hr) ? hr : E_NOINTERFACE;
+        }
+
+        itemSink_ = sink;
+        sinkCookie_ = 1;
+        *cookie = sinkCookie_;
+        return S_OK;
+    }
+
+    STDMETHODIMP UnadviseSink(DWORD cookie) override {
+        if (itemSink_ == nullptr || cookie != sinkCookie_) {
+            return kConnectENoConnection;
+        }
+
+        itemSink_->Release();
+        itemSink_ = nullptr;
+        sinkCookie_ = TF_INVALID_COOKIE;
+        return S_OK;
+    }
+
+    void SetChineseMode(bool chineseMode) {
+        chineseMode_ = chineseMode;
+        NotifyUpdate(TF_LBI_TOOLTIP);
+    }
+
 private:
-    ~ConfigLangBarButton() = default;
+    static HICON CreateModeBadgeIcon(
+        const wchar_t* glyph,
+        COLORREF backgroundColor,
+        COLORREF borderColor,
+        COLORREF textColor,
+        const wchar_t* fontFace,
+        int fontHeight) {
+        BITMAPV5HEADER bi = {};
+        bi.bV5Size = sizeof(bi);
+        bi.bV5Width = 16;
+        bi.bV5Height = -16;
+        bi.bV5Planes = 1;
+        bi.bV5BitCount = 32;
+        bi.bV5Compression = BI_BITFIELDS;
+        bi.bV5RedMask = 0x00FF0000;
+        bi.bV5GreenMask = 0x0000FF00;
+        bi.bV5BlueMask = 0x000000FF;
+        bi.bV5AlphaMask = 0xFF000000;
+
+        void* bits = nullptr;
+        HDC screenDc = GetDC(nullptr);
+        if (screenDc == nullptr) {
+            return nullptr;
+        }
+
+        HBITMAP colorBitmap = CreateDIBSection(screenDc, reinterpret_cast<const BITMAPINFO*>(&bi), DIB_RGB_COLORS, &bits, nullptr, 0);
+        ReleaseDC(nullptr, screenDc);
+        if (colorBitmap == nullptr || bits == nullptr) {
+            if (colorBitmap != nullptr) {
+                DeleteObject(colorBitmap);
+            }
+            return nullptr;
+        }
+
+        HBITMAP maskBitmap = CreateBitmap(16, 16, 1, 1, nullptr);
+        if (maskBitmap == nullptr) {
+            DeleteObject(colorBitmap);
+            return nullptr;
+        }
+
+        HDC colorDc = CreateCompatibleDC(nullptr);
+        HDC maskDc = CreateCompatibleDC(nullptr);
+        if (colorDc == nullptr || maskDc == nullptr) {
+            if (colorDc != nullptr) {
+                DeleteDC(colorDc);
+            }
+            if (maskDc != nullptr) {
+                DeleteDC(maskDc);
+            }
+            DeleteObject(colorBitmap);
+            DeleteObject(maskBitmap);
+            return nullptr;
+        }
+
+        const HGDIOBJ oldColorBitmap = SelectObject(colorDc, colorBitmap);
+        const HGDIOBJ oldMaskBitmap = SelectObject(maskDc, maskBitmap);
+
+        RECT rect = {0, 0, 16, 16};
+        HBRUSH bgBrush = CreateSolidBrush(backgroundColor);
+        FillRect(colorDc, &rect, bgBrush);
+        DeleteObject(bgBrush);
+
+        PatBlt(maskDc, 0, 0, 16, 16, BLACKNESS);
+
+        HPEN borderPen = CreatePen(PS_SOLID, 1, borderColor);
+        const HGDIOBJ oldPen = SelectObject(colorDc, borderPen);
+        const HGDIOBJ oldBrush = SelectObject(colorDc, GetStockObject(NULL_BRUSH));
+        RoundRect(colorDc, 0, 0, 16, 16, 5, 5);
+        SelectObject(colorDc, oldBrush);
+        SelectObject(colorDc, oldPen);
+        DeleteObject(borderPen);
+
+        HFONT font = CreateFontW(
+            -fontHeight,
+            0,
+            0,
+            0,
+            FW_BOLD,
+            FALSE,
+            FALSE,
+            FALSE,
+            DEFAULT_CHARSET,
+            OUT_DEFAULT_PRECIS,
+            CLIP_DEFAULT_PRECIS,
+            CLEARTYPE_QUALITY,
+            DEFAULT_PITCH | FF_SWISS,
+            fontFace);
+        const HGDIOBJ oldFont = SelectObject(colorDc, font);
+        SetBkMode(colorDc, TRANSPARENT);
+        SetTextColor(colorDc, textColor);
+        DrawTextW(colorDc, glyph, static_cast<int>(wcslen(glyph)), &rect, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        SelectObject(colorDc, oldFont);
+        DeleteObject(font);
+
+        ICONINFO iconInfo = {};
+        iconInfo.fIcon = TRUE;
+        iconInfo.hbmMask = maskBitmap;
+        iconInfo.hbmColor = colorBitmap;
+        HICON icon = CreateIconIndirect(&iconInfo);
+
+        SelectObject(colorDc, oldColorBitmap);
+        SelectObject(maskDc, oldMaskBitmap);
+        DeleteDC(colorDc);
+        DeleteDC(maskDc);
+        DeleteObject(colorBitmap);
+        DeleteObject(maskBitmap);
+        return icon;
+    }
+
+    HICON EnsureChineseIcon() {
+        if (chineseIcon_ == nullptr) {
+            chineseIcon_ = CreateModeBadgeIcon(
+                L"\u4E2D",
+                RGB(231, 108, 72),
+                RGB(154, 58, 32),
+                RGB(255, 251, 245),
+                L"Microsoft YaHei UI",
+                11);
+            if (chineseIcon_ == nullptr) {
+                chineseIcon_ = static_cast<HICON>(LoadImageW(g_moduleHandle, MAKEINTRESOURCEW(1), IMAGE_ICON, 16, 16, LR_DEFAULTCOLOR));
+            }
+        }
+        return chineseIcon_;
+    }
+
+    void NotifyUpdate(DWORD flags) {
+        if (itemSink_ != nullptr) {
+            itemSink_->OnUpdate(flags);
+        }
+    }
+
+    ~ConfigLangBarButton() {
+        if (itemSink_ != nullptr) {
+            itemSink_->Release();
+            itemSink_ = nullptr;
+        }
+        if (chineseIcon_ != nullptr) {
+            DestroyIcon(chineseIcon_);
+            chineseIcon_ = nullptr;
+        }
+    }
 
     LONG refCount_;
     TF_LANGBARITEMINFO info_ = {};
+    DWORD sinkCookie_;
+    ITfLangBarItemSink* itemSink_;
+    bool chineseMode_;
+    HICON chineseIcon_;
 };
+
+namespace {
 
 bool SendUnicodeTextWithInput(const std::wstring& text) {
     if (text.empty()) {
@@ -1804,6 +2108,7 @@ TextService::TextService()
         hasRecentAnchor_(false),
         lastAnchor_{0, 0},
                 lastAnchorTick_(0),
+            focusGainedTick_(0),
                 autoPhraseSelectedStreak_(0),
                                 autoPhraseSelectedTick_(0),
                     userDictionaryDirty_(false),
@@ -1826,11 +2131,14 @@ TextService::TextService()
                                 pageCandidatesCachePageSize_(0),
                                     candidatesFullyExpanded_(false),
                                     deferredExpansionDueTick_(0),
+                                    deferredAnchorRefreshDueTick_(0),
                                     deferredMaintenanceDueTick_(0),
+                                    modeSwitchHintDueTick_(0),
                                     lastInteractiveInputTick_(0),
                                     inputPriorityGeneration_(0),
                                     deferredExpansionGeneration_(0),
-                                    lastCompletedCompositionCommitTick_(0) {
+                                    lastCompletedCompositionCommitTick_(0),
+                                    deferredRuntimeWarmupPending_(false) {
     InterlockedIncrement(&g_objectCount);
     StartRuntimeLogWorker();
 }
@@ -1947,6 +2255,7 @@ STDMETHODIMP TextService::Activate(ITfThreadMgr* threadMgr, TfClientId clientId)
     if (SUCCEEDED(lbMgrHr) && langBarItemMgr_ != nullptr) {
         configLangBarItem_ = new (std::nothrow) ConfigLangBarButton();
         if (configLangBarItem_ != nullptr) {
+            configLangBarItem_->SetChineseMode(chineseMode_);
             const HRESULT addHr = langBarItemMgr_->AddItem(configLangBarItem_);
             wchar_t lbLog[180] = {};
             swprintf_s(lbLog, L"LangBar AddItem hr=0x%08X", static_cast<unsigned int>(addHr));
@@ -1989,6 +2298,11 @@ STDMETHODIMP TextService::Activate(ITfThreadMgr* threadMgr, TfClientId clientId)
     }
 
     LoadSettings();
+
+    candidateWindow_.EnsureCreated();
+    candidateWindow_.SetAsyncPollCallback([this]() {
+        ProcessDeferredUiTasks();
+    });
 
     Trace(std::wstring(L"TextService activated marker=") + kBuildMarker);
 
@@ -2129,6 +2443,10 @@ bool TextService::ReloadUserDataIfChanged(bool force) {
         fullShapeMode_ != previousFullShapeMode ||
         pageSize_ != previousPageSize;
 
+    if (chineseMode_ != previousChineseMode) {
+        RefreshLangBarIndicator();
+    }
+
     if (profileChanged) {
         ClearComposition();
         candidateWindow_.Hide();
@@ -2203,20 +2521,11 @@ bool TextService::EnsureRuntimeReady() {
         engine_.LoadBlockedEntriesFromFile(blockedEntriesPath_);
         LoadContextAssociationFromFile(contextAssocPath_);
         LoadContextAssociationBlacklistFromFile(contextAssocBlacklistPath_);
-        LoadAutoPhraseSessionState();
-        autoPhraseBuilderPending_ = true;
-        LaunchAutoPhraseBuilderProcess();
-        if (FileContainsLegacyFrequencyNoise(userFreqPath_)) {
-            engine_.SaveFrequencyToFile(userFreqPath_);
-        }
         SyncUserDataFilesStamp();
         helperAutoPhraseStamp_ = QueryFileStampToken(autoPhraseHelperPath_);
+        deferredRuntimeWarmupPending_ = true;
+        ScheduleDeferredMaintenance();
     }
-
-    candidateWindow_.EnsureCreated();
-    candidateWindow_.SetAsyncPollCallback([this]() {
-        ProcessDeferredUiTasks();
-    });
 
     runtimeReady_ = true;
     Trace(L"runtime init completed dict=" + std::to_wstring(dictionariesLoaded ? 1 : 0));
@@ -2696,6 +3005,17 @@ bool TextService::LaunchAutoPhraseBuilderProcess() {
         return false;
     }
 
+    std::wstring builderLaunchPath = autoPhraseBuilderPath_;
+    autoPhraseBuilderStagedPath_.clear();
+    if (IsRemoteExecutablePath(std::filesystem::path(autoPhraseBuilderPath_))) {
+        autoPhraseBuilderStagedPath_ = GetLocalAutoPhraseBuilderStagePath(std::filesystem::path(autoPhraseBuilderPath_));
+        if (!autoPhraseBuilderStagedPath_.empty()) {
+            builderLaunchPath = autoPhraseBuilderStagedPath_;
+        } else {
+            Trace(L"auto phrase builder staging failed; using original path");
+        }
+    }
+
     const std::filesystem::path rootDir = ResolveDataRootFromModule(modulePath);
     const std::filesystem::path dataDir = rootDir / L"data";
     const std::wstring profileDictPath = dictionaryProfile_ == DictionaryProfile::ZhengmaLargePinyin
@@ -2706,7 +3026,7 @@ bool TextService::LaunchAutoPhraseBuilderProcess() {
         ? (dataDir / L"zhengma-single.dict").wstring()
         : profileDictPath;
 
-    std::wstring commandLine = QuoteCommandLineArg(autoPhraseBuilderPath_) +
+    std::wstring commandLine = QuoteCommandLineArg(builderLaunchPath) +
         L" session-watch " +
         QuoteCommandLineArg(autoPhraseSessionPath_) + L" " +
         QuoteCommandLineArg(profileDictPath) + L" " +
@@ -2732,7 +3052,7 @@ bool TextService::LaunchAutoPhraseBuilderProcess() {
             FALSE,
             CREATE_NO_WINDOW,
             nullptr,
-            std::filesystem::path(autoPhraseBuilderPath_).parent_path().c_str(),
+            std::filesystem::path(builderLaunchPath).parent_path().c_str(),
             &startupInfo,
             &processInfo)) {
         const DWORD error = GetLastError();
@@ -2778,6 +3098,7 @@ bool TextService::SaveAutoPhraseSessionState() const {
 bool TextService::LoadAutoPhraseSessionState() {
     autoPhraseHistoryText_.clear();
     sessionAutoPhraseEntries_.clear();
+    sessionAutoPhraseTextsByCode_.clear();
 
     if (autoPhraseSessionPath_.empty()) {
         autoPhraseSessionStamp_.clear();
@@ -2828,33 +3149,9 @@ bool TextService::LoadAutoPhraseSessionState() {
         }
 
         if (tag == "entry") {
-            std::string textUtf8;
-            std::string codesCsv;
-            std::string tickText;
-            if (!std::getline(iss, textUtf8, '\t') ||
-                !std::getline(iss, codesCsv, '\t') ||
-                !std::getline(iss, tickText, '\t')) {
-                continue;
-            }
-
-            SessionAutoPhraseEntry entry;
-            entry.text = Utf8ToWideText(textUtf8);
-            entry.lastTick = static_cast<ULONGLONG>(_strtoui64(tickText.c_str(), nullptr, 10));
-            std::istringstream codeStream(codesCsv);
-            std::string codeUtf8;
-            while (std::getline(codeStream, codeUtf8, ',')) {
-                const std::wstring code = Utf8ToWideText(codeUtf8);
-                if (code.empty()) {
-                    continue;
-                }
-                if (!engine_.HasEntry(code, entry.text)) {
-                    entry.codes.push_back(code);
-                }
-            }
-
-            if (!entry.text.empty() && !entry.codes.empty()) {
-                sessionAutoPhraseEntries_[entry.text] = std::move(entry);
-            }
+            // Older helper/build paths may persist entry rows, but the runtime now
+            // reconstructs active occurrence counts from the sliding history window.
+            continue;
         }
     }
 
@@ -2866,11 +3163,18 @@ bool TextService::LoadAutoPhraseSessionState() {
         return false;
     }
 
+    bool changed = false;
+    if (TrimSessionAutoPhraseEntriesToHistoryWindow()) {
+        changed = true;
+    }
     if (!autoPhraseHistoryText_.empty()) {
-        CollectSessionAutoPhraseCandidatesForTail(GetTickCount64());
+        RebuildSessionAutoPhraseEntriesFromHistory(GetTickCount64());
+    }
+    if (CompactSessionAutoPhraseEntries()) {
+        changed = true;
     }
 
-    if (PruneSessionAutoPhraseEntries()) {
+    if (changed) {
         QueueAutoPhraseSessionWrite();
     }
 
@@ -2954,6 +3258,44 @@ bool TextService::LoadHelperAutoPhraseEntries() {
     return !helperAutoPhraseEntriesByCode_.empty();
 }
 
+void TextService::IndexSessionAutoPhraseEntry(const SessionAutoPhraseEntry& entry) {
+    if (entry.text.empty() || entry.codes.empty()) {
+        return;
+    }
+
+    for (const std::wstring& code : entry.codes) {
+        if (code.empty()) {
+            continue;
+        }
+
+        auto& texts = sessionAutoPhraseTextsByCode_[code];
+        if (std::find(texts.begin(), texts.end(), entry.text) == texts.end()) {
+            texts.push_back(entry.text);
+        }
+    }
+}
+
+void TextService::RemoveSessionAutoPhraseEntryFromIndex(const SessionAutoPhraseEntry& entry) {
+    if (entry.text.empty() || entry.codes.empty()) {
+        return;
+    }
+
+    for (const std::wstring& code : entry.codes) {
+        auto codeIt = sessionAutoPhraseTextsByCode_.find(code);
+        if (codeIt == sessionAutoPhraseTextsByCode_.end()) {
+            continue;
+        }
+
+        auto& texts = codeIt->second;
+        texts.erase(
+            std::remove(texts.begin(), texts.end(), entry.text),
+            texts.end());
+        if (texts.empty()) {
+            sessionAutoPhraseTextsByCode_.erase(codeIt);
+        }
+    }
+}
+
 bool TextService::IsHanCharacter(wchar_t ch) {
     return (ch >= 0x3400 && ch <= 0x4DBF) ||
            (ch >= 0x4E00 && ch <= 0x9FFF) ||
@@ -2963,16 +3305,14 @@ bool TextService::IsHanCharacter(wchar_t ch) {
 void TextService::RecordSessionAutoPhraseBreak() {
     if (!autoPhraseHistoryText_.empty() && autoPhraseHistoryText_.back() != kSessionAutoPhraseBreak) {
         autoPhraseHistoryText_.push_back(kSessionAutoPhraseBreak);
-        if (autoPhraseHistoryText_.size() > kSessionAutoPhraseHistoryCharLimit) {
-            autoPhraseHistoryText_.erase(0, autoPhraseHistoryText_.size() - kSessionAutoPhraseHistoryCharLimit);
-        }
-        PruneSessionAutoPhraseEntries();
+        TrimSessionAutoPhraseEntriesToHistoryWindow();
+        CompactSessionAutoPhraseEntries();
         QueueAutoPhraseSessionWrite();
     }
 }
 
-void TextService::CollectSessionAutoPhraseCandidatesForTail(ULONGLONG now) {
-    if (autoPhraseHistoryText_.size() < 2) {
+void TextService::CollectSessionAutoPhraseCandidatesForRange(const std::wstring& localText, size_t affectedStart, size_t affectedLength, ULONGLONG now) {
+    if (localText.size() < 2 || affectedLength == 0 || affectedStart >= localText.size()) {
         return;
     }
 
@@ -2991,30 +3331,21 @@ void TextService::CollectSessionAutoPhraseCandidatesForTail(ULONGLONG now) {
         return code;
     };
 
-    size_t tailStart = autoPhraseHistoryText_.find_last_of(kSessionAutoPhraseBreak);
-    if (tailStart == std::wstring::npos) {
-        tailStart = 0;
-    } else {
-        tailStart += 1;
-    }
-
-    if (tailStart >= autoPhraseHistoryText_.size()) {
-        return;
-    }
-
-    const std::wstring tailText = autoPhraseHistoryText_.substr(tailStart);
-    if (tailText.size() < 2) {
-        return;
-    }
-
-    const size_t maxPhraseLength = std::min(kSessionAutoPhraseMaxLength, tailText.size());
-    for (size_t start = 0; start + 2 <= tailText.size(); ++start) {
-        const size_t remaining = tailText.size() - start;
+    const size_t affectedEnd = std::min(localText.size(), affectedStart + affectedLength);
+    const size_t maxPhraseLength = std::min(kSessionAutoPhraseMaxLength, localText.size());
+    for (size_t start = 0; start + 2 <= localText.size(); ++start) {
+        const size_t remaining = localText.size() - start;
         const size_t maxLengthForStart = std::min(maxPhraseLength, remaining);
         for (size_t phraseLength = 2; phraseLength <= maxLengthForStart; ++phraseLength) {
-            const std::wstring phraseText = tailText.substr(start, phraseLength);
+            const size_t phraseEnd = start + phraseLength;
+            if (phraseEnd <= affectedStart || start >= affectedEnd) {
+                continue;
+            }
+
+            const std::wstring phraseText = localText.substr(start, phraseLength);
             auto existingIt = sessionAutoPhraseEntries_.find(phraseText);
             if (existingIt != sessionAutoPhraseEntries_.end()) {
+                existingIt->second.occurrenceCount += 1;
                 existingIt->second.lastTick = now;
                 continue;
             }
@@ -3047,19 +3378,17 @@ void TextService::CollectSessionAutoPhraseCandidatesForTail(ULONGLONG now) {
             SessionAutoPhraseEntry entry;
             entry.text = phraseText;
             entry.codes = std::move(sanitizedCodes);
+            entry.occurrenceCount = 1;
             entry.lastTick = now;
+            IndexSessionAutoPhraseEntry(entry);
             sessionAutoPhraseEntries_.emplace(entry.text, std::move(entry));
         }
     }
 }
 
-bool TextService::PruneSessionAutoPhraseEntries() {
-    if (sessionAutoPhraseEntries_.empty()) {
-        return false;
-    }
-
-    std::unordered_set<std::wstring> validPhrases;
-    validPhrases.reserve(sessionAutoPhraseEntries_.size() * 2);
+void TextService::RebuildSessionAutoPhraseEntriesFromHistory(ULONGLONG now) {
+    sessionAutoPhraseEntries_.clear();
+    sessionAutoPhraseTextsByCode_.clear();
 
     size_t segmentStart = 0;
     while (segmentStart < autoPhraseHistoryText_.size()) {
@@ -3077,22 +3406,98 @@ bool TextService::PruneSessionAutoPhraseEntries() {
 
         const size_t segmentLength = segmentEnd - segmentStart;
         if (segmentLength >= 2) {
-            const size_t maxPhraseLength = std::min(kSessionAutoPhraseMaxLength, segmentLength);
-            for (size_t start = 0; start + 2 <= segmentLength; ++start) {
-                const size_t remaining = segmentLength - start;
-                const size_t maxLengthForStart = std::min(maxPhraseLength, remaining);
-                for (size_t phraseLength = 2; phraseLength <= maxLengthForStart; ++phraseLength) {
-                    validPhrases.insert(autoPhraseHistoryText_.substr(segmentStart + start, phraseLength));
-                }
-            }
+            CollectSessionAutoPhraseCandidatesForRange(
+                autoPhraseHistoryText_.substr(segmentStart, segmentLength),
+                0,
+                segmentLength,
+                now);
         }
 
         segmentStart = segmentEnd + 1;
     }
+}
+
+void TextService::DecrementSessionAutoPhraseOccurrencesForRange(const std::wstring& localText, size_t affectedStart, size_t affectedLength) {
+    if (localText.size() < 2 || affectedLength == 0 || affectedStart >= localText.size()) {
+        return;
+    }
+
+    const size_t affectedEnd = std::min(localText.size(), affectedStart + affectedLength);
+    const size_t maxPhraseLength = std::min(kSessionAutoPhraseMaxLength, localText.size());
+    for (size_t start = 0; start + 2 <= localText.size(); ++start) {
+        const size_t remaining = localText.size() - start;
+        const size_t maxLengthForStart = std::min(maxPhraseLength, remaining);
+        for (size_t phraseLength = 2; phraseLength <= maxLengthForStart; ++phraseLength) {
+            const size_t phraseEnd = start + phraseLength;
+            if (phraseEnd <= affectedStart || start >= affectedEnd) {
+                continue;
+            }
+
+            const std::wstring phraseText = localText.substr(start, phraseLength);
+            const auto it = sessionAutoPhraseEntries_.find(phraseText);
+            if (it == sessionAutoPhraseEntries_.end()) {
+                continue;
+            }
+
+            if (it->second.occurrenceCount > 0) {
+                it->second.occurrenceCount -= 1;
+            }
+        }
+    }
+}
+
+bool TextService::TrimSessionAutoPhraseEntriesToHistoryWindow() {
+    size_t totalHanCharacters = CountHanCharacters(autoPhraseHistoryText_);
+    if (totalHanCharacters <= kSessionAutoPhraseHistoryCharLimit) {
+        return false;
+    }
 
     bool changed = false;
+    while (totalHanCharacters > kSessionAutoPhraseHistoryCharLimit && !autoPhraseHistoryText_.empty()) {
+        while (!autoPhraseHistoryText_.empty() && autoPhraseHistoryText_.front() == kSessionAutoPhraseBreak) {
+            autoPhraseHistoryText_.erase(0, 1);
+            changed = true;
+        }
+        if (autoPhraseHistoryText_.empty()) {
+            break;
+        }
+
+        size_t segmentEnd = autoPhraseHistoryText_.find(kSessionAutoPhraseBreak);
+        if (segmentEnd == std::wstring::npos) {
+            segmentEnd = autoPhraseHistoryText_.size();
+        }
+
+        const size_t segmentLength = segmentEnd;
+        const size_t overflow = totalHanCharacters - kSessionAutoPhraseHistoryCharLimit;
+        const size_t evictedCount = std::min(segmentLength, overflow);
+        if (evictedCount == 0) {
+            break;
+        }
+
+        const size_t rightOverlap = std::min<size_t>(kSessionAutoPhraseMaxLength - 1, segmentLength - evictedCount);
+        DecrementSessionAutoPhraseOccurrencesForRange(
+            autoPhraseHistoryText_.substr(0, evictedCount + rightOverlap),
+            0,
+            evictedCount);
+
+        autoPhraseHistoryText_.erase(0, evictedCount);
+        totalHanCharacters -= evictedCount;
+        changed = true;
+    }
+
+    while (!autoPhraseHistoryText_.empty() && autoPhraseHistoryText_.front() == kSessionAutoPhraseBreak) {
+        autoPhraseHistoryText_.erase(0, 1);
+        changed = true;
+    }
+
+    return changed;
+}
+
+bool TextService::CompactSessionAutoPhraseEntries() {
+    bool changed = false;
     for (auto it = sessionAutoPhraseEntries_.begin(); it != sessionAutoPhraseEntries_.end();) {
-        if (it->second.codes.empty() || validPhrases.find(it->first) == validPhrases.end()) {
+        if (it->second.codes.empty() || it->second.occurrenceCount == 0) {
+            RemoveSessionAutoPhraseEntryFromIndex(it->second);
             it = sessionAutoPhraseEntries_.erase(it);
             changed = true;
         } else {
@@ -3105,27 +3510,63 @@ bool TextService::PruneSessionAutoPhraseEntries() {
 
 void TextService::UpdateSessionAutoPhraseHistory(const std::wstring& committedText, ULONGLONG now) {
     bool changed = false;
+    size_t appendedHanCountInCurrentSegment = 0;
+
+    const auto flushCurrentSegment = [this, now, &appendedHanCountInCurrentSegment]() {
+        if (appendedHanCountInCurrentSegment == 0 || autoPhraseHistoryText_.empty()) {
+            return;
+        }
+
+        size_t segmentStart = autoPhraseHistoryText_.find_last_of(kSessionAutoPhraseBreak);
+        if (segmentStart == std::wstring::npos) {
+            segmentStart = 0;
+        } else {
+            segmentStart += 1;
+        }
+        if (segmentStart >= autoPhraseHistoryText_.size()) {
+            appendedHanCountInCurrentSegment = 0;
+            return;
+        }
+
+        const size_t segmentLength = autoPhraseHistoryText_.size() - segmentStart;
+        const size_t localLength = std::min(segmentLength, appendedHanCountInCurrentSegment + kSessionAutoPhraseMaxLength - 1);
+        const size_t localStart = autoPhraseHistoryText_.size() - localLength;
+        const size_t affectedStart = localLength - appendedHanCountInCurrentSegment;
+        CollectSessionAutoPhraseCandidatesForRange(
+            autoPhraseHistoryText_.substr(localStart, localLength),
+            affectedStart,
+            appendedHanCountInCurrentSegment,
+            now);
+        appendedHanCountInCurrentSegment = 0;
+    };
+
     for (wchar_t ch : committedText) {
         if (IsHanCharacter(ch)) {
             autoPhraseHistoryText_.push_back(ch);
-            if (autoPhraseHistoryText_.size() > kSessionAutoPhraseHistoryCharLimit) {
-                autoPhraseHistoryText_.erase(0, autoPhraseHistoryText_.size() - kSessionAutoPhraseHistoryCharLimit);
-            }
+            appendedHanCountInCurrentSegment += 1;
             changed = true;
         } else if (!autoPhraseHistoryText_.empty() && autoPhraseHistoryText_.back() != kSessionAutoPhraseBreak) {
+            flushCurrentSegment();
             autoPhraseHistoryText_.push_back(kSessionAutoPhraseBreak);
-            if (autoPhraseHistoryText_.size() > kSessionAutoPhraseHistoryCharLimit) {
-                autoPhraseHistoryText_.erase(0, autoPhraseHistoryText_.size() - kSessionAutoPhraseHistoryCharLimit);
-            }
             changed = true;
         }
     }
 
     if (changed) {
-        CollectSessionAutoPhraseCandidatesForTail(now);
-        PruneSessionAutoPhraseEntries();
+        flushCurrentSegment();
+        TrimSessionAutoPhraseEntriesToHistoryWindow();
+        CompactSessionAutoPhraseEntries();
         QueueAutoPhraseSessionWrite();
     }
+}
+
+size_t TextService::CountHanCharacters(const std::wstring& text) {
+    return static_cast<size_t>(std::count_if(
+        text.begin(),
+        text.end(),
+        [](wchar_t ch) {
+            return IsHanCharacter(ch);
+        }));
 }
 
 void TextService::MergeSessionAutoPhraseCandidates() {
@@ -3137,7 +3578,7 @@ void TextService::MergeSessionAutoPhraseCandidates() {
     sessionCandidates.reserve(16);
     for (const auto& pair : sessionAutoPhraseEntries_) {
         const SessionAutoPhraseEntry& entry = pair.second;
-        if (entry.text.empty()) {
+        if (entry.text.empty() || entry.occurrenceCount == 0) {
             continue;
         }
 
@@ -3183,14 +3624,57 @@ bool TextService::PromoteSessionAutoPhrase(const std::wstring& text) {
         MarkUserDictionaryDirty();
     }
 
+    RemoveSessionAutoPhraseEntryFromIndex(it->second);
     sessionAutoPhraseEntries_.erase(it);
     QueueAutoPhraseSessionWrite();
     return changed;
 }
 
-void TextService::RefreshCandidates(bool expandAll, bool prioritizeInput) {
+void TextService::ShowModeSwitchHint() {
+    if (!candidateWindow_.EnsureCreated()) {
+        return;
+    }
+
+    POINT anchor = {};
+    const POINT* anchorPtr = nullptr;
+    if (TryGetCaretScreenPoint(anchor)) {
+        anchorPtr = &anchor;
+        hasRecentAnchor_ = true;
+        lastAnchor_ = anchor;
+        lastAnchorTick_ = GetTickCount64();
+    } else if (hasRecentAnchor_) {
+        anchor = lastAnchor_;
+        anchorPtr = &anchor;
+    }
+
+    std::vector<CandidateWindow::DisplayCandidate> hintCandidates;
+    CandidateWindow::DisplayCandidate hintRow;
+    hintRow.text = chineseMode_ ? L"Chinese input" : L"English input";
+    hintRow.code = chineseMode_ ? L"ZH" : L"EN";
+    hintCandidates.push_back(std::move(hintRow));
+
+    candidateWindow_.Update(
+        L"Mode switched",
+        L"",
+        hintCandidates,
+        0,
+        1,
+        1,
+        0,
+        0,
+        chineseMode_,
+        fullShapeMode_,
+        anchorPtr,
+        true);
+
+    modeSwitchHintDueTick_ = GetTickCount64() + 900ULL;
+    ScheduleNextDeferredUiTask();
+}
+
+void TextService::RefreshCandidates(bool expandAll, bool prioritizeInput, bool updateCandidateWindow) {
     const LONGLONG refreshStartCounter = QueryPerfCounterValue();
     const ULONGLONG refreshNow = GetTickCount64();
+    modeSwitchHintDueTick_ = 0;
     if (prioritizeInput) {
         lastInteractiveInputTick_ = refreshNow;
         ++inputPriorityGeneration_;
@@ -3219,7 +3703,9 @@ void TextService::RefreshCandidates(bool expandAll, bool prioritizeInput) {
         pageIndex_ = 0;
         selectedIndexInPage_ = 0;
         emptyCandidateAlerted_ = false;
-        UpdateCandidateWindow();
+        if (updateCandidateWindow) {
+            UpdateCandidateWindow();
+        }
         return;
     }
 
@@ -3232,6 +3718,15 @@ void TextService::RefreshCandidates(bool expandAll, bool prioritizeInput) {
         : (recentCommitStartupFastPath
                ? std::max<size_t>(pageSize_ + 2, 8)
                : std::max<size_t>(pageSize_ * 2, 12));
+    const size_t estimatedCandidateCount =
+        primaryQueryLimit +
+        kPrefixCandidateQueryLimit +
+        kPhraseCandidateQueryLimit +
+        std::max(targetCandidateCount, pageSize_) +
+        16;
+    if (allCandidates_.capacity() < estimatedCandidateCount) {
+        allCandidates_.reserve(estimatedCandidateCount);
+    }
 
     const bool pinyinFallbackMode = dictionaryProfile_ == DictionaryProfile::ZhengmaLargePinyin;
     const bool allowIncrementalPrefixCache = !expandAll && !pinyinFallbackMode && compositionCode_.size() > 1;
@@ -3249,19 +3744,32 @@ void TextService::RefreshCandidates(bool expandAll, bool prioritizeInput) {
         return std::wstring(L"-");
     };
 
-    std::unordered_map<std::wstring, size_t> candidateIndexByKey;
-    candidateIndexByKey.reserve(primaryQueryLimit + 64);
+    std::unordered_map<std::wstring, std::vector<size_t>> candidateIndicesByText;
+    candidateIndicesByText.reserve(primaryQueryLimit + 64);
 
-    auto makeCandidateMergeKey = [](const std::wstring& text, const std::wstring& commitCode) {
-        std::wstring key;
-        key.reserve(text.size() + 1 + commitCode.size());
-        key.append(text);
-        key.push_back(L'\t');
-        key.append(commitCode);
-        return key;
+    auto findCandidateIndex = [this, &candidateIndicesByText](const std::wstring& text, const std::wstring& stableCommitCode) {
+        const auto textIt = candidateIndicesByText.find(text);
+        if (textIt == candidateIndicesByText.end()) {
+            return static_cast<size_t>(SIZE_MAX);
+        }
+
+        for (size_t candidateIndex : textIt->second) {
+            const CandidateItem& existing = allCandidates_[candidateIndex];
+            const std::wstring& existingCommitCode = existing.commitCode.empty() ? existing.code : existing.commitCode;
+            if (existingCommitCode == stableCommitCode) {
+                return candidateIndex;
+            }
+        }
+
+        return static_cast<size_t>(SIZE_MAX);
     };
 
-    auto mergeCandidate = [this, &candidateIndexByKey, &makeCandidateMergeKey](
+    auto indexCandidate = [&candidateIndicesByText](const std::wstring& text, size_t candidateIndex) {
+        auto [it, inserted] = candidateIndicesByText.try_emplace(text);
+        it->second.push_back(candidateIndex);
+    };
+
+    auto mergeCandidate = [this, &findCandidateIndex, &indexCandidate](
                               const std::wstring& text,
                               const std::wstring& displayCode,
                               const std::wstring& commitCode,
@@ -3274,17 +3782,16 @@ void TextService::RefreshCandidates(bool expandAll, bool prioritizeInput) {
                               bool fromAutoPhrase,
                               bool fromSessionAutoPhrase,
                               bool fromSystemDict,
+                              bool fromSystemCompatibility,
                               size_t consumedLength) {
         if (text.empty()) {
             return;
         }
 
         const std::wstring stableCommitCode = commitCode.empty() ? displayCode : commitCode;
-        const std::wstring candidateKey = makeCandidateMergeKey(text, stableCommitCode);
-
-        const auto existingIt = candidateIndexByKey.find(candidateKey);
-        if (existingIt != candidateIndexByKey.end()) {
-            CandidateItem& existing = allCandidates_[existingIt->second];
+        const size_t existingIndex = findCandidateIndex(text, stableCommitCode);
+        if (existingIndex != static_cast<size_t>(SIZE_MAX)) {
+            CandidateItem& existing = allCandidates_[existingIndex];
 
             existing.boostedUser = existing.boostedUser || boostedUser;
             existing.boostedLearned = existing.boostedLearned || boostedLearned;
@@ -3293,6 +3800,7 @@ void TextService::RefreshCandidates(bool expandAll, bool prioritizeInput) {
             existing.fromAutoPhrase = existing.fromAutoPhrase || fromAutoPhrase;
             existing.fromSessionAutoPhrase = existing.fromSessionAutoPhrase || fromSessionAutoPhrase;
             existing.fromSystemDict = existing.fromSystemDict || fromSystemDict;
+            existing.fromSystemCompatibility = existing.fromSystemCompatibility && fromSystemCompatibility;
             if (learnedScore > existing.learnedScore) {
                 existing.learnedScore = learnedScore;
             }
@@ -3306,6 +3814,7 @@ void TextService::RefreshCandidates(bool expandAll, bool prioritizeInput) {
                 (boostedContext && !existing.boostedContext);
             if (preferNewCode) {
                 existing.code = displayCode;
+                existing.fromSystemCompatibility = fromSystemCompatibility;
             }
 
             if (existing.commitCode.empty()) {
@@ -3330,12 +3839,13 @@ void TextService::RefreshCandidates(bool expandAll, bool prioritizeInput) {
         candidate.fromAutoPhrase = fromAutoPhrase;
         candidate.fromSessionAutoPhrase = fromSessionAutoPhrase;
         candidate.fromSystemDict = fromSystemDict;
+        candidate.fromSystemCompatibility = fromSystemCompatibility;
         candidate.consumedLength = consumedLength;
         allCandidates_.push_back(std::move(candidate));
-        candidateIndexByKey.emplace(candidateKey, allCandidates_.size() - 1);
+        indexCandidate(allCandidates_.back().text, allCandidates_.size() - 1);
     };
 
-    std::vector<CandidateItem> helperTailCandidates;
+    bool hasExactCurrentCode = false;
 
     if (allowIncrementalPrefixCache) {
         const std::wstring previousCode = compositionCode_.substr(0, compositionCode_.size() - 1);
@@ -3356,30 +3866,58 @@ void TextService::RefreshCandidates(bool expandAll, bool prioritizeInput) {
 
                 CandidateItem candidate = cached;
                 candidate.exactMatch = stableCode == compositionCode_;
+                hasExactCurrentCode = hasExactCurrentCode || candidate.exactMatch;
                 candidate.consumedLength = compositionCode_.size();
                 if (candidate.code.empty()) {
                     candidate.code = stableCode;
                 }
 
-                const std::wstring candidateKey = makeCandidateMergeKey(candidate.text, stableCode);
-                if (candidateIndexByKey.find(candidateKey) != candidateIndexByKey.end()) {
+                if (findCandidateIndex(candidate.text, stableCode) != static_cast<size_t>(SIZE_MAX)) {
                     continue;
                 }
 
                 allCandidates_.push_back(std::move(candidate));
-                candidateIndexByKey.emplace(candidateKey, allCandidates_.size() - 1);
+                indexCandidate(allCandidates_.back().text, allCandidates_.size() - 1);
             }
         }
     }
 
-    bool hasExactCurrentCode = std::any_of(
-        allCandidates_.begin(),
-        allCandidates_.end(),
-        [](const CandidateItem& item) {
-            return item.exactMatch;
-        });
+    const bool exactCodeStartupFastPath =
+        !expandAll &&
+        compositionCode_.size() == 1;
+    if (exactCodeStartupFastPath) {
+        const std::vector<CompositionEngine::Entry> exactQueried = engine_.QueryExactCandidateEntries(compositionCode_, primaryQueryLimit);
+        for (const auto& item : exactQueried) {
+            if (pinyinFallbackMode && item.text.size() != 1) {
+                continue;
+            }
+
+            hasExactCurrentCode = hasExactCurrentCode || item.code == compositionCode_;
+            const std::wstring displayCode = buildDisplayCode(item.text, item.code);
+            mergeCandidate(
+                item.text,
+                displayCode,
+                item.code.empty() ? compositionCode_ : item.code,
+                0,
+                item.learnedScore,
+                item.code == compositionCode_,
+                item.isUser && !item.isAutoPhrase,
+                item.isLearned,
+                false,
+                item.isAutoPhrase,
+                false,
+                !item.isUser,
+                item.isCompatibilitySource,
+                compositionCode_.size());
+        }
+    }
+
     const bool canUseIncrementalPrefixFastPath =
         allowIncrementalPrefixCache &&
+        hasExactCurrentCode &&
+        allCandidates_.size() >= pageSize_;
+    const bool exactCodeFastPathSatisfied =
+        exactCodeStartupFastPath &&
         hasExactCurrentCode &&
         allCandidates_.size() >= pageSize_;
 
@@ -3391,12 +3929,12 @@ void TextService::RefreshCandidates(bool expandAll, bool prioritizeInput) {
                    : (compositionCode_.size() == 2 ? kFastQueryScanBudgetTwoChar : 0));
 
     const std::vector<CompositionEngine::Entry> queried =
-        canUseIncrementalPrefixFastPath
+        (canUseIncrementalPrefixFastPath || exactCodeFastPathSatisfied)
             ? std::vector<CompositionEngine::Entry>()
             : (fastQueryScanBudget == 0
                    ? engine_.QueryCandidateEntries(compositionCode_, primaryQueryLimit)
                    : engine_.QueryCandidateEntriesFast(compositionCode_, primaryQueryLimit, fastQueryScanBudget));
-    if (!canUseIncrementalPrefixFastPath) {
+    if (!(canUseIncrementalPrefixFastPath || exactCodeFastPathSatisfied)) {
         allCandidates_.reserve(std::max(allCandidates_.capacity(), queried.size() + 32));
     }
 
@@ -3420,6 +3958,7 @@ void TextService::RefreshCandidates(bool expandAll, bool prioritizeInput) {
             item.isAutoPhrase,
             false,
             !item.isUser,
+            item.isCompatibilitySource,
             compositionCode_.size());
     }
 
@@ -3427,7 +3966,10 @@ void TextService::RefreshCandidates(bool expandAll, bool prioritizeInput) {
         return allCandidates_.size() < targetCandidateCount;
     };
 
-    const bool fastPathSatisfied = !expandAll && hasExactCurrentCode && allCandidates_.size() >= pageSize_;
+    const bool fastPathSatisfied =
+        !expandAll &&
+        hasExactCurrentCode &&
+        allCandidates_.size() >= pageSize_;
 
     if (!fastPathSatisfied && pinyinFallbackMode && allCandidates_.empty() && compositionCode_.size() > 2) {
         std::wstring prefixCode = compositionCode_;
@@ -3454,6 +3996,7 @@ void TextService::RefreshCandidates(bool expandAll, bool prioritizeInput) {
                     item.isAutoPhrase,
                     false,
                     !item.isUser,
+                    item.isCompatibilitySource,
                     prefixLength);
             }
 
@@ -3490,6 +4033,7 @@ void TextService::RefreshCandidates(bool expandAll, bool prioritizeInput) {
                     item.isAutoPhrase,
                     false,
                     !item.isUser,
+                    item.isCompatibilitySource,
                     prefixLength);
             }
 
@@ -3535,6 +4079,7 @@ void TextService::RefreshCandidates(bool expandAll, bool prioritizeInput) {
                     item.isAutoPhrase,
                     false,
                     !item.isUser,
+                    item.isCompatibilitySource,
                     compositionCode_.size());
             }
         }
@@ -3570,41 +4115,45 @@ void TextService::RefreshCandidates(bool expandAll, bool prioritizeInput) {
     }
 
     if (!fastPathSatisfied && !pinyinFallbackMode && compositionCode_.size() >= 4) {
-        for (const auto& pair : sessionAutoPhraseEntries_) {
-            const SessionAutoPhraseEntry& entry = pair.second;
-            if (entry.text.empty()) {
-                continue;
-            }
-            if (std::find(entry.codes.begin(), entry.codes.end(), compositionCode_) == entry.codes.end()) {
-                continue;
-            }
+        const auto sessionCodeIt = sessionAutoPhraseTextsByCode_.find(compositionCode_);
+        if (sessionCodeIt != sessionAutoPhraseTextsByCode_.end()) {
+            for (const std::wstring& text : sessionCodeIt->second) {
+                const auto entryIt = sessionAutoPhraseEntries_.find(text);
+                if (entryIt == sessionAutoPhraseEntries_.end()) {
+                    continue;
+                }
 
-            mergeCandidate(
-                entry.text,
-                compositionCode_,
-                compositionCode_,
-                0,
-                0,
-                true,
-                false,
-                false,
-                false,
-                false,
-                true,
-                false,
-                compositionCode_.size());
+                const SessionAutoPhraseEntry& entry = entryIt->second;
+                if (entry.text.empty() || entry.occurrenceCount == 0) {
+                    continue;
+                }
+
+                mergeCandidate(
+                    entry.text,
+                    compositionCode_,
+                    compositionCode_,
+                    0,
+                    0,
+                    true,
+                    false,
+                    false,
+                    false,
+                    false,
+                    true,
+                    false,
+                    false,
+                    compositionCode_.size());
+            }
         }
 
         const auto helperIt = helperAutoPhraseEntriesByCode_.find(compositionCode_);
         if (helperIt != helperAutoPhraseEntriesByCode_.end()) {
-            helperTailCandidates.reserve(helperIt->second.size());
             for (const HelperAutoPhraseEntry& entry : helperIt->second) {
                 if (entry.text.empty()) {
                     continue;
                 }
 
-                const std::wstring candidateKey = makeCandidateMergeKey(entry.text, compositionCode_);
-                if (candidateIndexByKey.find(candidateKey) != candidateIndexByKey.end()) {
+                if (findCandidateIndex(entry.text, compositionCode_) != static_cast<size_t>(SIZE_MAX)) {
                     continue;
                 }
 
@@ -3615,7 +4164,7 @@ void TextService::RefreshCandidates(bool expandAll, bool prioritizeInput) {
                 candidate.exactMatch = true;
                 candidate.fromAutoPhrase = true;
                 candidate.consumedLength = compositionCode_.size();
-                helperTailCandidates.push_back(std::move(candidate));
+                allCandidates_.push_back(std::move(candidate));
             }
         }
     }
@@ -3625,9 +4174,13 @@ void TextService::RefreshCandidates(bool expandAll, bool prioritizeInput) {
         !lastAutoPhraseSelectedKey_.empty() &&
         now >= autoPhraseSelectedTick_ &&
         (now - autoPhraseSelectedTick_) <= 60000ULL;
+    const size_t repeatKeyDelimiterPos = repeatBoostActive
+        ? lastAutoPhraseSelectedKey_.find(L'\t')
+        : std::wstring::npos;
 
     auto fillSortHints = [this](CandidateItem& candidate) {
-        candidate.sortAutoOnly = candidate.fromAutoPhrase && !candidate.fromSystemDict && !candidate.boostedUser;
+        candidate.sortTemporaryAutoPhrase = candidate.fromSessionAutoPhrase || candidate.fromAutoPhrase;
+        candidate.sortAutoOnly = candidate.sortTemporaryAutoPhrase;
         candidate.sortSingleChar = candidate.text.size() == 1;
         candidate.sortGB2312Text = IsTextInGB2312Cached(candidate.text);
         candidate.sortNonGB2312Single = candidate.sortSingleChar && !candidate.sortGB2312Text;
@@ -3674,10 +4227,12 @@ void TextService::RefreshCandidates(bool expandAll, bool prioritizeInput) {
              candidate.contextScore > 0);
 
         std::uint8_t tier = 7;
-        if (candidate.sortNonGB2312Single) {
-            tier = 250;
-        } else if (candidate.sortSystemFiveCodePhrase) {
+        if (candidate.sortSystemFiveCodePhrase) {
             tier = 240;
+        } else if (candidate.fromSystemCompatibility) {
+            tier = 245;
+        } else if (candidate.sortNonGB2312Single) {
+            tier = 250;
         } else if (candidate.sortPreferredPhrase) {
             tier = 0;
         } else if (candidate.sortSingleChar && sortCodeLength <= 1) {
@@ -3702,10 +4257,12 @@ void TextService::RefreshCandidates(bool expandAll, bool prioritizeInput) {
 
     for (CandidateItem& candidate : allCandidates_) {
         candidate.boostedAutoRepeat = false;
-        if (repeatBoostActive && candidate.fromAutoPhrase) {
-            const std::wstring candidateKey =
-                (candidate.commitCode.empty() ? compositionCode_ : candidate.commitCode) + L"\t" + candidate.text;
-            candidate.boostedAutoRepeat = candidateKey == lastAutoPhraseSelectedKey_;
+        if (repeatKeyDelimiterPos != std::wstring::npos && candidate.fromAutoPhrase) {
+            const std::wstring& repeatCommitCode = candidate.commitCode.empty() ? compositionCode_ : candidate.commitCode;
+            candidate.boostedAutoRepeat =
+                lastAutoPhraseSelectedKey_.compare(0, repeatKeyDelimiterPos, repeatCommitCode) == 0 &&
+                lastAutoPhraseSelectedKey_.size() == repeatKeyDelimiterPos + 1 + candidate.text.size() &&
+                lastAutoPhraseSelectedKey_.compare(repeatKeyDelimiterPos + 1, candidate.text.size(), candidate.text) == 0;
         }
         fillSortHints(candidate);
     }
@@ -3719,6 +4276,17 @@ void TextService::RefreshCandidates(bool expandAll, bool prioritizeInput) {
                 if (left.sortSingleChar != right.sortSingleChar) {
                     return left.sortSingleChar > right.sortSingleChar;
                 }
+            }
+            if (left.sortTemporaryAutoPhrase != right.sortTemporaryAutoPhrase) {
+                const bool leftIsNonGbSingle = !left.sortTemporaryAutoPhrase && left.sortNonGB2312Single;
+                const bool rightIsNonGbSingle = !right.sortTemporaryAutoPhrase && right.sortNonGB2312Single;
+                if (left.sortTemporaryAutoPhrase && rightIsNonGbSingle) {
+                    return true;
+                }
+                if (right.sortTemporaryAutoPhrase && leftIsNonGbSingle) {
+                    return false;
+                }
+                return right.sortTemporaryAutoPhrase;
             }
             if (left.exactMatch != right.exactMatch) {
                 return left.exactMatch > right.exactMatch;
@@ -3773,10 +4341,6 @@ void TextService::RefreshCandidates(bool expandAll, bool prioritizeInput) {
             return false;
         });
 
-    for (CandidateItem& candidate : helperTailCandidates) {
-        allCandidates_.push_back(std::move(candidate));
-    }
-
     pageIndex_ = 0;
     selectedIndexInPage_ = FindPreferredSelectionIndexForPage(pageIndex_);
     if (allCandidates_.empty()) {
@@ -3789,7 +4353,9 @@ void TextService::RefreshCandidates(bool expandAll, bool prioritizeInput) {
     }
 
     CacheCurrentCandidatesForCode();
-    UpdateCandidateWindow();
+    if (updateCandidateWindow) {
+        UpdateCandidateWindow();
+    }
     if (!expandAll) {
         ScheduleDeferredCandidateExpansion();
     }
@@ -3923,7 +4489,7 @@ bool TextService::LoadConfiguredDictionaries() {
     }
 
     const bool loadedPackagedUser = engine_.LoadUserDictionaryFromFile(userDictPath_);
-    const bool loadedPackagedAutoPhrase = engine_.LoadAutoPhraseDictionaryFromFile(autoPhraseDictPath_);
+    const bool loadedPackagedAutoPhrase = engine_.LoadCompatibilityDictionaryFromFile(autoPhraseDictPath_);
     const bool loadedRoamingAutoPhrase = !autoPhraseUserPath_.empty() && engine_.LoadAutoPhraseDictionaryFromFile(autoPhraseUserPath_);
     const bool loadedHelperAutoPhrase = LoadHelperAutoPhraseEntries();
         helperAutoPhraseStamp_ = QueryFileStampToken(autoPhraseHelperPath_);
@@ -4286,6 +4852,7 @@ std::uint64_t TextService::QueryContextAssociationScore(const std::wstring& prev
 void TextService::UpdateCandidateWindow() {
     const LONGLONG updateWindowStartCounter = QueryPerfCounterValue();
     if (compositionCode_.empty()) {
+        deferredAnchorRefreshDueTick_ = 0;
         candidateWindow_.Hide();
         return;
     }
@@ -4299,29 +4866,39 @@ void TextService::UpdateCandidateWindow() {
     const POINT* anchorPtr = nullptr;
     bool hasFocusedContext = false;
     const ULONGLONG nowTick = GetTickCount64();
+    const bool candidateWindowVisible = candidateWindow_.IsVisible();
+    const bool hasReusableAnchor =
+        hasRecentAnchor_ &&
+        nowTick >= lastAnchorTick_ &&
+        (nowTick - lastAnchorTick_) <= kAnchorReuseWindowMs;
 
     const bool recentCommitAnchorReuse =
         lastCompletedCompositionCommitTick_ != 0 &&
         nowTick >= lastCompletedCompositionCommitTick_ &&
         (nowTick - lastCompletedCompositionCommitTick_) <= kAnchorFastReuseWindowMs;
 
-    if (hasRecentAnchor_ &&
-        nowTick >= lastAnchorTick_ &&
+    const bool fastVisibleAnchorReuse =
+        hasReusableAnchor &&
         (nowTick - lastAnchorTick_) <= kAnchorFastReuseWindowMs &&
-        (candidateWindow_.IsVisible() || recentCommitAnchorReuse)) {
-        anchor = lastAnchor_;
-        anchorPtr = &anchor;
-        hasFocusedContext = candidateWindow_.IsVisible();
-    }
+        (candidateWindowVisible || recentCommitAnchorReuse);
+    const bool focusStartupAnchorReuse =
+        hasReusableAnchor &&
+        !candidateWindowVisible &&
+        focusGainedTick_ != 0 &&
+        nowTick >= focusGainedTick_ &&
+        (nowTick - focusGainedTick_) <= kFocusStartupFastWindowMs;
 
     ITfContext* focusedContext = nullptr;
-    if (!hasFocusedContext && TryGetFocusedContext(threadMgr_, &focusedContext)) {
+    if (focusStartupAnchorReuse) {
+        anchor = lastAnchor_;
+        anchorPtr = &anchor;
+    }
+
+    const bool shouldQueryFocusedContext = !focusStartupAnchorReuse;
+    if (shouldQueryFocusedContext && TryGetFocusedContext(threadMgr_, &focusedContext)) {
         hasFocusedContext = true;
         if (TryGetCaretScreenPointFromContext(focusedContext, clientId_, anchor)) {
             anchorPtr = &anchor;
-            hasRecentAnchor_ = true;
-            lastAnchor_ = anchor;
-            lastAnchorTick_ = nowTick;
         }
         focusedContext->Release();
     }
@@ -4329,39 +4906,42 @@ void TextService::UpdateCandidateWindow() {
     if (anchorPtr == nullptr) {
         POINT fallbackAnchor = {};
         if (TryGetCaretScreenPoint(fallbackAnchor)) {
-            bool useCachedAnchor = false;
-            if (hasRecentAnchor_) {
-                const ULONGLONG nowTick = GetTickCount64();
-                if (nowTick >= lastAnchorTick_ && (nowTick - lastAnchorTick_) <= kAnchorReuseWindowMs) {
-                    const int distance = std::abs(fallbackAnchor.x - lastAnchor_.x) + std::abs(fallbackAnchor.y - lastAnchor_.y);
-                    useCachedAnchor = distance > 420;
-                }
-            }
-
-            anchor = useCachedAnchor ? lastAnchor_ : fallbackAnchor;
+            anchor = fallbackAnchor;
             anchorPtr = &anchor;
         }
-        else if (hasRecentAnchor_) {
-            const ULONGLONG nowTick = GetTickCount64();
-            if (nowTick >= lastAnchorTick_ && (nowTick - lastAnchorTick_) <= kAnchorReuseWindowMs) {
-                anchor = lastAnchor_;
-                anchorPtr = &anchor;
-            }
-        }
+    }
+
+    if (anchorPtr == nullptr && fastVisibleAnchorReuse) {
+        anchor = lastAnchor_;
+        anchorPtr = &anchor;
+    }
+
+    if (anchorPtr == nullptr && !hasFocusedContext) {
+        candidateWindow_.Hide();
+        Trace(L"UpdateCandidateWindow: no focused context or anchor, hide candidate window");
+        return;
     }
 
     if (anchorPtr != nullptr) {
         hasRecentAnchor_ = true;
         lastAnchor_ = *anchorPtr;
         lastAnchorTick_ = nowTick;
-    } else if (!hasFocusedContext) {
-        candidateWindow_.Hide();
-        Trace(L"UpdateCandidateWindow: no focused context or anchor, hide candidate window");
-        return;
+    }
+
+    if (focusStartupAnchorReuse) {
+        const ULONGLONG nextRefreshTick = nowTick + kDeferredAnchorRefreshDelayMs;
+        if (deferredAnchorRefreshDueTick_ == 0 || nextRefreshTick < deferredAnchorRefreshDueTick_) {
+            deferredAnchorRefreshDueTick_ = nextRefreshTick;
+        }
+        ScheduleNextDeferredUiTask();
+    } else {
+        deferredAnchorRefreshDueTick_ = 0;
     }
 
     const auto& pageCandidates = GetCurrentPageCandidates();
+    const std::wstring headerText = compositionCode_;
     candidateWindow_.Update(
+        headerText,
         compositionCode_,
         pageCandidates,
         pageIndex_,
@@ -4371,7 +4951,8 @@ void TextService::UpdateCandidateWindow() {
         pageIndex_ * pageSize_ + selectedIndexInPage_,
         chineseMode_,
         fullShapeMode_,
-        anchorPtr);
+        anchorPtr,
+        false);
     TraceLatencySample(
         L"candidate-window code=" + compositionCode_ +
             L" visible=" + std::to_wstring(pageCandidates.empty() ? 0 : 1) +
@@ -4559,11 +5140,27 @@ void TextService::ScheduleDeferredMaintenance() {
 
 void TextService::ProcessDeferredUiTasks() {
     const ULONGLONG now = GetTickCount64();
+    if (modeSwitchHintDueTick_ != 0 && now >= modeSwitchHintDueTick_) {
+        modeSwitchHintDueTick_ = 0;
+        if (compositionCode_.empty()) {
+            candidateWindow_.Hide();
+        }
+    }
+
+    if (deferredAnchorRefreshDueTick_ != 0 && now >= deferredAnchorRefreshDueTick_) {
+        deferredAnchorRefreshDueTick_ = 0;
+        if (!compositionCode_.empty() && candidateWindow_.IsVisible()) {
+            UpdateCandidateWindow();
+            return;
+        }
+    }
+
     if (deferredMaintenanceDueTick_ != 0) {
         if (IsInputPriorityActive(now)) {
             deferredMaintenanceDueTick_ = std::max(deferredMaintenanceDueTick_, lastInteractiveInputTick_ + kInputPriorityWindowMs);
         } else if (now >= deferredMaintenanceDueTick_) {
             deferredMaintenanceDueTick_ = 0;
+            RunDeferredRuntimeWarmup();
             const bool userDataReloaded = ReloadUserDataIfChanged(false);
             const bool helperReloaded = ReloadHelperAutoPhraseEntriesIfChanged(false);
             if ((userDataReloaded || helperReloaded) && !compositionCode_.empty()) {
@@ -4577,10 +5174,33 @@ void TextService::ProcessDeferredUiTasks() {
     ScheduleNextDeferredUiTask();
 }
 
+void TextService::RunDeferredRuntimeWarmup() {
+    if (!deferredRuntimeWarmupPending_ || userDataDir_.empty()) {
+        return;
+    }
+
+    deferredRuntimeWarmupPending_ = false;
+    LoadAutoPhraseSessionState();
+    autoPhraseBuilderPending_ = true;
+    LaunchAutoPhraseBuilderProcess();
+    if (FileContainsLegacyFrequencyNoise(userFreqPath_)) {
+        engine_.SaveFrequencyToFile(userFreqPath_);
+    }
+    SyncUserDataFilesStamp();
+    helperAutoPhraseStamp_ = QueryFileStampToken(autoPhraseHelperPath_);
+    Trace(L"runtime deferred warmup completed");
+}
+
 void TextService::ScheduleNextDeferredUiTask() {
     ULONGLONG nextDueTick = 0;
+    if (deferredAnchorRefreshDueTick_ != 0) {
+        nextDueTick = deferredAnchorRefreshDueTick_;
+    }
     if (deferredMaintenanceDueTick_ != 0) {
-        nextDueTick = deferredMaintenanceDueTick_;
+        nextDueTick = nextDueTick == 0 ? deferredMaintenanceDueTick_ : std::min(nextDueTick, deferredMaintenanceDueTick_);
+    }
+    if (modeSwitchHintDueTick_ != 0 && (nextDueTick == 0 || modeSwitchHintDueTick_ < nextDueTick)) {
+        nextDueTick = modeSwitchHintDueTick_;
     }
     if (deferredExpansionDueTick_ != 0 && (nextDueTick == 0 || deferredExpansionDueTick_ < nextDueTick)) {
         nextDueTick = deferredExpansionDueTick_;
@@ -4755,7 +5375,16 @@ bool TextService::CommitCandidateByGlobalIndex(ITfContext* context, size_t globa
         autoPhraseSelectedTick_ = 0;
     }
 
-    engine_.RecordCommit(freqCode, textToCommit, freqBoost);
+    std::uint64_t effectiveFreqBoost = freqBoost;
+    if (textToCommit.size() == 1) {
+        if (freqCode.size() <= 2) {
+            effectiveFreqBoost = std::max<std::uint64_t>(effectiveFreqBoost, freqBoost * 6);
+        } else if (freqCode.size() == 3) {
+            effectiveFreqBoost = std::max<std::uint64_t>(effectiveFreqBoost, freqBoost * 3);
+        }
+    }
+
+    engine_.RecordCommit(freqCode, textToCommit, effectiveFreqBoost, !candidate.fromSystemCompatibility);
     LearnPhraseFromRecentCommits(freqCode, textToCommit);
     MarkFrequencyDataDirty();
     FlushPendingUserDataIfNeeded(false);
@@ -4871,12 +5500,14 @@ bool TextService::ShowStatusMenu() {
 
     if (cmd == kMenuToggleChinese) {
         chineseMode_ = !chineseMode_;
+        RefreshLangBarIndicator();
         if (!chineseMode_) {
             ClearComposition();
             candidateWindow_.Hide();
         } else {
             UpdateCandidateWindow();
         }
+        ShowModeSwitchHint();
         Trace(std::wstring(L"menu mode=") + (chineseMode_ ? L"ZH" : L"EN"));
         return true;
     }
@@ -5162,6 +5793,12 @@ void TextService::LoadSettings() {
     }
 }
 
+void TextService::RefreshLangBarIndicator() {
+    if (configLangBarItem_ != nullptr) {
+        configLangBarItem_->SetChineseMode(chineseMode_);
+    }
+}
+
 bool TextService::PersistDictionaryProfileSetting() const {
     const std::filesystem::path settingsPath = GetSettingsPath(userDataDir_, false);
     if (settingsPath.empty()) {
@@ -5252,12 +5889,28 @@ bool TextService::IsToggleHotkeyPressed(WPARAM wParam) const {
 }
 
 STDMETHODIMP TextService::OnSetFocus(BOOL foreground) {
+    if (foreground) {
+        focusGainedTick_ = GetTickCount64();
+        POINT focusAnchor = {};
+        if (TryGetCaretScreenPoint(focusAnchor)) {
+            hasRecentAnchor_ = true;
+            lastAnchor_ = focusAnchor;
+            lastAnchorTick_ = focusGainedTick_;
+        }
+        if (chineseMode_ && !runtimeReady_) {
+            EnsureRuntimeReady();
+        }
+    }
+
     if (!foreground) {
+        focusGainedTick_ = 0;
+        deferredAnchorRefreshDueTick_ = 0;
         const bool hadComposition = !compositionCode_.empty();
         if (hadComposition) {
             ClearComposition();
         }
         const bool hidWindow = candidateWindow_.Hide();
+        hasRecentAnchor_ = false;
         if (hadComposition || hidWindow) {
             Trace(L"OnSetFocus(BOOL): hide candidate window");
         }
@@ -5292,11 +5945,26 @@ STDMETHODIMP TextService::OnUninitDocumentMgr(ITfDocumentMgr* documentMgr) {
 
 STDMETHODIMP TextService::OnSetFocus(ITfDocumentMgr* documentMgrFocus, ITfDocumentMgr* documentMgrPrevFocus) {
     if (documentMgrFocus != documentMgrPrevFocus) {
+        focusGainedTick_ = documentMgrFocus != nullptr ? GetTickCount64() : 0;
+        POINT focusAnchor = {};
+        if (documentMgrFocus != nullptr && TryGetCaretScreenPoint(focusAnchor)) {
+            hasRecentAnchor_ = true;
+            lastAnchor_ = focusAnchor;
+            lastAnchorTick_ = focusGainedTick_;
+        }
+        if (documentMgrFocus != nullptr && chineseMode_ && !runtimeReady_) {
+            EnsureRuntimeReady();
+        }
+
         const bool hadComposition = !compositionCode_.empty();
         if (hadComposition) {
             ClearComposition();
         }
         const bool hidWindow = candidateWindow_.Hide();
+        if (documentMgrFocus == nullptr) {
+            hasRecentAnchor_ = false;
+            deferredAnchorRefreshDueTick_ = 0;
+        }
         if (hadComposition || hidWindow) {
             Trace(L"OnSetFocus(DocumentMgr): hide candidate window");
         }
@@ -5320,21 +5988,11 @@ STDMETHODIMP TextService::OnTestKeyDown(ITfContext*, WPARAM wParam, LPARAM lPara
 
     const WPARAM key = NormalizeVirtualKey(wParam, lParam);
     const bool verboseKeyTrace = IsVerboseKeyTraceEnabled();
-    const bool ctrlPressed =
-        (GetKeyState(VK_CONTROL) & 0x8000) != 0 ||
-        (GetKeyState(VK_LCONTROL) & 0x8000) != 0 ||
-        (GetKeyState(VK_RCONTROL) & 0x8000) != 0 ||
-        (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0 ||
-        (GetAsyncKeyState(VK_LCONTROL) & 0x8000) != 0 ||
-        (GetAsyncKeyState(VK_RCONTROL) & 0x8000) != 0;
-    const bool altPressed =
-        (GetKeyState(VK_MENU) & 0x8000) != 0 ||
-        (GetKeyState(VK_LMENU) & 0x8000) != 0 ||
-        (GetKeyState(VK_RMENU) & 0x8000) != 0;
-    const bool winPressed =
-        (GetKeyState(VK_LWIN) & 0x8000) != 0 ||
-        (GetKeyState(VK_RWIN) & 0x8000) != 0;
-    const bool shiftPressed = IsShiftPressed();
+    const KeyboardModifierState modifiers = QueryKeyboardModifierState();
+    const bool ctrlPressed = modifiers.ctrlPressed;
+    const bool altPressed = modifiers.altPressed;
+    const bool winPressed = modifiers.winPressed;
+    const bool shiftPressed = modifiers.shiftPressed;
     const bool modeSwitchHotkey = ctrlPressed && shiftPressed && (key == VK_F3 || key == VK_F4);
     const bool manualEntryHotkey = ctrlPressed && shiftPressed && (key == L'M' || key == L'm');
     size_t selectionOffset = 0;
@@ -5510,21 +6168,11 @@ STDMETHODIMP TextService::OnKeyDown(ITfContext* context, WPARAM wParam, LPARAM l
 
     *eaten = FALSE;
 
-    const bool ctrlPressed =
-        (GetKeyState(VK_CONTROL) & 0x8000) != 0 ||
-        (GetKeyState(VK_LCONTROL) & 0x8000) != 0 ||
-        (GetKeyState(VK_RCONTROL) & 0x8000) != 0 ||
-        (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0 ||
-        (GetAsyncKeyState(VK_LCONTROL) & 0x8000) != 0 ||
-        (GetAsyncKeyState(VK_RCONTROL) & 0x8000) != 0;
-    const bool shiftPressed = IsShiftPressed();
-    const bool altPressed =
-        (GetKeyState(VK_MENU) & 0x8000) != 0 ||
-        (GetKeyState(VK_LMENU) & 0x8000) != 0 ||
-        (GetKeyState(VK_RMENU) & 0x8000) != 0;
-    const bool winPressed =
-        (GetKeyState(VK_LWIN) & 0x8000) != 0 ||
-        (GetKeyState(VK_RWIN) & 0x8000) != 0;
+    const KeyboardModifierState modifiers = QueryKeyboardModifierState();
+    const bool ctrlPressed = modifiers.ctrlPressed;
+    const bool shiftPressed = modifiers.shiftPressed;
+    const bool altPressed = modifiers.altPressed;
+    const bool winPressed = modifiers.winPressed;
 
     size_t ctrlSelectionOffset = 0;
     const bool ctrlDigitHotkey = ctrlPressed && TryMapSelectionInputToIndex(key, lParam, ctrlSelectionOffset);
@@ -5592,12 +6240,8 @@ STDMETHODIMP TextService::OnKeyDown(ITfContext* context, WPARAM wParam, LPARAM l
 
     if (key == VK_SHIFT || key == VK_LSHIFT || key == VK_RSHIFT) {
         const UINT scanCode = (static_cast<UINT>(lParam) >> 16) & 0xFF;
-        const bool leftDown =
-            (GetKeyState(VK_LSHIFT) & 0x8000) != 0 ||
-            (GetAsyncKeyState(VK_LSHIFT) & 0x8000) != 0;
-        const bool rightDown =
-            (GetKeyState(VK_RSHIFT) & 0x8000) != 0 ||
-            (GetAsyncKeyState(VK_RSHIFT) & 0x8000) != 0;
+        const bool leftDown = modifiers.leftShiftPressed;
+        const bool rightDown = modifiers.rightShiftPressed;
         if (verboseKeyTrace) {
             wchar_t shiftLog[220] = {};
             swprintf_s(
@@ -5628,12 +6272,14 @@ STDMETHODIMP TextService::OnKeyDown(ITfContext* context, WPARAM wParam, LPARAM l
 
     if (IsToggleHotkeyPressed(key)) {
         chineseMode_ = !chineseMode_;
+        RefreshLangBarIndicator();
         if (!chineseMode_) {
             ClearComposition();
             candidateWindow_.Hide();
         } else {
             UpdateCandidateWindow();
         }
+        ShowModeSwitchHint();
         *eaten = TRUE;
         Trace(std::wstring(L"mode=") + (chineseMode_ ? L"ZH" : L"EN"));
         return S_OK;
@@ -5755,10 +6401,20 @@ STDMETHODIMP TextService::OnKeyDown(ITfContext* context, WPARAM wParam, LPARAM l
     }
 
     std::wstring punctuationText;
+    const auto tryCommitFirstCandidateInCurrentWindow = [this, context]() {
+        const size_t pageCandidateCount = GetCurrentPageCandidateCount();
+        if (pageCandidateCount == 0) {
+            return false;
+        }
+
+        const size_t firstVisibleIndex = pageIndex_ * pageSize_;
+        return CommitCandidateByGlobalIndex(context, firstVisibleIndex, 1);
+    };
+
     if (!compositionCode_.empty() && (minusPageUpKey || plusPageDownKey)) {
         if (plusPageDownKey && !candidatesFullyExpanded_) {
             const size_t requestedPage = pageIndex_ + 1;
-            RefreshCandidates(true, false);
+            RefreshCandidates(true, false, false);
             const size_t expandedTotalPages = GetTotalPages();
             if (expandedTotalPages > 0 && requestedPage < expandedTotalPages) {
                 pageIndex_ = requestedPage;
@@ -5819,9 +6475,7 @@ STDMETHODIMP TextService::OnKeyDown(ITfContext* context, WPARAM wParam, LPARAM l
         bool committed = false;
         const size_t pageCandidateCount = GetCurrentPageCandidateCount();
         if (pageCandidateCount > 0) {
-            const size_t safeIndexInPage = std::min(selectedIndexInPage_, pageCandidateCount - 1);
-            const size_t globalIndex = pageIndex_ * pageSize_ + safeIndexInPage;
-            committed = CommitCandidateByGlobalIndex(context, globalIndex, 1);
+            committed = tryCommitFirstCandidateInCurrentWindow();
         } else {
             const std::wstring rawCode = compositionCode_;
             CancelDeferredCandidateExpansion();
@@ -5866,7 +6520,7 @@ STDMETHODIMP TextService::OnKeyDown(ITfContext* context, WPARAM wParam, LPARAM l
         if (!compositionCode_.empty()) {
             bool committed = false;
             if (!allCandidates_.empty()) {
-                committed = CommitCandidateByGlobalIndex(context, 0, 1);
+                committed = tryCommitFirstCandidateInCurrentWindow();
             } else {
                 const std::wstring rawCode = compositionCode_;
                 CancelDeferredCandidateExpansion();
@@ -5925,22 +6579,10 @@ STDMETHODIMP TextService::OnKeyDown(ITfContext* context, WPARAM wParam, LPARAM l
         if (shouldAutoCommitDuringTyping && !shouldSuppressAutoCommitForPinyin && compositionCode_.size() >= kAutoCommitCodeLength) {
             bool autoCommitted = false;
             if (!allCandidates_.empty()) {
-                size_t commitIndex = 0;
-                bool foundExact = false;
-                for (size_t i = 0; i < allCandidates_.size(); ++i) {
-                    if (allCandidates_[i].exactMatch) {
-                        commitIndex = i;
-                        foundExact = true;
-                        break;
-                    }
-                }
-
-                if (foundExact) {
-                    autoCommitted = CommitCandidateByGlobalIndex(context, commitIndex, 1);
-                }
+                autoCommitted = tryCommitFirstCandidateInCurrentWindow();
                 if (autoCommitted) {
                     if (verboseKeyTrace) {
-                        Trace(L"auto-commit first candidate on 4-code overflow");
+                        Trace(L"auto-commit first visible candidate on 4-code overflow");
                     }
                 }
             }
@@ -5962,9 +6604,10 @@ STDMETHODIMP TextService::OnKeyDown(ITfContext* context, WPARAM wParam, LPARAM l
         if (shouldAutoCommitDuringTyping && !shouldSuppressAutoCommitForPinyin && autoCommitUniqueExact_ && !compositionCode_.empty()) {
             size_t uniqueExactIndex = 0;
             if (compositionCode_.size() >= static_cast<size_t>(autoCommitMinCodeLength_) && TryFindUniqueExactCommitCandidateIndex(uniqueExactIndex)) {
-                if (CommitCandidateByGlobalIndex(context, uniqueExactIndex, 1)) {
+                (void)uniqueExactIndex;
+                if (tryCommitFirstCandidateInCurrentWindow()) {
                     if (verboseKeyTrace) {
-                        Trace(L"auto-commit exact before continue input");
+                        Trace(L"auto-commit first visible candidate before continue input");
                     }
                 }
             }
@@ -6026,7 +6669,7 @@ STDMETHODIMP TextService::OnKeyDown(ITfContext* context, WPARAM wParam, LPARAM l
     if ((key == VK_OEM_6 || key == VK_OEM_PERIOD || key == VK_NEXT) && !compositionCode_.empty()) {
         if (!candidatesFullyExpanded_) {
             const size_t requestedPage = pageIndex_ + 1;
-            RefreshCandidates(true, false);
+            RefreshCandidates(true, false, false);
             const size_t expandedTotalPages = GetTotalPages();
             if (expandedTotalPages > 0 && requestedPage < expandedTotalPages) {
                 pageIndex_ = requestedPage;
@@ -6177,20 +6820,10 @@ STDMETHODIMP TextService::OnKeyUp(ITfContext* context, WPARAM wParam, LPARAM lPa
 
     const WPARAM key = NormalizeVirtualKey(wParam, lParam);
     const bool verboseKeyTrace = IsVerboseKeyTraceEnabled();
-    const bool ctrlPressed =
-        (GetKeyState(VK_CONTROL) & 0x8000) != 0 ||
-        (GetKeyState(VK_LCONTROL) & 0x8000) != 0 ||
-        (GetKeyState(VK_RCONTROL) & 0x8000) != 0 ||
-        (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0 ||
-        (GetAsyncKeyState(VK_LCONTROL) & 0x8000) != 0 ||
-        (GetAsyncKeyState(VK_RCONTROL) & 0x8000) != 0;
-    const bool altPressed =
-        (GetKeyState(VK_MENU) & 0x8000) != 0 ||
-        (GetKeyState(VK_LMENU) & 0x8000) != 0 ||
-        (GetKeyState(VK_RMENU) & 0x8000) != 0;
-    const bool winPressed =
-        (GetKeyState(VK_LWIN) & 0x8000) != 0 ||
-        (GetKeyState(VK_RWIN) & 0x8000) != 0;
+    const KeyboardModifierState modifiers = QueryKeyboardModifierState();
+    const bool ctrlPressed = modifiers.ctrlPressed;
+    const bool altPressed = modifiers.altPressed;
+    const bool winPressed = modifiers.winPressed;
 
     if (IsLeftShiftToggleKey(key, lParam)) {
         constexpr ULONGLONG kLeftShiftToggleTapThresholdMs = 400ULL;
@@ -6219,17 +6852,21 @@ STDMETHODIMP TextService::OnKeyUp(ITfContext* context, WPARAM wParam, LPARAM lPa
         if (shouldToggle) {
             if (chineseMode_) {
                 chineseMode_ = false;
+                RefreshLangBarIndicator();
                 chinesePunctuation_ = false;
                 fullShapeMode_ = false;
                 if (!compositionCode_.empty()) {
                     ClearComposition();
                 }
                 candidateWindow_.Hide();
+                ShowModeSwitchHint();
                 Trace(L"left-shift toggle mode=EN punctuation=HALF shape=HALF");
             } else {
                 chineseMode_ = true;
+                RefreshLangBarIndicator();
                 chinesePunctuation_ = true;
                 UpdateCandidateWindow();
+                ShowModeSwitchHint();
                 Trace(std::wstring(L"left-shift toggle mode=ZH punctuation=") + (chinesePunctuation_ ? L"FULL" : L"HALF") +
                       L" shape=" + (fullShapeMode_ ? L"FULL" : L"HALF"));
             }

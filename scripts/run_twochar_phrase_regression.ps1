@@ -19,6 +19,49 @@ function Resolve-RepoPath([string]$basePath, [string]$relativePath) {
     return [System.IO.Path]::GetFullPath((Join-Path $basePath $relativePath))
 }
 
+function Test-IsRemotePath([string]$path) {
+    if ([string]::IsNullOrWhiteSpace($path)) {
+        return $false
+    }
+
+    if ($path.StartsWith('\\')) {
+        return $true
+    }
+
+    try {
+        $root = [System.IO.Path]::GetPathRoot($path)
+        if ([string]::IsNullOrWhiteSpace($root) -or $root.Length -lt 2) {
+            return $false
+        }
+
+        $drive = $root.Substring(0, 1) + ':\\'
+        $driveType = [System.IO.DriveInfo]::new($drive).DriveType
+        return $driveType -eq [System.IO.DriveType]::Network
+    }
+    catch {
+        return $false
+    }
+}
+
+function Copy-ToLocalStage([string]$sourcePath, [string]$stageRoot) {
+    if ([string]::IsNullOrWhiteSpace($sourcePath) -or -not (Test-Path $sourcePath)) {
+        return $sourcePath
+    }
+
+    if (-not (Test-IsRemotePath $sourcePath)) {
+        return $sourcePath
+    }
+
+    $targetPath = Join-Path $stageRoot ([System.IO.Path]::GetFileName($sourcePath))
+    if (-not (Test-Path $stageRoot)) {
+        New-Item -ItemType Directory -Path $stageRoot -Force | Out-Null
+    }
+
+    Copy-Item -Path $sourcePath -Destination $targetPath -Force
+    Unblock-File -Path $targetPath -ErrorAction SilentlyContinue
+    return $targetPath
+}
+
 function Is-CodeToken([string]$token) {
     return -not [string]::IsNullOrWhiteSpace($token) -and $token -cmatch '^[A-Za-z]+$'
 }
@@ -71,24 +114,47 @@ function Get-CodeChar([string]$code, [int]$index) {
     return $code.Substring($safeIndex, 1)
 }
 
-function Get-ExpectedTwoCharCodes([string[]]$firstCodes, [string[]]$secondCodes) {
-    $codes = @{}
-    foreach ($firstCode in $firstCodes) {
-        foreach ($secondCode in $secondCodes) {
-            for ($firstTailIndex = 1; $firstTailIndex -le 3; $firstTailIndex++) {
-                for ($secondTailIndex = 1; $secondTailIndex -le 3; $secondTailIndex++) {
-                    $phraseCode =
-                        (Get-CodeChar $firstCode 0) +
-                        (Get-CodeChar $firstCode $firstTailIndex) +
-                        (Get-CodeChar $secondCode 0) +
-                        (Get-CodeChar $secondCode $secondTailIndex)
-                    $codes[$phraseCode] = $true
-                }
-            }
+function Select-LongestCodeVariant([string[]]$variants, [int]$minLength) {
+    if ($null -eq $variants) {
+        return $null
+    }
+
+    for ($index = $variants.Count - 1; $index -ge 0; $index--) {
+        $variant = $variants[$index]
+        if (-not [string]::IsNullOrWhiteSpace($variant) -and $variant.Length -ge $minLength) {
+            return $variant
         }
     }
 
-    return @($codes.Keys | Sort-Object)
+    return $null
+}
+
+function Get-ExpectedTwoCharCodes([string[]]$firstCodes, [string[]]$secondCodes) {
+    $firstCode = Select-LongestCodeVariant $firstCodes 1
+    $secondCode = Select-LongestCodeVariant $secondCodes 1
+    if ([string]::IsNullOrWhiteSpace($firstCode) -or [string]::IsNullOrWhiteSpace($secondCode)) {
+        return @()
+    }
+
+    $codes = New-Object System.Collections.Generic.List[string]
+
+    $primaryCode =
+        (Get-CodeChar $firstCode 0) +
+        (Get-CodeChar $firstCode 2) +
+        (Get-CodeChar $secondCode 0) +
+        (Get-CodeChar $secondCode 2)
+    $codes.Add($primaryCode) | Out-Null
+
+    $compatibleCode =
+        (Get-CodeChar $firstCode 0) +
+        (Get-CodeChar $firstCode 1) +
+        (Get-CodeChar $secondCode 0) +
+        (Get-CodeChar $secondCode 1)
+    if ($compatibleCode -ne $primaryCode) {
+        $codes.Add($compatibleCode) | Out-Null
+    }
+
+    return @($codes | Sort-Object -Unique)
 }
 
 function Invoke-PhraseProbe([string]$probePath, [string]$dictPath, [string]$phrase) {
@@ -109,6 +175,11 @@ $probePath = Resolve-RepoPath $repo 'build/Release/yuninput_sort_probe.exe'
 $singleDictPath = Resolve-RepoPath $repo $SingleDictRelativePath
 $phraseSourcePath = Resolve-RepoPath $repo $PhraseSourceRelativePath
 $outputPath = Resolve-RepoPath $repo $OutputRelativePath
+
+$stageRoot = Join-Path ([System.IO.Path]::GetTempPath()) 'yuninput_probe_stage'
+$probePath = Copy-ToLocalStage $probePath (Join-Path $stageRoot 'bin')
+$singleDictPath = Copy-ToLocalStage $singleDictPath (Join-Path $stageRoot 'data')
+$phraseSourcePath = Copy-ToLocalStage $phraseSourcePath (Join-Path $stageRoot 'data')
 
 foreach ($requiredPath in @($probePath, $singleDictPath, $phraseSourcePath)) {
     if (-not (Test-Path $requiredPath)) {

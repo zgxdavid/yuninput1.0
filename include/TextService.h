@@ -16,6 +16,8 @@
 #include <unordered_set>
 #include <vector>
 
+class ConfigLangBarButton;
+
 class TextService final : public ITfTextInputProcessor, public ITfKeyEventSink, public ITfThreadMgrEventSink {
 public:
     TextService();
@@ -58,9 +60,11 @@ private:
         bool fromAutoPhrase = false;
         bool fromSessionAutoPhrase = false;
         bool fromSystemDict = false;
+        bool fromSystemCompatibility = false;
         bool boostedAutoRepeat = false;
         bool sortSingleChar = false;
         bool sortAutoOnly = false;
+        bool sortTemporaryAutoPhrase = false;
         bool sortSystemFiveCodePhrase = false;
         bool sortGB2312Text = false;
         bool sortNonGB2312Single = false;
@@ -76,6 +80,7 @@ private:
     struct SessionAutoPhraseEntry {
         std::wstring text;
         std::vector<std::wstring> codes;
+        std::uint32_t occurrenceCount = 0;
         ULONGLONG lastTick = 0;
     };
 
@@ -124,7 +129,7 @@ private:
 
     ~TextService();
 
-    void RefreshCandidates(bool expandAll = false, bool prioritizeInput = true);
+    void RefreshCandidates(bool expandAll = false, bool prioritizeInput = true, bool updateCandidateWindow = true);
     bool EnsureRuntimeReady();
     bool ReloadActiveDictionaries();
     bool LoadConfiguredDictionaries();
@@ -141,6 +146,7 @@ private:
     void ScheduleDeferredMaintenance();
     void ProcessDeferredUiTasks();
     void ScheduleNextDeferredUiTask();
+    void RunDeferredRuntimeWarmup();
     bool IsInputPriorityActive(ULONGLONG now) const;
     bool TryRestoreCachedCandidatesForCode(const std::wstring& code);
     void CacheCurrentCandidatesForCode();
@@ -177,13 +183,19 @@ private:
     bool SaveAutoPhraseSessionState() const;
     bool LoadAutoPhraseSessionState();
     bool LoadHelperAutoPhraseEntries();
+    void IndexSessionAutoPhraseEntry(const SessionAutoPhraseEntry& entry);
+    void RemoveSessionAutoPhraseEntryFromIndex(const SessionAutoPhraseEntry& entry);
     void UpdateSessionAutoPhraseHistory(const std::wstring& committedText, ULONGLONG now);
     void RecordSessionAutoPhraseBreak();
-    void CollectSessionAutoPhraseCandidatesForTail(ULONGLONG now);
-    bool PruneSessionAutoPhraseEntries();
+    void CollectSessionAutoPhraseCandidatesForRange(const std::wstring& localText, size_t affectedStart, size_t affectedLength, ULONGLONG now);
+    void RebuildSessionAutoPhraseEntriesFromHistory(ULONGLONG now);
+    bool TrimSessionAutoPhraseEntriesToHistoryWindow();
+    void DecrementSessionAutoPhraseOccurrencesForRange(const std::wstring& localText, size_t affectedStart, size_t affectedLength);
+    bool CompactSessionAutoPhraseEntries();
     void MergeSessionAutoPhraseCandidates();
     bool PromoteSessionAutoPhrase(const std::wstring& text);
     static bool IsHanCharacter(wchar_t ch);
+    static size_t CountHanCharacters(const std::wstring& text);
     bool IsTextInGB2312Cached(const std::wstring& text) const;
     bool CommitCandidateByGlobalIndex(ITfContext* context, size_t globalIndex, std::uint64_t freqBoost);
     bool PinCandidateByGlobalIndex(size_t globalIndex);
@@ -203,15 +215,17 @@ private:
 
     bool CommitText(ITfContext* context, const std::wstring& text);
     bool CommitAsciiKey(ITfContext* context, WPARAM wParam, LPARAM lParam);
+    void ShowModeSwitchHint();
 
     static bool IsAlphaKey(WPARAM wParam);
     static wchar_t ToLowerAlpha(WPARAM wParam);
+    void RefreshLangBarIndicator();
 
     LONG refCount_;
     ITfThreadMgr* threadMgr_;
     TfClientId clientId_;
     ITfLangBarItemMgr* langBarItemMgr_;
-    ITfLangBarItem* configLangBarItem_;
+    ConfigLangBarButton* configLangBarItem_;
     bool keyEventSinkAdvised_;
     bool threadMgrEventSinkAdvised_;
     DWORD threadMgrEventSinkCookie_;
@@ -250,6 +264,7 @@ private:
     std::wstring autoPhraseHelperPath_;
     std::wstring autoPhraseSessionPath_;
     std::wstring autoPhraseBuilderPath_;
+    std::wstring autoPhraseBuilderStagedPath_;
     std::wstring blockedEntriesPath_;
     std::wstring contextAssocPath_;
     std::wstring contextAssocBlacklistPath_;
@@ -267,10 +282,12 @@ private:
     bool hasRecentAnchor_;
     POINT lastAnchor_;
     ULONGLONG lastAnchorTick_;
+    ULONGLONG focusGainedTick_;
     std::deque<CommitHistoryItem> recentCommits_;
     std::unordered_map<std::wstring, PendingPhraseStat> pendingPhraseStats_;
     std::wstring autoPhraseHistoryText_;
     std::unordered_map<std::wstring, SessionAutoPhraseEntry> sessionAutoPhraseEntries_;
+    std::unordered_map<std::wstring, std::vector<std::wstring>> sessionAutoPhraseTextsByCode_;
     std::unordered_map<std::wstring, std::vector<HelperAutoPhraseEntry>> helperAutoPhraseEntriesByCode_;
     std::wstring lastAutoPhraseSelectedKey_;
     int autoPhraseSelectedStreak_;
@@ -314,11 +331,14 @@ private:
     std::deque<std::wstring> compositionCandidateCacheOrder_;
     std::wstring deferredExpansionCode_;
     ULONGLONG deferredExpansionDueTick_;
+    ULONGLONG deferredAnchorRefreshDueTick_;
     ULONGLONG deferredMaintenanceDueTick_;
+    ULONGLONG modeSwitchHintDueTick_;
     ULONGLONG lastInteractiveInputTick_;
     std::uint64_t inputPriorityGeneration_;
     std::uint64_t deferredExpansionGeneration_;
     ULONGLONG lastCompletedCompositionCommitTick_;
+    bool deferredRuntimeWarmupPending_;
 };
 
 HRESULT CreateTextServiceClassFactory(REFIID riid, void** ppv);

@@ -1,20 +1,16 @@
 {
-    "cmake.sourceDirectory": "${workspaceFolder}",
-    "cmake.buildDirectory": "${workspaceFolder}/build",
-    "cmake.generator": "Visual Studio 17 2022",
-    "cmake.platform": "x64",
+    "cmake.useCMakePresets": "always",
+    "cmake.configurePreset": "vs2022-x64",
+    "cmake.buildPreset": "release",
+    "cmake.configureOnOpen": true,
     "cmake.configureEnvironment": {
-        "PATH": "C:\\Program Files (x86)\\Windows Kits\\10\\bin\\10.0.26100.0\\x64;${env:PATH}"
+        "PATH": "C:/Program Files (x86)/Windows Kits/10/bin/10.0.26100.0/x64;${env:PATH}"
     },
     "cmake.buildEnvironment": {
-        "PATH": "C:\\Program Files (x86)\\Windows Kits\\10\\bin\\10.0.26100.0\\x64;${env:PATH}"
+        "PATH": "C:/Program Files (x86)/Windows Kits/10/bin/10.0.26100.0/x64;${env:PATH}"
     },
-    "cmake.configureArgs": [
-        "-DCMAKE_MT=C:/Program Files (x86)/Windows Kits/10/bin/10.0.26100.0/x64/mt.exe",
-        "-DCMAKE_RC_COMPILER=C:/Program Files (x86)/Windows Kits/10/bin/10.0.26100.0/x64/rc.exe"
-    ],
-    "cmake.preferredGenerators": [
-        "Visual Studio 17 2022"
-    ],
-    "cmake.configureOnOpen": false
+    "cmake.configureSettings": {
+        "CMAKE_MT": "C:/Program Files (x86)/Windows Kits/10/bin/10.0.26100.0/x64/mt.exe",
+        "CMAKE_RC_COMPILER": "C:/Program Files (x86)/Windows Kits/10/bin/10.0.26100.0/x64/rc.exe"
+    }
 }

@@ -19,6 +19,7 @@ struct CandidateScore {
     std::wstring text;
     std::wstring displayCode;
     bool displayCodeExact = false;
+    bool displayCodeIsCompatibility = false;
     size_t displayCodeLength = 0;
     size_t displayCodeLoadOrder = 0;
     bool exactCode = false;
@@ -801,10 +802,13 @@ bool CompositionEngine::TryGetBestSingleCharCode(wchar_t ch, size_t minLength, s
     outCode.clear();
 
     const Entry* bestEntry = nullptr;
-    for (const Entry& entry : entries_) {
-        if (entry.text.size() != 1 || entry.text[0] != ch) {
-            continue;
-        }
+    const auto indexIt = singleCharEntryIndices_.find(ch);
+    if (indexIt == singleCharEntryIndices_.end()) {
+        return false;
+    }
+
+    for (size_t entryIndex : indexIt->second) {
+        const Entry& entry = entries_[entryIndex];
         if (entry.code.size() < minLength) {
             continue;
         }
@@ -1159,12 +1163,15 @@ bool CompositionEngine::TryBuildPhraseCodes(const std::wstring& text, std::vecto
 bool CompositionEngine::TryGetSingleCharCodeVariants(wchar_t ch, std::vector<std::wstring>& outCodes) const {
     outCodes.clear();
 
+    const auto indexIt = singleCharEntryIndices_.find(ch);
+    if (indexIt == singleCharEntryIndices_.end()) {
+        return false;
+    }
+
     std::vector<std::wstring> matchingCodes;
-    matchingCodes.reserve(32);
-    for (const Entry& entry : entries_) {
-        if (entry.text.size() != 1 || entry.text[0] != ch) {
-            continue;
-        }
+    matchingCodes.reserve(indexIt->second.size());
+    for (size_t entryIndex : indexIt->second) {
+        const Entry& entry = entries_[entryIndex];
         std::wstring normalized = NormalizeCode(entry.code);
         if (normalized.empty()) {
             continue;
@@ -1249,6 +1256,19 @@ void CompositionEngine::RebuildPrefixRanges() {
     }
 }
 
+void CompositionEngine::RebuildSingleCharEntryIndices() {
+    singleCharEntryIndices_.clear();
+    singleCharEntryIndices_.reserve(4096);
+    for (size_t index = 0; index < entries_.size(); ++index) {
+        const Entry& entry = entries_[index];
+        if (entry.text.size() != 1 || entry.code.empty()) {
+            continue;
+        }
+
+        singleCharEntryIndices_[entry.text[0]].push_back(index);
+    }
+}
+
 void CompositionEngine::InsertEntryIntoIndices(size_t index) {
     const Entry& entry = entries_[index];
     if (entry.isUser) {
@@ -1256,6 +1276,9 @@ void CompositionEngine::InsertEntryIntoIndices(size_t index) {
     }
     if (entry.isAutoPhrase) {
         autoPhraseEntryIndices_.push_back(index);
+    }
+    if (entry.text.size() == 1 && !entry.code.empty()) {
+        singleCharEntryIndices_[entry.text[0]].push_back(index);
     }
 
     const auto insertIt = std::lower_bound(
@@ -1275,6 +1298,7 @@ void CompositionEngine::RebuildIndex() {
     sortedIndices_.reserve(entries_.size());
     userEntryIndices_.clear();
     autoPhraseEntryIndices_.clear();
+    singleCharEntryIndices_.clear();
     userEntryIndices_.reserve(entries_.size());
     autoPhraseEntryIndices_.reserve(entries_.size());
     for (size_t i = 0; i < entries_.size(); ++i) {
@@ -1294,6 +1318,7 @@ void CompositionEngine::RebuildIndex() {
             return EntryIndexLess(left, right);
         });
 
+    RebuildSingleCharEntryIndices();
     RebuildPrefixRanges();
 
     InvalidateQueryCache();
@@ -1341,7 +1366,43 @@ std::pair<std::vector<size_t>::const_iterator, std::vector<size_t>::const_iterat
     return {begin, end};
 }
 
-bool CompositionEngine::LoadDictionaryInternal(const std::wstring& filePath, bool clearExisting, bool isUserSource, bool isAutoPhraseSource) {
+std::pair<std::vector<size_t>::const_iterator, std::vector<size_t>::const_iterator> CompositionEngine::FindExactCandidateRange(
+    const std::wstring& normalizedCode) const {
+    if (normalizedCode.empty()) {
+        return {sortedIndices_.end(), sortedIndices_.end()};
+    }
+
+    const auto range = FindCandidateRange(normalizedCode);
+    if (range.first == sortedIndices_.end() || range.first == range.second) {
+        return range;
+    }
+
+    const std::wstring rangeEndKey = normalizedCode + std::wstring(1, static_cast<wchar_t>(0xFFFF));
+    const auto begin = std::lower_bound(
+        range.first,
+        range.second,
+        normalizedCode,
+        [this](size_t idx, const std::wstring& key) {
+            return entries_[idx].code < key;
+        });
+
+    const auto end = std::lower_bound(
+        begin,
+        range.second,
+        rangeEndKey,
+        [this](size_t idx, const std::wstring& key) {
+            return entries_[idx].code < key;
+        });
+
+    return {begin, end};
+}
+
+bool CompositionEngine::LoadDictionaryInternal(
+    const std::wstring& filePath,
+    bool clearExisting,
+    bool isUserSource,
+    bool isAutoPhraseSource,
+    bool isCompatibilitySource) {
     std::ifstream input(filePath, std::ios::in | std::ios::binary);
     if (!input) {
         return false;
@@ -1423,6 +1484,7 @@ bool CompositionEngine::LoadDictionaryInternal(const std::wstring& filePath, boo
         entry.loadOrder = entries_.size();
         entry.isUser = isUserSource;
         entry.isAutoPhrase = isAutoPhraseSource || (isUserSource && taggedAuto);
+        entry.isCompatibilitySource = isCompatibilitySource;
         if (!entry.code.empty() && !entry.text.empty()) {
             entries_.push_back(std::move(entry));
         }
@@ -1434,7 +1496,7 @@ bool CompositionEngine::LoadDictionaryInternal(const std::wstring& filePath, boo
 }
 
 bool CompositionEngine::LoadDictionaryFromFile(const std::wstring& filePath) {
-    return LoadDictionaryInternal(filePath, true, false, false);
+    return LoadDictionaryInternal(filePath, true, false, false, false);
 }
 
 bool CompositionEngine::LoadDictionaryDirectory(const std::wstring& directoryPath) {
@@ -1471,7 +1533,7 @@ bool CompositionEngine::LoadDictionaryDirectory(const std::wstring& directoryPat
     bool anyLoaded = false;
     bool firstFile = true;
     for (const auto& path : dictFiles) {
-        if (LoadDictionaryInternal(path.wstring(), firstFile, false, false)) {
+        if (LoadDictionaryInternal(path.wstring(), firstFile, false, false, false)) {
             anyLoaded = true;
             firstFile = false;
         }
@@ -1481,11 +1543,15 @@ bool CompositionEngine::LoadDictionaryDirectory(const std::wstring& directoryPat
 }
 
 bool CompositionEngine::LoadUserDictionaryFromFile(const std::wstring& filePath) {
-    return LoadDictionaryInternal(filePath, false, true, false);
+    return LoadDictionaryInternal(filePath, false, true, false, false);
 }
 
 bool CompositionEngine::LoadAutoPhraseDictionaryFromFile(const std::wstring& filePath) {
-    return LoadDictionaryInternal(filePath, false, true, true);
+    return LoadDictionaryInternal(filePath, false, true, true, false);
+}
+
+bool CompositionEngine::LoadCompatibilityDictionaryFromFile(const std::wstring& filePath) {
+    return LoadDictionaryInternal(filePath, false, false, false, true);
 }
 
 bool CompositionEngine::LoadDictionaryMetadataOnlyFromFile(const std::wstring& filePath) {
@@ -1510,6 +1576,18 @@ bool CompositionEngine::LoadFrequencyFromFile(const std::wstring& filePath) {
         }
 
         if (line.rfind(kTextFrequencyCommentPrefix, 0) == 0) {
+            std::istringstream commentIss(line.substr(std::char_traits<char>::length(kTextFrequencyCommentPrefix)));
+            std::string textUtf8;
+            std::uint64_t score = 0;
+            if (commentIss >> textUtf8 >> score) {
+                const std::wstring text = Utf8ToWide(textUtf8);
+                if (!text.empty()) {
+                    const auto textIt = textFrequency_.find(text);
+                    if (textIt == textFrequency_.end() || score > textIt->second) {
+                        textFrequency_[text] = score;
+                    }
+                }
+            }
             continue;
         }
 
@@ -1704,11 +1782,12 @@ bool CompositionEngine::AddUserEntry(const std::wstring& code, const std::wstrin
 
     for (Entry& entry : entries_) {
         if (entry.code == normalizedCode && entry.text == text) {
-            const bool changed = !entry.isUser || entry.isAutoPhrase;
+            const bool changed = !entry.isUser || entry.isAutoPhrase || entry.isCompatibilitySource;
             const bool wasAutoPhrase = entry.isAutoPhrase;
             const bool wasUser = entry.isUser;
             entry.isUser = true;
             entry.isAutoPhrase = false;
+            entry.isCompatibilitySource = false;
             if (changed) {
                 if (wasUser && wasAutoPhrase) {
                     autoPhraseEntryIndices_.erase(
@@ -1737,6 +1816,7 @@ bool CompositionEngine::AddUserEntry(const std::wstring& code, const std::wstrin
     entry.loadOrder = entries_.size();
     entry.isUser = true;
     entry.isAutoPhrase = false;
+    entry.isCompatibilitySource = false;
     entries_.push_back(std::move(entry));
     InsertEntryIntoIndices(entries_.size() - 1);
     return true;
@@ -1752,12 +1832,13 @@ bool CompositionEngine::AddAutoPhraseEntry(const std::wstring& code, const std::
 
     for (Entry& entry : entries_) {
         if (entry.code == normalizedCode && entry.text == text) {
-            if (entry.isUser && !entry.isAutoPhrase) {
+            if (entry.isUser && !entry.isAutoPhrase && !entry.isCompatibilitySource) {
                 return false;
             }
-            const bool changed = !entry.isAutoPhrase;
+            const bool changed = !entry.isAutoPhrase || entry.isCompatibilitySource;
             entry.isUser = true;
             entry.isAutoPhrase = true;
+            entry.isCompatibilitySource = false;
             if (changed) {
                 RebuildIndex();
             }
@@ -1772,6 +1853,7 @@ bool CompositionEngine::AddAutoPhraseEntry(const std::wstring& code, const std::
     entry.loadOrder = entries_.size();
     entry.isUser = true;
     entry.isAutoPhrase = true;
+    entry.isCompatibilitySource = false;
     entries_.push_back(std::move(entry));
     InsertEntryIntoIndices(entries_.size() - 1);
     return true;
@@ -1779,21 +1861,23 @@ bool CompositionEngine::AddAutoPhraseEntry(const std::wstring& code, const std::
 
 std::unordered_map<wchar_t, std::wstring> CompositionEngine::BuildSingleCharCodeHintMap() const {
     std::unordered_map<wchar_t, const Entry*> bestByChar;
-    bestByChar.reserve(4096);
+    bestByChar.reserve(singleCharEntryIndices_.size());
 
-    for (const Entry& entry : entries_) {
-        if (entry.text.size() != 1 || entry.code.empty()) {
-            continue;
-        }
-        if (blockedEntries_.find(MakeCandidateKey(entry.code, entry.text)) != blockedEntries_.end()) {
-            continue;
+    for (const auto& pair : singleCharEntryIndices_) {
+        const wchar_t ch = pair.first;
+        const Entry* currentBest = nullptr;
+        for (size_t entryIndex : pair.second) {
+            const Entry& entry = entries_[entryIndex];
+            if (blockedEntries_.find(MakeCandidateKey(entry.code, entry.text)) != blockedEntries_.end()) {
+                continue;
+            }
+            if (IsBetterSingleCharCodeEntry(entry, currentBest)) {
+                currentBest = &entry;
+            }
         }
 
-        const wchar_t ch = entry.text[0];
-        const auto it = bestByChar.find(ch);
-        const Entry* currentBest = it == bestByChar.end() ? nullptr : it->second;
-        if (IsBetterSingleCharCodeEntry(entry, currentBest)) {
-            bestByChar[ch] = &entry;
+        if (currentBest != nullptr) {
+            bestByChar[ch] = currentBest;
         }
     }
 
@@ -1815,9 +1899,10 @@ bool CompositionEngine::PinEntry(const std::wstring& code, const std::wstring& t
 
     for (Entry& entry : entries_) {
         if (entry.code == normalizedCode && entry.text == text) {
-            const bool changed = !entry.isUser || entry.isAutoPhrase;
+            const bool changed = !entry.isUser || entry.isAutoPhrase || entry.isCompatibilitySource;
             entry.isUser = true;
             entry.isAutoPhrase = false;
+            entry.isCompatibilitySource = false;
             if (changed) {
                 RebuildIndex();
             }
@@ -1832,6 +1917,7 @@ bool CompositionEngine::PinEntry(const std::wstring& code, const std::wstring& t
     entry.loadOrder = entries_.size();
     entry.isUser = true;
     entry.isAutoPhrase = false;
+    entry.isCompatibilitySource = false;
     entries_.push_back(std::move(entry));
     RebuildIndex();
     return true;
@@ -1889,6 +1975,21 @@ bool CompositionEngine::HasEntry(const std::wstring& code, const std::wstring& t
     }
 
     return false;
+}
+
+std::vector<CompositionEngine::Entry> CompositionEngine::QueryExactCandidateEntries(const std::wstring& code, size_t maxCandidates) const {
+    std::vector<Entry> result;
+    if (code.empty() || maxCandidates == 0 || sortedIndices_.empty()) {
+        return result;
+    }
+
+    const std::wstring normalizedCode = NormalizeCode(code);
+    const auto range = FindExactCandidateRange(normalizedCode);
+    if (range.first == sortedIndices_.end() || range.first == range.second) {
+        return result;
+    }
+
+    return QueryCandidateEntriesInRange(normalizedCode, range.first, range.second, maxCandidates);
 }
 
 std::vector<CompositionEngine::Entry> CompositionEngine::QueryCandidateEntries(const std::wstring& code, size_t maxCandidates) const {
@@ -1967,11 +2068,12 @@ std::vector<CompositionEngine::Entry> CompositionEngine::QueryCandidateEntriesIn
         if (IsLikelyBrokenCandidate(item.text)) {
             continue;
         }
-        const bool frequencyEligible = !item.isAutoPhrase && IsFrequencyEligibleEntry(item.code, item.text);
+        const bool textFrequencyEligible = IsFrequencyEligibleEntry(item.code, item.text);
+        const bool codeFrequencyEligible = textFrequencyEligible && !item.isAutoPhrase && !item.isCompatibilitySource;
         const auto freqIt = frequency_.find(freqKey);
         const auto textFreqIt = textFrequency_.find(item.text);
-        const std::uint64_t codeScore = (frequencyEligible && freqIt != frequency_.end()) ? freqIt->second : 0;
-        const std::uint64_t textScore = (frequencyEligible && textFreqIt != textFrequency_.end()) ? textFreqIt->second : 0;
+        const std::uint64_t codeScore = (codeFrequencyEligible && freqIt != frequency_.end()) ? freqIt->second : 0;
+        const std::uint64_t textScore = (textFrequencyEligible && textFreqIt != textFrequency_.end()) ? textFreqIt->second : 0;
         const std::uint64_t score = std::max(codeScore, textScore);
         const bool exactCode = item.code == normalizedCode;
         const size_t completionDelta = item.code.size() >= normalizedCode.size()
@@ -1986,6 +2088,7 @@ std::vector<CompositionEngine::Entry> CompositionEngine::QueryCandidateEntriesIn
             candidate.text = item.text;
             candidate.displayCode = item.code;
             candidate.displayCodeExact = exactCode;
+            candidate.displayCodeIsCompatibility = item.isCompatibilitySource;
             candidate.displayCodeLength = item.code.size();
             candidate.displayCodeLoadOrder = item.loadOrder;
             candidate.exactCode = exactCode;
@@ -1997,7 +2100,7 @@ std::vector<CompositionEngine::Entry> CompositionEngine::QueryCandidateEntriesIn
             candidate.hasManualUser = item.isUser && !item.isAutoPhrase;
             candidate.hasAutoPhrase = item.isAutoPhrase;
             candidate.hasSystemSource = !item.isUser;
-            candidate.hasLearned = frequencyEligible && score > 0;
+            candidate.hasLearned = textFrequencyEligible && score > 0;
             candidate.commonCharRank = GetCommonCharRankCached(item.text);
             candidate.completionDelta = completionDelta;
             candidate.lengthPreferenceScore = lengthPreferenceScore;
@@ -2018,7 +2121,7 @@ std::vector<CompositionEngine::Entry> CompositionEngine::QueryCandidateEntriesIn
         existing.hasManualUser = existing.hasManualUser || (item.isUser && !item.isAutoPhrase);
         existing.hasAutoPhrase = existing.hasAutoPhrase || item.isAutoPhrase;
         existing.hasSystemSource = existing.hasSystemSource || !item.isUser;
-        existing.hasLearned = existing.hasLearned || (frequencyEligible && score > 0);
+        existing.hasLearned = existing.hasLearned || (textFrequencyEligible && score > 0);
         existing.hasSystemFiveCodePhrase = existing.hasSystemFiveCodePhrase || systemFiveCodePhrase;
         if (score > existing.frequency) {
             existing.frequency = score;
@@ -2061,6 +2164,7 @@ std::vector<CompositionEngine::Entry> CompositionEngine::QueryCandidateEntriesIn
         if (betterDisplayCode) {
             existing.displayCode = item.code;
             existing.displayCodeExact = exactCode;
+            existing.displayCodeIsCompatibility = item.isCompatibilitySource;
             existing.displayCodeLength = item.code.size();
             existing.displayCodeLoadOrder = item.loadOrder;
         }
@@ -2102,6 +2206,9 @@ std::vector<CompositionEngine::Entry> CompositionEngine::QueryCandidateEntriesIn
             }
             if (left.hasSystemFiveCodePhrase != right.hasSystemFiveCodePhrase) {
                 return left.hasSystemFiveCodePhrase < right.hasSystemFiveCodePhrase;
+            }
+            if (left.displayCodeIsCompatibility != right.displayCodeIsCompatibility) {
+                return left.displayCodeIsCompatibility < right.displayCodeIsCompatibility;
             }
             if (left.nonGb2312Single != right.nonGb2312Single) {
                 return left.nonGb2312Single < right.nonGb2312Single;
@@ -2148,6 +2255,7 @@ std::vector<CompositionEngine::Entry> CompositionEngine::QueryCandidateEntriesIn
         entry.isUser = candidate.hasManualUser;
         entry.isLearned = candidate.hasLearned;
         entry.isAutoPhrase = candidate.hasAutoPhrase;
+        entry.isCompatibilitySource = candidate.displayCodeIsCompatibility;
         result.push_back(std::move(entry));
         if (result.size() >= maxCandidates) {
             break;
@@ -2166,7 +2274,7 @@ std::vector<std::wstring> CompositionEngine::QueryCandidates(const std::wstring&
     return result;
 }
 
-void CompositionEngine::RecordCommit(const std::wstring& code, const std::wstring& text, std::uint64_t boost) {
+void CompositionEngine::RecordCommit(const std::wstring& code, const std::wstring& text, std::uint64_t boost, bool recordCodeFrequency) {
     if (code.empty() || text.empty() || boost == 0) {
         return;
     }
@@ -2176,14 +2284,16 @@ void CompositionEngine::RecordCommit(const std::wstring& code, const std::wstrin
         return;
     }
 
-    const CandidateKey key = MakeCandidateKey(normalizedCode, text);
-    std::uint64_t current = 0;
-    const auto it = frequency_.find(key);
-    if (it != frequency_.end()) {
-        current = it->second;
-    }
+    if (recordCodeFrequency) {
+        const CandidateKey key = MakeCandidateKey(normalizedCode, text);
+        std::uint64_t current = 0;
+        const auto it = frequency_.find(key);
+        if (it != frequency_.end()) {
+            current = it->second;
+        }
 
-    frequency_[key] = SaturatingAddFrequency(current, boost);
+        frequency_[key] = SaturatingAddFrequency(current, boost);
+    }
 
     std::uint64_t textCurrent = 0;
     const auto textIt = textFrequency_.find(text);

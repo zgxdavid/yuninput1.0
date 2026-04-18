@@ -1,3 +1,7 @@
+param(
+    [switch]$Clean
+)
+
 $ErrorActionPreference = 'Stop'
 
 # Force UTF-8 console I/O for better compatibility across PowerShell versions.
@@ -15,18 +19,18 @@ if (-not (Test-Path $cmakeExe)) {
 
 Push-Location $projectRoot
 try {
-    if (Test-Path 'build') {
+    if ($Clean -and (Test-Path 'build')) {
         Remove-Item -Recurse -Force 'build'
     }
 
     Write-Host 'Configuring CMake project...'
-    & $cmakeExe -S . -B build -G 'Visual Studio 17 2022' -A x64
+    & $cmakeExe --preset vs2022-x64
     if ($LASTEXITCODE -ne 0) {
         throw "CMake configure failed, exit code: $LASTEXITCODE"
     }
 
     Write-Host 'Building Release...'
-    & $cmakeExe --build build --config Release
+    & $cmakeExe --build --preset release
     if ($LASTEXITCODE -ne 0) {
         throw "Build failed, exit code: $LASTEXITCODE"
     }

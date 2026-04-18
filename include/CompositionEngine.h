@@ -17,6 +17,7 @@ public:
         bool isUser = false;
         bool isLearned = false;
         bool isAutoPhrase = false;
+        bool isCompatibilitySource = false;
     };
 
     struct CandidateKey {
@@ -82,6 +83,7 @@ public:
     bool LoadDictionaryDirectory(const std::wstring& directoryPath);
     bool LoadUserDictionaryFromFile(const std::wstring& filePath);
     bool LoadAutoPhraseDictionaryFromFile(const std::wstring& filePath);
+    bool LoadCompatibilityDictionaryFromFile(const std::wstring& filePath);
     bool LoadDictionaryMetadataOnlyFromFile(const std::wstring& filePath);
     bool LoadFrequencyFromFile(const std::wstring& filePath);
     bool LoadBlockedEntriesFromFile(const std::wstring& filePath);
@@ -102,10 +104,11 @@ public:
     std::unordered_map<wchar_t, std::wstring> BuildSingleCharCodeHintMap() const;
     bool HasEntry(const std::wstring& code, const std::wstring& text) const;
 
+    std::vector<Entry> QueryExactCandidateEntries(const std::wstring& code, size_t maxCandidates) const;
     std::vector<Entry> QueryCandidateEntries(const std::wstring& code, size_t maxCandidates) const;
     std::vector<Entry> QueryCandidateEntriesFast(const std::wstring& code, size_t maxCandidates, size_t scanBudget) const;
     std::vector<std::wstring> QueryCandidates(const std::wstring& code, size_t maxCandidates) const;
-    void RecordCommit(const std::wstring& code, const std::wstring& text, std::uint64_t boost = 1);
+    void RecordCommit(const std::wstring& code, const std::wstring& text, std::uint64_t boost = 1, bool recordCodeFrequency = true);
 
 private:
     static std::wstring Utf8ToWide(const std::string& input);
@@ -123,6 +126,7 @@ private:
     bool TryGetSingleCharCodeVariants(wchar_t ch, std::vector<std::wstring>& outCodes) const;
     bool TryBuildPhraseCodeFromConfiguredRules(const std::vector<std::wstring>& charCodes, std::wstring& outCode) const;
     std::pair<std::vector<size_t>::const_iterator, std::vector<size_t>::const_iterator> FindCandidateRange(const std::wstring& normalizedCode) const;
+    std::pair<std::vector<size_t>::const_iterator, std::vector<size_t>::const_iterator> FindExactCandidateRange(const std::wstring& normalizedCode) const;
     std::vector<Entry> QueryCandidateEntriesInRange(
         const std::wstring& normalizedCode,
         std::vector<size_t>::const_iterator begin,
@@ -132,9 +136,15 @@ private:
     void InvalidateQueryCache() const;
     bool EntryIndexLess(size_t left, size_t right) const;
     void RebuildPrefixRanges();
+    void RebuildSingleCharEntryIndices();
     void InsertEntryIntoIndices(size_t index);
 
-    bool LoadDictionaryInternal(const std::wstring& filePath, bool clearExisting, bool isUserSource, bool isAutoPhraseSource);
+    bool LoadDictionaryInternal(
+        const std::wstring& filePath,
+        bool clearExisting,
+        bool isUserSource,
+        bool isAutoPhraseSource,
+        bool isCompatibilitySource);
     void RebuildIndex();
 
     std::vector<Entry> entries_;
@@ -144,6 +154,7 @@ private:
     std::unordered_set<CandidateKey, CandidateKeyHash> blockedEntries_;
     std::vector<size_t> userEntryIndices_;
     std::vector<size_t> autoPhraseEntryIndices_;
+    std::unordered_map<wchar_t, std::vector<size_t>> singleCharEntryIndices_;
     std::unordered_map<std::wstring, PrefixRange> prefixRanges_;
     std::vector<PhraseRule> phraseRules_;
     std::wstring constructPhrasePrefix_;

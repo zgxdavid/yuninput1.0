@@ -20,6 +20,11 @@ constexpr int kWindowBaseWidthPx = 82;
 constexpr int kWindowMinWidthPx = 236;
 constexpr int kWindowMaxWidthPx = 360;
 constexpr int kPositionSnapThresholdPx = 3;
+constexpr int kAnchorOffsetXPx = 6;
+constexpr int kBelowAnchorOffsetPx = 18;
+constexpr int kAboveAnchorGapPx = 10;
+constexpr int kWorkAreaRightMarginPx = 16;
+constexpr int kWorkAreaBottomMarginPx = 14;
 constexpr int kHeaderTopPaddingPx = 6;
 constexpr int kHeaderHeightPx = 18;
 constexpr int kHeaderBottomGapPx = 6;
@@ -312,6 +317,7 @@ void CandidateWindow::Destroy() {
 }
 
 void CandidateWindow::Update(
+    const std::wstring& headerText,
     const std::wstring& code,
     const std::vector<DisplayCandidate>& candidates,
     size_t pageIndex,
@@ -321,12 +327,14 @@ void CandidateWindow::Update(
     size_t selectedAbsoluteIndex,
     bool chineseMode,
     bool fullShapeMode,
-    const POINT* anchorScreenPos) {
+    const POINT* anchorScreenPos,
+    bool pinToWorkAreaBottomRight) {
     if (!EnsureCreated()) {
         return;
     }
 
     const bool cheapStateChanged =
+        headerText_ != headerText ||
         code_ != code ||
         pageIndex_ != pageIndex ||
         totalPages_ != totalPages ||
@@ -340,6 +348,7 @@ void CandidateWindow::Update(
     const bool contentChanged = cheapStateChanged || candidatesChanged;
 
     if (contentChanged) {
+        headerText_ = headerText;
         code_ = code;
         candidates_ = candidates;
         pageIndex_ = pageIndex;
@@ -377,6 +386,9 @@ void CandidateWindow::Update(
         measuredWidth = std::max(measuredWidth, rowWidth);
     }
 
+    const size_t headerChars = std::min<size_t>(headerText_.size(), 18);
+    measuredWidth = std::max(measuredWidth, 160 + static_cast<int>(headerChars) * 9);
+
     width = std::max(kWindowMinWidthPx, std::min(kWindowMaxWidthPx, measuredWidth));
 
     int x = 120;
@@ -391,19 +403,31 @@ void CandidateWindow::Update(
     }
 
     if (hasAnchor) {
-        x = anchorPoint.x + 10;
-        y = anchorPoint.y + 18;
+        x = anchorPoint.x + kAnchorOffsetXPx;
+        y = anchorPoint.y + kBelowAnchorOffsetPx;
     }
 
     RECT workArea = {};
     if (GetWorkAreaForPoint(anchorPoint, workArea)) {
-        if (hasAnchor) {
-            const int belowY = anchorPoint.y + 18;
-            const int aboveY = anchorPoint.y - height - 10;
-            if (belowY + height <= workArea.bottom || aboveY < workArea.top) {
-                y = belowY;
-            } else {
+        if (pinToWorkAreaBottomRight) {
+            x = workArea.right - width - kWorkAreaRightMarginPx;
+            y = workArea.bottom - height - kWorkAreaBottomMarginPx;
+        } else if (hasAnchor) {
+            const int belowY = anchorPoint.y + kBelowAnchorOffsetPx;
+            const int aboveY = anchorPoint.y - height - kAboveAnchorGapPx;
+            const int belowAvailable = std::max<int>(0, static_cast<int>(workArea.bottom) - belowY);
+            const int aboveAvailable = std::max<int>(0, anchorPoint.y - static_cast<int>(workArea.top) - kAboveAnchorGapPx);
+            const bool canPlaceAbove = aboveY >= workArea.top;
+            const bool canPlaceBelow = belowY + height <= workArea.bottom;
+
+            if (canPlaceAbove && (aboveAvailable >= height || !canPlaceBelow)) {
                 y = aboveY;
+            } else if (canPlaceBelow) {
+                y = belowY;
+            } else if (aboveAvailable >= belowAvailable) {
+                y = aboveY;
+            } else {
+                y = belowY;
             }
         }
 
@@ -544,19 +568,29 @@ void CandidateWindow::PaintContent(HDC hdc, const RECT& rc) const {
     HGDIOBJ oldFont = SelectObject(hdc, smallFont_ != nullptr ? smallFont_ : static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT)));
 
     RECT headerRc = rc;
-    headerRc.left += 10;
+    headerRc.left += 3;
     headerRc.right -= 10;
     headerRc.top += kHeaderTopPaddingPx;
     headerRc.bottom = headerRc.top + kHeaderHeightPx;
+    RECT titleRc = headerRc;
+    titleRc.right -= 104;
+    SetTextColor(hdc, RGB(70, 56, 40));
+    SelectObject(hdc, titleFont_ != nullptr ? titleFont_ : static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT)));
+    const std::wstring titleText = headerText_.empty() ? code_ : headerText_;
+    DrawTextW(hdc, titleText.c_str(), static_cast<int>(titleText.size()), &titleRc, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+
     wchar_t pageText[96] = {};
-    swprintf_s(
-        pageText,
-        L"\u7b2c %zu/%zu \u9875  \u5171 %zu \u9879",
-        totalPages_ == 0 ? static_cast<size_t>(0) : (pageIndex_ + 1),
-        totalPages_,
-        totalCandidateCount_);
     SetTextColor(hdc, metaText);
-    DrawTextW(hdc, pageText, -1, &headerRc, DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+    SelectObject(hdc, smallFont_ != nullptr ? smallFont_ : static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT)));
+    if (!code_.empty()) {
+        swprintf_s(
+            pageText,
+            L"\u7b2c %zu/%zu \u9875  \u5171 %zu \u9879",
+            totalPages_ == 0 ? static_cast<size_t>(0) : (pageIndex_ + 1),
+            totalPages_,
+            totalCandidateCount_);
+        DrawTextW(hdc, pageText, -1, &headerRc, DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+    }
 
     int y = headerRc.bottom + kHeaderBottomGapPx;
     const int rowHeight = 34;

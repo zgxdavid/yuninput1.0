@@ -93,12 +93,12 @@ Set-ExecutionPolicy -Scope Process Bypass
 
 ```powershell
 Set-ExecutionPolicy -Scope Process Bypass
-./scripts/build_msi_wrapper.ps1 -Version 1.2.0 -OutputName Yuninput1.2.msi -SkipDictionaryGeneration
+./scripts/build_msi_wrapper.ps1 -Version 1.3.3 -OutputName Yuninput1.3.3.msi -SkipDictionaryGeneration
 ```
 
 默认输出：
 
-- ./Yuninput1.2.msi
+- ./Yuninput1.3.3.msi
 
 说明：当前 scripts/generate_user_dict.ps1 在 Extend User Dictionary Variants 阶段仍可能卡住，因此现阶段打包通常使用 -SkipDictionaryGeneration，直接复用仓库内已有词库产物。
 

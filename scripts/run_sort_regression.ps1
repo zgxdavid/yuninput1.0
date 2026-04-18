@@ -26,6 +26,49 @@ function Resolve-RepoPath([string]$basePath, [string]$relativePath) {
     return [System.IO.Path]::GetFullPath((Join-Path $basePath $relativePath))
 }
 
+function Test-IsRemotePath([string]$path) {
+    if ([string]::IsNullOrWhiteSpace($path)) {
+        return $false
+    }
+
+    if ($path.StartsWith('\\')) {
+        return $true
+    }
+
+    try {
+        $root = [System.IO.Path]::GetPathRoot($path)
+        if ([string]::IsNullOrWhiteSpace($root) -or $root.Length -lt 2) {
+            return $false
+        }
+
+        $drive = $root.Substring(0, 1) + ':\\'
+        $driveType = [System.IO.DriveInfo]::new($drive).DriveType
+        return $driveType -eq [System.IO.DriveType]::Network
+    }
+    catch {
+        return $false
+    }
+}
+
+function Copy-ToLocalStage([string]$sourcePath, [string]$stageRoot) {
+    if ([string]::IsNullOrWhiteSpace($sourcePath) -or -not (Test-Path $sourcePath)) {
+        return $sourcePath
+    }
+
+    if (-not (Test-IsRemotePath $sourcePath)) {
+        return $sourcePath
+    }
+
+    $targetPath = Join-Path $stageRoot ([System.IO.Path]::GetFileName($sourcePath))
+    if (-not (Test-Path $stageRoot)) {
+        New-Item -ItemType Directory -Path $stageRoot -Force | Out-Null
+    }
+
+    Copy-Item -Path $sourcePath -Destination $targetPath -Force
+    Unblock-File -Path $targetPath -ErrorAction SilentlyContinue
+    return $targetPath
+}
+
 $repo = [System.IO.Path]::GetFullPath($RepoRoot)
 $probePath = Resolve-RepoPath $repo 'build/Release/yuninput_sort_probe.exe'
 $dictPath = Resolve-RepoPath $repo $DictRelativePath
@@ -38,6 +81,10 @@ if (-not (Test-Path $probePath)) {
 if (-not (Test-Path $dictPath)) {
     throw "Dictionary not found: $dictPath"
 }
+
+$stageRoot = Join-Path ([System.IO.Path]::GetTempPath()) 'yuninput_probe_stage'
+$probePath = Copy-ToLocalStage $probePath (Join-Path $stageRoot 'bin')
+$dictPath = Copy-ToLocalStage $dictPath (Join-Path $stageRoot 'data')
 
 $baselineDir = Split-Path $baselinePath -Parent
 $latestDir = Split-Path $latestPath -Parent

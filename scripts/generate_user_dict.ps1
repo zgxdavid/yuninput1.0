@@ -16,6 +16,26 @@ $sourceDicts = @(
     (Join-Path $projectRoot 'data\zhengma.dict')
 )
 
+function Get-StagedLocalExecutablePath {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$SourcePath
+    )
+
+    $item = Get-Item $SourcePath
+    $stageRoot = Join-Path $env:LOCALAPPDATA 'yuninput\staging'
+    New-Item -ItemType Directory -Path $stageRoot -Force | Out-Null
+
+    $stamp = '{0:x}-{1:x}' -f $item.Length, $item.LastWriteTimeUtc.Ticks
+    $stagedPath = Join-Path $stageRoot ("yuninput_user_dict_builder_{0}.exe" -f $stamp)
+    if (-not (Test-Path $stagedPath)) {
+        Copy-Item $SourcePath $stagedPath -Force
+        Unblock-File -Path $stagedPath -ErrorAction SilentlyContinue
+    }
+
+    return $stagedPath
+}
+
 function Invoke-TimedStep {
     param(
         [string]$Name,
@@ -33,6 +53,8 @@ function Invoke-TimedStep {
 if (-not (Test-Path $builderExe)) {
     throw "Missing builder executable: $builderExe"
 }
+
+$builderExe = Get-StagedLocalExecutablePath -SourcePath $builderExe
 
 foreach ($path in @($userDict) + $sourceDicts) {
     if (-not (Test-Path $path)) {

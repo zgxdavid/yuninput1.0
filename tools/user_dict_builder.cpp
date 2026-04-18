@@ -259,35 +259,29 @@ std::wstring QueryFileStampToken(const std::wstring& filePath) {
     return L"1:" + std::to_wstring(static_cast<long long>(writeTime.time_since_epoch().count()));
 }
 
-bool AppendAutoPhraseEntries(
+bool RewriteAutoPhraseEntries(
     const std::wstring& filePath,
-    const std::vector<std::pair<std::wstring, std::wstring>>& additions) {
+    const std::vector<std::pair<std::wstring, std::wstring>>& entries) {
     if (filePath.empty()) {
         return false;
-    }
-    if (additions.empty()) {
-        return true;
     }
 
     std::error_code ec;
     const std::filesystem::path path(filePath);
-    const bool existed = std::filesystem::exists(path, ec);
     if (path.has_parent_path()) {
         std::filesystem::create_directories(path.parent_path(), ec);
     }
 
-    std::ofstream output(path, std::ios::out | std::ios::binary | std::ios::app);
+    std::ofstream output(path, std::ios::out | std::ios::binary | std::ios::trunc);
     if (!output) {
         return false;
     }
 
-    if (!existed) {
-        output << "# helper runtime auto phrase dictionary\n";
-        output << "# format: code text score\n";
-    }
+    output << "# helper runtime auto phrase dictionary\n";
+    output << "# format: code text score\n";
 
-    for (const auto& addition : additions) {
-        output << WideToUtf8(addition.first) << ' ' << WideToUtf8(addition.second) << " 1\n";
+    for (const auto& entry : entries) {
+        output << WideToUtf8(entry.first) << ' ' << WideToUtf8(entry.second) << " 1\n";
     }
 
     return output.good();
@@ -908,11 +902,13 @@ int RunSessionWatchCommand(int argc, char* argv[]) {
                     phraseSourceDictPath,
                     userDictPath,
                     extendDictPath,
-                    {runtimeDictPath, helperDictPath},
+                    {runtimeDictPath},
                     additions);
-                if (collected && !additions.empty() && !AppendAutoPhraseEntries(helperDictPath, additions)) {
-                    std::cerr << "failed to append helper auto phrase dictionary\n";
+                if (collected && !RewriteAutoPhraseEntries(helperDictPath, additions)) {
+                    std::cerr << "failed to rewrite helper auto phrase dictionary\n";
                 }
+            } else if (!RewriteAutoPhraseEntries(helperDictPath, {})) {
+                std::cerr << "failed to clear helper auto phrase dictionary\n";
             }
         }
 

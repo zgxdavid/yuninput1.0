@@ -26,6 +26,7 @@ public:
     void Destroy();
 
     void Update(
+        const std::wstring& headerText,
         const std::wstring& code,
         const std::vector<DisplayCandidate>& candidates,
         size_t pageIndex,
@@ -35,7 +36,8 @@ public:
         size_t selectedAbsoluteIndex,
         bool chineseMode,
         bool fullShapeMode,
-        const POINT* anchorScreenPos);
+        const POINT* anchorScreenPos,
+        bool pinToWorkAreaBottomRight = false);
     void SetAsyncPollCallback(std::function<void()> callback);
     void ScheduleAsyncPoll(UINT delayMs);
     void CancelAsyncPoll();
@@ -50,6 +52,7 @@ private:
     void ReleaseFonts();
 
     HWND hwnd_;
+    std::wstring headerText_;
     std::wstring code_;
     std::vector<DisplayCandidate> candidates_;
     size_t pageIndex_;

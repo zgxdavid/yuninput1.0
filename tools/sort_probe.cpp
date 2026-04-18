@@ -73,7 +73,7 @@ std::string WideToUtf8(const std::wstring& input) {
 
 int wmain(int argc, wchar_t* argv[]) {
     if (argc < 3) {
-        std::cerr << "usage: yuninput_sort_probe <dict-path> <code> [max-candidates] [--record <code> <text> [boost]]...\n";
+        std::cerr << "usage: yuninput_sort_probe <dict-path> <code> [max-candidates] [--compat <dict-path>] [--show-flags] [--record <code> <text> [boost]]...\n";
         std::cerr << "   or: yuninput_sort_probe <dict-path> --phrase <text>\n";
         return 1;
     }
@@ -92,6 +92,7 @@ int wmain(int argc, wchar_t* argv[]) {
     SetConsoleOutputCP(CP_UTF8);
     SetConsoleCP(CP_UTF8);
     std::setlocale(LC_ALL, ".UTF-8");
+    bool showFlags = false;
 
     CompositionEngine engine;
     if (!engine.LoadDictionaryFromFile(dictPath)) {
@@ -119,13 +120,34 @@ int wmain(int argc, wchar_t* argv[]) {
 
     while (argIndex < argc) {
         const std::wstring option = argv[argIndex];
+        if (option == L"--compat") {
+            if (argIndex + 1 >= argc) {
+                std::cerr << "--compat requires <dict-path>\n";
+                return 5;
+            }
+
+            if (!engine.LoadCompatibilityDictionaryFromFile(argv[argIndex + 1])) {
+                std::cerr << "failed to load compatibility dictionary\n";
+                return 6;
+            }
+
+            argIndex += 2;
+            continue;
+        }
+
+        if (option == L"--show-flags") {
+            showFlags = true;
+            ++argIndex;
+            continue;
+        }
+
         if (option != L"--record") {
             std::cerr << "unknown option: " << WideToUtf8(option) << '\n';
-            return 5;
+            return 7;
         }
         if (argIndex + 2 >= argc) {
             std::cerr << "--record requires <code> <text> [boost]\n";
-            return 6;
+            return 8;
         }
 
         const std::wstring recordCode = argv[argIndex + 1];
@@ -142,7 +164,29 @@ int wmain(int argc, wchar_t* argv[]) {
 
     const std::vector<CompositionEngine::Entry> candidates = engine.QueryCandidateEntries(code, maxCandidates);
     for (const auto& entry : candidates) {
-        std::cout << WideToUtf8(entry.code) << '\t' << WideToUtf8(entry.text) << '\n';
+        std::cout << WideToUtf8(entry.code) << '\t' << WideToUtf8(entry.text);
+        if (showFlags) {
+            std::string flags;
+            if (entry.isCompatibilitySource) {
+                flags += "compat,";
+            }
+            if (entry.isAutoPhrase) {
+                flags += "auto,";
+            }
+            if (entry.isUser) {
+                flags += "user,";
+            }
+            if (entry.isLearned) {
+                flags += "learned,";
+            }
+            if (!flags.empty()) {
+                flags.pop_back();
+            } else {
+                flags = "system";
+            }
+            std::cout << '\t' << flags;
+        }
+        std::cout << '\n';
     }
 
     return 0;
