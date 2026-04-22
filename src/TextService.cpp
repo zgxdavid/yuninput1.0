@@ -6103,7 +6103,7 @@ STDMETHODIMP TextService::OnTestKeyDown(ITfContext*, WPARAM wParam, LPARAM lPara
               (key == VK_DELETE && hasComposition) ||
               (key == VK_SPACE && hasComposition) ||
               (key == VK_RETURN && hasComposition) ||
-              key == VK_ESCAPE ||
+              (key == VK_ESCAPE && hasComposition) ||
               key == VK_UP ||
               key == VK_DOWN ||
               key == VK_PRIOR ||

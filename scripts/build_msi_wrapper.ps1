@@ -1,6 +1,6 @@
 param(
-    [string]$Version = '1.3.3',
-    [string]$OutputName = 'Yuninput1.3.3.msi',
+    [string]$Version = '1.3.4',
+    [string]$OutputName = 'Yuninput1.3.4.msi',
     [switch]$SkipDictionaryGeneration
 )
 

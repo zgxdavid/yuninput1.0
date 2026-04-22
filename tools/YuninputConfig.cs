@@ -4,7 +4,6 @@ using System.Diagnostics;
 using System.Drawing;
 using System.Globalization;
 using System.IO;
-using System.Runtime.InteropServices;
 using System.Text;
 using System.Windows.Forms;
 
@@ -71,82 +70,6 @@ internal sealed class PhraseReviewLogItem
 
 public class ConfigForm : Form
 {
-    private static class NativeMethods
-    {
-        [DllImport("user32.dll")]
-        internal static extern short GetAsyncKeyState(int vKey);
-    }
-
-    private sealed class EscapeCloseMessageFilter : IMessageFilter
-    {
-        private const int WmKeyDown = 0x0100;
-        private const int WmSysKeyDown = 0x0104;
-
-        public bool PreFilterMessage(ref Message m)
-        {
-            if (m.Msg != WmKeyDown && m.Msg != WmSysKeyDown)
-            {
-                return false;
-            }
-
-            Keys keyData = (Keys)(int)m.WParam & Keys.KeyCode;
-            if (keyData != Keys.Escape)
-            {
-                return false;
-            }
-
-            if ((Control.ModifierKeys & (Keys.Control | Keys.Alt)) != Keys.None)
-            {
-                return false;
-            }
-
-            Form targetForm = ResolveTargetForm(m.HWnd);
-            if (targetForm == null || targetForm.IsDisposed)
-            {
-                return false;
-            }
-
-            lock (EscapeCloseForms)
-            {
-                if (!EscapeCloseForms.Contains(targetForm))
-                {
-                    return false;
-                }
-            }
-
-            targetForm.Close();
-            return true;
-        }
-
-        private static Form ResolveTargetForm(IntPtr hwnd)
-        {
-            Control sourceControl = null;
-            if (hwnd != IntPtr.Zero)
-            {
-                sourceControl = Control.FromChildHandle(hwnd);
-                if (sourceControl == null)
-                {
-                    sourceControl = Control.FromHandle(hwnd);
-                }
-            }
-
-            if (sourceControl != null)
-            {
-                Form ownerForm = sourceControl.FindForm();
-                if (ownerForm != null)
-                {
-                    return ownerForm;
-                }
-            }
-
-            return Form.ActiveForm;
-        }
-    }
-
-    private static readonly HashSet<Form> EscapeCloseForms = new HashSet<Form>();
-    private static readonly HashSet<Control> EscapeCloseControls = new HashSet<Control>();
-    internal static readonly IMessageFilter EscapeCloseFilter = new EscapeCloseMessageFilter();
-
     private static readonly Color PanelBackColor = Color.FromArgb(247, 248, 250);
     private static readonly Color AccentColor = Color.FromArgb(31, 95, 168);
     private static readonly Color BorderColor = Color.FromArgb(214, 219, 226);
@@ -197,7 +120,6 @@ public class ConfigForm : Form
         Font = new Font("Microsoft YaHei UI", 9F, FontStyle.Regular, GraphicsUnit.Point);
         BackColor = PanelBackColor;
         AutoScaleMode = AutoScaleMode.Dpi;
-        EnableEscapeClose(this);
 
         localRoot = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "yuninput");
         roamingRoot = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "yuninput");
@@ -268,35 +190,10 @@ public class ConfigForm : Form
         bottomBar.Controls.Add(btnClose);
 
         AcceptButton = btnSave;
-        CancelButton = btnClose;
 
         LoadConfig();
         RefreshDataLists();
         RefreshContextAssocLists();
-    }
-
-    protected override bool ProcessCmdKey(ref Message msg, Keys keyData)
-    {
-        if (keyData == Keys.Escape)
-        {
-            Close();
-            return true;
-        }
-
-        return base.ProcessCmdKey(ref msg, keyData);
-    }
-
-    protected override bool ProcessDialogKey(Keys keyData)
-    {
-        Keys keyCode = keyData & Keys.KeyCode;
-        Keys modifiers = keyData & Keys.Modifiers;
-        if (keyCode == Keys.Escape && (modifiers & (Keys.Control | Keys.Alt)) == Keys.None)
-        {
-            Close();
-            return true;
-        }
-
-        return base.ProcessDialogKey(keyData);
     }
 
     private string ResolveManualPath()
@@ -336,134 +233,6 @@ public class ConfigForm : Form
             Arguments = "\"" + manualPath + "\"",
             UseShellExecute = true
         });
-    }
-
-    private static void EnableEscapeClose(Form form)
-    {
-        RegisterEscapeCloseForm(form);
-        AttachEscapeCloseHandlers(form, form);
-        AttachEscapeClosePolling(form);
-        form.KeyPreview = true;
-        form.KeyDown += (s, e) =>
-        {
-            if (e.KeyCode != Keys.Escape)
-            {
-                return;
-            }
-
-            form.Close();
-            e.Handled = true;
-        };
-    }
-
-    private static void AttachEscapeClosePolling(Form form)
-    {
-        if (form == null)
-        {
-            return;
-        }
-
-        const int vkEscape = 0x1B;
-        bool escapeWasDown = false;
-        var timer = new Timer();
-        timer.Interval = 40;
-        timer.Tick += (s, e) =>
-        {
-            if (form.IsDisposed)
-            {
-                timer.Stop();
-                timer.Dispose();
-                return;
-            }
-
-            bool escapeDown = (NativeMethods.GetAsyncKeyState(vkEscape) & 0x8000) != 0;
-            bool modifiersDown = (Control.ModifierKeys & (Keys.Control | Keys.Alt)) != Keys.None;
-            bool formActive = Form.ActiveForm == form || form.ContainsFocus;
-            if (formActive && escapeDown && !escapeWasDown && !modifiersDown)
-            {
-                form.Close();
-            }
-
-            escapeWasDown = escapeDown;
-        };
-        timer.Start();
-
-        form.FormClosed += (s, e) =>
-        {
-            timer.Stop();
-            timer.Dispose();
-        };
-    }
-
-    private static void AttachEscapeCloseHandlers(Control control, Form ownerForm)
-    {
-        if (control == null || ownerForm == null)
-        {
-            return;
-        }
-
-        lock (EscapeCloseControls)
-        {
-            if (!EscapeCloseControls.Add(control))
-            {
-                return;
-            }
-        }
-
-        control.PreviewKeyDown += (s, e) =>
-        {
-            if (e.KeyCode == Keys.Escape)
-            {
-                e.IsInputKey = true;
-            }
-        };
-
-        control.KeyDown += (s, e) =>
-        {
-            if (e.KeyCode != Keys.Escape)
-            {
-                return;
-            }
-
-            ownerForm.Close();
-            e.Handled = true;
-            e.SuppressKeyPress = true;
-        };
-
-        control.ControlAdded += (s, e) => AttachEscapeCloseHandlers(e.Control, ownerForm);
-        control.Disposed += (s, e) =>
-        {
-            lock (EscapeCloseControls)
-            {
-                EscapeCloseControls.Remove(control);
-            }
-        };
-
-        foreach (Control child in control.Controls)
-        {
-            AttachEscapeCloseHandlers(child, ownerForm);
-        }
-    }
-
-    private static void RegisterEscapeCloseForm(Form form)
-    {
-        if (form == null)
-        {
-            return;
-        }
-
-        lock (EscapeCloseForms)
-        {
-            EscapeCloseForms.Add(form);
-        }
-
-        form.FormClosed += (s, e) =>
-        {
-            lock (EscapeCloseForms)
-            {
-                EscapeCloseForms.Remove(form);
-            }
-        };
     }
 
     private static string BuildEntryLine(CandidateEntryItem item)
@@ -660,7 +429,7 @@ public class ConfigForm : Form
     private void BuildGeneralTab(TabPage tab)
     {
         tab.BackColor = PanelBackColor;
-        var lblIntro = new Label { Left = 20, Top = 18, Width = 840, Height = 24, Text = "这里集中管理默认状态、候选行为、词库模式和常用维护入口。按 Esc 可直接关闭窗口。" };
+        var lblIntro = new Label { Left = 20, Top = 18, Width = 840, Height = 24, Text = "这里集中管理默认状态、候选行为、词库模式和常用维护入口。" };
         lblIntro.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right;
         tab.Controls.Add(lblIntro);
         var behaviorGroup = CreateGroupBox(tab, "输入与候选行为", 20, 52, 404, 262);
@@ -915,7 +684,6 @@ public class ConfigForm : Form
             BackColor = PanelBackColor,
             Font = Font
         };
-        EnableEscapeClose(dialog);
 
         var lblFilter = new Label { Left = 18, Top = 18, Width = 40, Height = 24, Text = "查询:" };
         var txtFilter = new TextBox { Left = 62, Top = 14, Width = 286, Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right };
@@ -1212,7 +980,6 @@ public class ConfigForm : Form
         btnOpenFolder.Click += (s, e) => Process.Start(new ProcessStartInfo { FileName = roamingRoot, UseShellExecute = true });
         btnClose.Click += (s, e) => dialog.Close();
         dialog.AcceptButton = btnSave;
-        dialog.CancelButton = btnClose;
         dialog.FormClosing += (s, e) =>
         {
             if (!dirty)
@@ -1357,7 +1124,6 @@ public class ConfigForm : Form
             BackColor = PanelBackColor,
             Font = Font
         };
-        EnableEscapeClose(dialog);
 
         var grpAuto = new GroupBox { Left = 16, Top = 16, Width = 456, Height = 520, Text = "自动造词快照（只读）", BackColor = Color.White, ForeColor = AccentColor, Anchor = AnchorStyles.Top | AnchorStyles.Bottom | AnchorStyles.Left };
         var grpManual = new GroupBox { Left = 488, Top = 16, Width = 476, Height = 520, Text = "手工造词日志（manual_phrase_review.txt）", BackColor = Color.White, ForeColor = AccentColor, Anchor = AnchorStyles.Top | AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right };
@@ -1485,7 +1251,6 @@ public class ConfigForm : Form
         btnOpenAutoFile.Click += (s, e) => Process.Start(new ProcessStartInfo { FileName = "notepad.exe", Arguments = "\"" + autoPhrasePath + "\"", UseShellExecute = true });
         btnOpenLog.Click += (s, e) => Process.Start(new ProcessStartInfo { FileName = "notepad.exe", Arguments = "\"" + manualPhraseReviewPath + "\"", UseShellExecute = true });
         btnClose.Click += (s, e) => dialog.Close();
-        dialog.CancelButton = btnClose;
 
         refresh();
         dialog.ShowDialog(this);
@@ -2292,7 +2057,6 @@ static class Program
 
         Application.EnableVisualStyles();
         Application.SetCompatibleTextRenderingDefault(false);
-        Application.AddMessageFilter(ConfigForm.EscapeCloseFilter);
         Application.Run(new ConfigForm());
     }
 }
