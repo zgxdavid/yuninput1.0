@@ -32,8 +32,11 @@ constexpr ULONGLONG kUserDataReloadMinIntervalMs = 1500ULL;
 constexpr ULONGLONG kHelperAutoPhraseReloadMinIntervalMs = 500ULL;
 constexpr ULONGLONG kAutoPhraseBuilderLaunchMinIntervalMs = 2000ULL;
 constexpr const wchar_t* kAutoPhraseHelperWakeEventName = L"Local\\Yuninput.AutoPhraseHelper.Wake";
-constexpr size_t kSessionAutoPhraseHistoryCharLimit = 2000;
 constexpr size_t kSessionAutoPhraseMaxLength = 12;
+constexpr size_t kSessionAutoPhraseHistoryCharLimit = kSessionAutoPhraseMaxLength;
+constexpr std::uint64_t kSessionAutoPhraseRetentionCommitGapSingle = 24ULL;
+constexpr std::uint64_t kSessionAutoPhraseRetentionCommitGapDouble = 48ULL;
+constexpr std::uint64_t kSessionAutoPhraseRetentionCommitGapFrequent = 96ULL;
 constexpr size_t kRoamingAutoPhraseMaxEntries = 4096;
 constexpr size_t kPrimaryCandidateQueryLimit = 96;
 constexpr size_t kPrefixCandidateQueryLimit = 16;
@@ -55,6 +58,59 @@ std::deque<std::wstring> g_runtimeLogQueue;
 std::thread g_runtimeLogThread;
 bool g_runtimeLogStopRequested = false;
 unsigned int g_runtimeLogClientCount = 0;
+
+std::string WideToUtf8Text(const std::wstring& input);
+std::wstring Utf8ToWideText(const std::string& input);
+
+std::uint64_t ParseUint64OrZero(const std::string& text) {
+    return static_cast<std::uint64_t>(_strtoui64(text.c_str(), nullptr, 10));
+}
+
+std::uint32_t ParseUint32OrZero(const std::string& text) {
+    return static_cast<std::uint32_t>(std::min<std::uint64_t>(ParseUint64OrZero(text), UINT32_MAX));
+}
+
+std::vector<std::wstring> SplitSessionAutoPhraseCodes(const std::string& codesUtf8) {
+    std::vector<std::wstring> codes;
+    std::istringstream codeStream(codesUtf8);
+    std::string codeToken;
+    while (std::getline(codeStream, codeToken, ',')) {
+        std::wstring code = Utf8ToWideText(codeToken);
+        std::transform(
+            code.begin(),
+            code.end(),
+            code.begin(),
+            [](wchar_t ch) {
+                return static_cast<wchar_t>(std::towlower(static_cast<wint_t>(ch)));
+            });
+        code.erase(
+            std::remove_if(
+                code.begin(),
+                code.end(),
+                [](wchar_t ch) {
+                    return ch < L'a' || ch > L'z';
+                }),
+            code.end());
+        if (code.empty()) {
+            continue;
+        }
+        if (std::find(codes.begin(), codes.end(), code) != codes.end()) {
+            continue;
+        }
+        codes.push_back(std::move(code));
+    }
+    return codes;
+}
+
+std::uint64_t GetSessionAutoPhraseRetentionCommitGap(std::uint32_t occurrenceCount) {
+    if (occurrenceCount <= 1) {
+        return kSessionAutoPhraseRetentionCommitGapSingle;
+    }
+    if (occurrenceCount == 2) {
+        return kSessionAutoPhraseRetentionCommitGapDouble;
+    }
+    return kSessionAutoPhraseRetentionCommitGapFrequent;
+}
 
 std::wstring BuildUserDataFilePath(const std::wstring& userDataDir, const wchar_t* fileName) {
     if (userDataDir.empty() || fileName == nullptr || *fileName == L'\0') {
@@ -2123,6 +2179,7 @@ TextService::TextService()
                     lastAutoPhraseHistoryUpdateTick_(0),
                     autoPhraseBuilderPending_(false),
                     autoPhraseBuilderProcess_(nullptr),
+                    sessionAutoPhraseCommitSeq_(0),
                                     userDataWriteStopRequested_(false),
                                     nextUserDataWriteGeneration_(0),
                     userDataStampRefreshPending_(false),
@@ -2888,14 +2945,45 @@ bool TextService::WriteUtf8FileSnapshot(const std::wstring& filePath, const std:
 }
 
 std::string TextService::BuildAutoPhraseSessionStateSnapshot(bool& deleteFile) const {
-    deleteFile = autoPhraseHistoryText_.empty();
-    if (deleteFile) {
-        return std::string();
-    }
+    deleteFile = false;
 
     std::ostringstream output;
-    output << "boot_tick\t" << GetTickCount64() << '\n';
+    output << "commit_seq\t" << sessionAutoPhraseCommitSeq_ << '\n';
     output << "history\t" << WideToUtf8Text(autoPhraseHistoryText_) << '\n';
+
+    std::vector<const SessionAutoPhraseEntry*> orderedEntries;
+    orderedEntries.reserve(sessionAutoPhraseEntries_.size());
+    for (const auto& pair : sessionAutoPhraseEntries_) {
+        const SessionAutoPhraseEntry& entry = pair.second;
+        if (entry.text.empty() || entry.codes.empty() || entry.occurrenceCount == 0) {
+            continue;
+        }
+        orderedEntries.push_back(&entry);
+    }
+
+    std::sort(
+        orderedEntries.begin(),
+        orderedEntries.end(),
+        [](const SessionAutoPhraseEntry* left, const SessionAutoPhraseEntry* right) {
+            if (left->lastSeenCommitSeq != right->lastSeenCommitSeq) {
+                return left->lastSeenCommitSeq > right->lastSeenCommitSeq;
+            }
+            return left->text < right->text;
+        });
+
+    for (const SessionAutoPhraseEntry* entry : orderedEntries) {
+        output << "entry\t" << WideToUtf8Text(entry->text) << '\t';
+        for (size_t index = 0; index < entry->codes.size(); ++index) {
+            if (index != 0) {
+                output << ',';
+            }
+            output << WideToUtf8Text(entry->codes[index]);
+        }
+        output << '\t' << entry->occurrenceCount
+               << '\t' << entry->lastSeenCommitSeq
+               << '\t' << entry->createdCommitSeq
+               << '\n';
+    }
     return output.str();
 }
 
@@ -3099,6 +3187,7 @@ bool TextService::LoadAutoPhraseSessionState() {
     autoPhraseHistoryText_.clear();
     sessionAutoPhraseEntries_.clear();
     sessionAutoPhraseTextsByCode_.clear();
+    sessionAutoPhraseCommitSeq_ = 0;
 
     if (autoPhraseSessionPath_.empty()) {
         autoPhraseSessionStamp_.clear();
@@ -3107,13 +3196,13 @@ bool TextService::LoadAutoPhraseSessionState() {
 
     std::ifstream input(autoPhraseSessionPath_, std::ios::in | std::ios::binary);
     if (!input) {
+        SaveAutoPhraseSessionState();
         autoPhraseSessionStamp_ = QueryFileStampToken(autoPhraseSessionPath_);
         return false;
     }
 
-    const ULONGLONG currentBootTick = GetTickCount64();
-    bool rebootInvalidated = false;
     std::string line;
+    bool changed = false;
     while (std::getline(input, line)) {
         if (line.empty()) {
             continue;
@@ -3125,14 +3214,10 @@ bool TextService::LoadAutoPhraseSessionState() {
             continue;
         }
 
-        if (tag == "boot_tick") {
-            std::string tickText;
-            if (std::getline(iss, tickText, '\t')) {
-                const ULONGLONG savedBootTick = static_cast<ULONGLONG>(_strtoui64(tickText.c_str(), nullptr, 10));
-                if (savedBootTick > currentBootTick) {
-                    rebootInvalidated = true;
-                    break;
-                }
+        if (tag == "commit_seq") {
+            std::string commitSeqText;
+            if (std::getline(iss, commitSeqText, '\t')) {
+                sessionAutoPhraseCommitSeq_ = ParseUint64OrZero(commitSeqText);
             }
             continue;
         }
@@ -3143,32 +3228,64 @@ bool TextService::LoadAutoPhraseSessionState() {
                 autoPhraseHistoryText_ = Utf8ToWideText(historyUtf8);
                 if (autoPhraseHistoryText_.size() > kSessionAutoPhraseHistoryCharLimit) {
                     autoPhraseHistoryText_.erase(0, autoPhraseHistoryText_.size() - kSessionAutoPhraseHistoryCharLimit);
+                    changed = true;
                 }
             }
             continue;
         }
 
         if (tag == "entry") {
-            // Older helper/build paths may persist entry rows, but the runtime now
-            // reconstructs active occurrence counts from the sliding history window.
+            std::string textUtf8;
+            std::string codesUtf8;
+            if (!std::getline(iss, textUtf8, '\t') || !std::getline(iss, codesUtf8, '\t')) {
+                changed = true;
+                continue;
+            }
+
+            SessionAutoPhraseEntry entry;
+            entry.text = Utf8ToWideText(textUtf8);
+            entry.codes = SplitSessionAutoPhraseCodes(codesUtf8);
+
+            std::string occurrenceText;
+            if (std::getline(iss, occurrenceText, '\t')) {
+                entry.occurrenceCount = ParseUint32OrZero(occurrenceText);
+            }
+            std::string lastSeenText;
+            if (std::getline(iss, lastSeenText, '\t')) {
+                entry.lastSeenCommitSeq = ParseUint64OrZero(lastSeenText);
+            }
+            std::string createdText;
+            if (std::getline(iss, createdText, '\t')) {
+                entry.createdCommitSeq = ParseUint64OrZero(createdText);
+            }
+
+            if (entry.text.empty() || entry.codes.empty()) {
+                changed = true;
+                continue;
+            }
+
+            if (entry.occurrenceCount == 0) {
+                entry.occurrenceCount = 1;
+                changed = true;
+            }
+
+            if (entry.createdCommitSeq == 0) {
+                entry.createdCommitSeq = entry.lastSeenCommitSeq;
+            }
+            if (entry.lastSeenCommitSeq == 0) {
+                entry.lastSeenCommitSeq = entry.createdCommitSeq;
+            }
+
+            entry.lastTick = GetTickCount64();
+            sessionAutoPhraseCommitSeq_ = std::max(sessionAutoPhraseCommitSeq_, std::max(entry.lastSeenCommitSeq, entry.createdCommitSeq));
+            IndexSessionAutoPhraseEntry(entry);
+            sessionAutoPhraseEntries_[entry.text] = std::move(entry);
             continue;
         }
     }
 
-    if (rebootInvalidated) {
-        autoPhraseHistoryText_.clear();
-        sessionAutoPhraseEntries_.clear();
-        QueueAutoPhraseSessionWrite();
-        autoPhraseSessionStamp_ = QueryFileStampToken(autoPhraseSessionPath_);
-        return false;
-    }
-
-    bool changed = false;
     if (TrimSessionAutoPhraseEntriesToHistoryWindow()) {
         changed = true;
-    }
-    if (!autoPhraseHistoryText_.empty()) {
-        RebuildSessionAutoPhraseEntriesFromHistory(GetTickCount64());
     }
     if (CompactSessionAutoPhraseEntries()) {
         changed = true;
@@ -3347,6 +3464,7 @@ void TextService::CollectSessionAutoPhraseCandidatesForRange(const std::wstring&
             if (existingIt != sessionAutoPhraseEntries_.end()) {
                 existingIt->second.occurrenceCount += 1;
                 existingIt->second.lastTick = now;
+                existingIt->second.lastSeenCommitSeq = sessionAutoPhraseCommitSeq_;
                 continue;
             }
 
@@ -3380,6 +3498,8 @@ void TextService::CollectSessionAutoPhraseCandidatesForRange(const std::wstring&
             entry.codes = std::move(sanitizedCodes);
             entry.occurrenceCount = 1;
             entry.lastTick = now;
+            entry.createdCommitSeq = sessionAutoPhraseCommitSeq_;
+            entry.lastSeenCommitSeq = sessionAutoPhraseCommitSeq_;
             IndexSessionAutoPhraseEntry(entry);
             sessionAutoPhraseEntries_.emplace(entry.text, std::move(entry));
         }
@@ -3474,12 +3594,6 @@ bool TextService::TrimSessionAutoPhraseEntriesToHistoryWindow() {
             break;
         }
 
-        const size_t rightOverlap = std::min<size_t>(kSessionAutoPhraseMaxLength - 1, segmentLength - evictedCount);
-        DecrementSessionAutoPhraseOccurrencesForRange(
-            autoPhraseHistoryText_.substr(0, evictedCount + rightOverlap),
-            0,
-            evictedCount);
-
         autoPhraseHistoryText_.erase(0, evictedCount);
         totalHanCharacters -= evictedCount;
         changed = true;
@@ -3496,7 +3610,13 @@ bool TextService::TrimSessionAutoPhraseEntriesToHistoryWindow() {
 bool TextService::CompactSessionAutoPhraseEntries() {
     bool changed = false;
     for (auto it = sessionAutoPhraseEntries_.begin(); it != sessionAutoPhraseEntries_.end();) {
-        if (it->second.codes.empty() || it->second.occurrenceCount == 0) {
+        const SessionAutoPhraseEntry& entry = it->second;
+        const std::uint64_t lastSeenCommitSeq = std::max(entry.lastSeenCommitSeq, entry.createdCommitSeq);
+        const std::uint64_t retentionGap = GetSessionAutoPhraseRetentionCommitGap(entry.occurrenceCount);
+        const bool expired =
+            sessionAutoPhraseCommitSeq_ > lastSeenCommitSeq &&
+            (sessionAutoPhraseCommitSeq_ - lastSeenCommitSeq) > retentionGap;
+        if (entry.codes.empty() || entry.occurrenceCount == 0 || expired) {
             RemoveSessionAutoPhraseEntryFromIndex(it->second);
             it = sessionAutoPhraseEntries_.erase(it);
             changed = true;
@@ -3511,6 +3631,7 @@ bool TextService::CompactSessionAutoPhraseEntries() {
 void TextService::UpdateSessionAutoPhraseHistory(const std::wstring& committedText, ULONGLONG now) {
     bool changed = false;
     size_t appendedHanCountInCurrentSegment = 0;
+    bool hasSessionCommit = false;
 
     const auto flushCurrentSegment = [this, now, &appendedHanCountInCurrentSegment]() {
         if (appendedHanCountInCurrentSegment == 0 || autoPhraseHistoryText_.empty()) {
@@ -3529,7 +3650,7 @@ void TextService::UpdateSessionAutoPhraseHistory(const std::wstring& committedTe
         }
 
         const size_t segmentLength = autoPhraseHistoryText_.size() - segmentStart;
-        const size_t localLength = std::min(segmentLength, appendedHanCountInCurrentSegment + kSessionAutoPhraseMaxLength - 1);
+        const size_t localLength = std::min(segmentLength, appendedHanCountInCurrentSegment + kSessionAutoPhraseMaxLength);
         const size_t localStart = autoPhraseHistoryText_.size() - localLength;
         const size_t affectedStart = localLength - appendedHanCountInCurrentSegment;
         CollectSessionAutoPhraseCandidatesForRange(
@@ -3542,6 +3663,10 @@ void TextService::UpdateSessionAutoPhraseHistory(const std::wstring& committedTe
 
     for (wchar_t ch : committedText) {
         if (IsHanCharacter(ch)) {
+            if (!hasSessionCommit) {
+                hasSessionCommit = true;
+                sessionAutoPhraseCommitSeq_ += 1;
+            }
             autoPhraseHistoryText_.push_back(ch);
             appendedHanCountInCurrentSegment += 1;
             changed = true;
@@ -3609,6 +3734,7 @@ bool TextService::PromoteSessionAutoPhrase(const std::wstring& text) {
 
     SessionAutoPhraseEntry entry = it->second;
     entry.lastTick = GetTickCount64();
+    entry.lastSeenCommitSeq = sessionAutoPhraseCommitSeq_;
 
     bool changed = false;
     for (const std::wstring& code : entry.codes) {

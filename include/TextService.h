@@ -82,6 +82,8 @@ private:
         std::vector<std::wstring> codes;
         std::uint32_t occurrenceCount = 0;
         ULONGLONG lastTick = 0;
+        std::uint64_t lastSeenCommitSeq = 0;
+        std::uint64_t createdCommitSeq = 0;
     };
 
     struct HelperAutoPhraseEntry {
@@ -289,6 +291,7 @@ private:
     std::unordered_map<std::wstring, SessionAutoPhraseEntry> sessionAutoPhraseEntries_;
     std::unordered_map<std::wstring, std::vector<std::wstring>> sessionAutoPhraseTextsByCode_;
     std::unordered_map<std::wstring, std::vector<HelperAutoPhraseEntry>> helperAutoPhraseEntriesByCode_;
+    std::uint64_t sessionAutoPhraseCommitSeq_;
     std::wstring lastAutoPhraseSelectedKey_;
     int autoPhraseSelectedStreak_;
     ULONGLONG autoPhraseSelectedTick_;
