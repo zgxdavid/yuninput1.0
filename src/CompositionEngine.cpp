@@ -580,6 +580,20 @@ bool SelectLongestCodeVariant(
     return false;
 }
 
+bool SelectShortestExactLengthCodeVariant(
+    const std::vector<std::wstring>& variants,
+    size_t exactLength,
+    std::wstring& outCode) {
+    outCode.clear();
+    for (const std::wstring& variant : variants) {
+        if (variant.size() == exactLength) {
+            outCode = variant;
+            return true;
+        }
+    }
+    return false;
+}
+
 }  // namespace
 
 std::wstring CompositionEngine::Utf8ToWide(const std::string& input) {
@@ -1007,6 +1021,13 @@ bool CompositionEngine::TryBuildPhraseCodes(const std::wstring& text, std::vecto
         std::wstring compatibleCode;
         if (BuildPhraseCodeFromPattern(selectedCodes, pattern, compatibleCode)) {
             PushUniqueCode(outCodes, compatibleCode);
+        }
+
+        std::wstring firstShortCode;
+        std::wstring secondShortCode;
+        if (SelectShortestExactLengthCodeVariant(charCodeVariants[0], 2, firstShortCode) &&
+            SelectShortestExactLengthCodeVariant(charCodeVariants[1], 2, secondShortCode)) {
+            PushUniqueCode(outCodes, firstShortCode + secondShortCode);
         }
 
         return !outCodes.empty();

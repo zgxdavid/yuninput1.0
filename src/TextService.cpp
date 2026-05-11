@@ -33,7 +33,8 @@ constexpr ULONGLONG kHelperAutoPhraseReloadMinIntervalMs = 500ULL;
 constexpr ULONGLONG kAutoPhraseBuilderLaunchMinIntervalMs = 2000ULL;
 constexpr const wchar_t* kAutoPhraseHelperWakeEventName = L"Local\\Yuninput.AutoPhraseHelper.Wake";
 constexpr size_t kSessionAutoPhraseMaxLength = 12;
-constexpr size_t kSessionAutoPhraseHistoryCharLimit = kSessionAutoPhraseMaxLength;
+constexpr size_t kSessionAutoPhraseHistoryCharLimit = 2000;
+constexpr wchar_t kCodeWildcardChar = L'0';
 constexpr std::uint64_t kSessionAutoPhraseRetentionCommitGapSingle = 24ULL;
 constexpr std::uint64_t kSessionAutoPhraseRetentionCommitGapDouble = 48ULL;
 constexpr std::uint64_t kSessionAutoPhraseRetentionCommitGapFrequent = 96ULL;
@@ -1030,6 +1031,63 @@ bool TryGetTypedChar(WPARAM wParam, LPARAM lParam, wchar_t& outChar) {
     }
 
     return false;
+}
+
+bool IsCompositionWildcardInput(WPARAM wParam, LPARAM lParam) {
+    wchar_t input = 0;
+    return TryGetTypedChar(wParam, lParam, input) && input == kCodeWildcardChar;
+}
+
+bool IsSupportedWildcardCodePattern(const std::wstring& code) {
+    if (code.size() != 4) {
+        return false;
+    }
+
+    bool hasWildcard = false;
+    for (size_t index = 0; index < code.size(); ++index) {
+        const wchar_t ch = code[index];
+        if (ch == kCodeWildcardChar) {
+            if (index != 1 && index != 3) {
+                return false;
+            }
+            hasWildcard = true;
+            continue;
+        }
+
+        if (ch < L'a' || ch > L'z') {
+            return false;
+        }
+    }
+
+    return hasWildcard;
+}
+
+void ExpandWildcardCodePattern(const std::wstring& pattern, std::vector<std::wstring>& outCodes) {
+    outCodes.clear();
+    if (!IsSupportedWildcardCodePattern(pattern)) {
+        return;
+    }
+
+    std::wstring building = pattern;
+    std::function<void(size_t)> dfs = [&](size_t index) {
+        if (index >= building.size()) {
+            outCodes.push_back(building);
+            return;
+        }
+
+        if (building[index] != kCodeWildcardChar) {
+            dfs(index + 1);
+            return;
+        }
+
+        for (wchar_t ch = L'a'; ch <= L'z'; ++ch) {
+            building[index] = ch;
+            dfs(index + 1);
+        }
+        building[index] = kCodeWildcardChar;
+    };
+
+    dfs(0);
 }
 
 bool IsAsciiAlphaVirtualKey(WPARAM wParam) {
@@ -2367,7 +2425,7 @@ STDMETHODIMP TextService::Activate(ITfThreadMgr* threadMgr, TfClientId clientId)
 }
 
 STDMETHODIMP TextService::Deactivate() {
-    FlushPendingUserDataIfNeeded(true, false);
+    FlushPendingUserDataIfNeeded(true, true);
     QueueAutoPhraseSessionWrite();
     ReapAutoPhraseBuilderProcess(false);
 
@@ -3855,7 +3913,12 @@ void TextService::RefreshCandidates(bool expandAll, bool prioritizeInput, bool u
     }
 
     const bool pinyinFallbackMode = dictionaryProfile_ == DictionaryProfile::ZhengmaLargePinyin;
-    const bool allowIncrementalPrefixCache = !expandAll && !pinyinFallbackMode && compositionCode_.size() > 1;
+    const bool wildcardCodeQuery = IsSupportedWildcardCodePattern(compositionCode_);
+    std::vector<std::wstring> wildcardExpandedCodes;
+    if (wildcardCodeQuery) {
+        ExpandWildcardCodePattern(compositionCode_, wildcardExpandedCodes);
+    }
+    const bool allowIncrementalPrefixCache = !expandAll && !pinyinFallbackMode && !wildcardCodeQuery && compositionCode_.size() > 1;
 
     auto buildDisplayCode = [this, pinyinFallbackMode](const std::wstring& text, const std::wstring& rawCode) {
         if (!pinyinFallbackMode) {
@@ -4055,13 +4118,43 @@ void TextService::RefreshCandidates(bool expandAll, bool prioritizeInput, bool u
                    : (compositionCode_.size() == 2 ? kFastQueryScanBudgetTwoChar : 0));
 
     const std::vector<CompositionEngine::Entry> queried =
-        (canUseIncrementalPrefixFastPath || exactCodeFastPathSatisfied)
+        (wildcardCodeQuery || canUseIncrementalPrefixFastPath || exactCodeFastPathSatisfied)
             ? std::vector<CompositionEngine::Entry>()
             : (fastQueryScanBudget == 0
                    ? engine_.QueryCandidateEntries(compositionCode_, primaryQueryLimit)
                    : engine_.QueryCandidateEntriesFast(compositionCode_, primaryQueryLimit, fastQueryScanBudget));
-    if (!(canUseIncrementalPrefixFastPath || exactCodeFastPathSatisfied)) {
+    if (!(wildcardCodeQuery || canUseIncrementalPrefixFastPath || exactCodeFastPathSatisfied)) {
         allCandidates_.reserve(std::max(allCandidates_.capacity(), queried.size() + 32));
+    }
+
+    if (wildcardCodeQuery) {
+        const size_t wildcardPerCodeLimit = std::min(primaryQueryLimit, static_cast<size_t>(8));
+        for (const std::wstring& expandedCode : wildcardExpandedCodes) {
+            const std::vector<CompositionEngine::Entry> exactMatches = engine_.QueryExactCandidateEntries(expandedCode, wildcardPerCodeLimit);
+            for (const auto& item : exactMatches) {
+                if (pinyinFallbackMode && item.text.size() != 1) {
+                    continue;
+                }
+
+                const std::wstring displayCode = buildDisplayCode(item.text, item.code);
+                mergeCandidate(
+                    item.text,
+                    displayCode,
+                    item.code.empty() ? expandedCode : item.code,
+                    0,
+                    item.learnedScore,
+                    true,
+                    item.isUser && !item.isAutoPhrase,
+                    item.isLearned,
+                    false,
+                    item.isAutoPhrase,
+                    false,
+                    !item.isUser,
+                    item.isCompatibilitySource,
+                    compositionCode_.size());
+            }
+        }
+        hasExactCurrentCode = !allCandidates_.empty();
     }
 
     for (const auto& item : queried) {
@@ -4097,7 +4190,7 @@ void TextService::RefreshCandidates(bool expandAll, bool prioritizeInput, bool u
         hasExactCurrentCode &&
         allCandidates_.size() >= pageSize_;
 
-    if (!fastPathSatisfied && pinyinFallbackMode && allCandidates_.empty() && compositionCode_.size() > 2) {
+    if (!wildcardCodeQuery && !fastPathSatisfied && pinyinFallbackMode && allCandidates_.empty() && compositionCode_.size() > 2) {
         std::wstring prefixCode = compositionCode_;
         for (size_t prefixLength = compositionCode_.size() - 1; prefixLength >= 2; --prefixLength) {
             prefixCode.resize(prefixLength);
@@ -4135,7 +4228,7 @@ void TextService::RefreshCandidates(bool expandAll, bool prioritizeInput, bool u
         }
     }
 
-    if (!fastPathSatisfied && !hasExactCurrentCode && compositionCode_.size() > 1 && !pinyinFallbackMode && needsMoreCandidates()) {
+    if (!wildcardCodeQuery && !fastPathSatisfied && !hasExactCurrentCode && compositionCode_.size() > 1 && !pinyinFallbackMode && needsMoreCandidates()) {
         const size_t prefixFallbackTarget = std::max(targetCandidateCount, pageSize_ * 3);
         std::wstring prefixCode = compositionCode_;
         for (size_t prefixLength = compositionCode_.size() - 1; prefixLength >= 1; --prefixLength) {
@@ -4174,7 +4267,7 @@ void TextService::RefreshCandidates(bool expandAll, bool prioritizeInput, bool u
     }
 
     const ULONGLONG now = refreshNow;
-    if (!fastPathSatisfied && !recentCommits_.empty() && !pinyinFallbackMode && needsMoreCandidates()) {
+    if (!wildcardCodeQuery && !fastPathSatisfied && !recentCommits_.empty() && !pinyinFallbackMode && needsMoreCandidates()) {
         const CommitHistoryItem& previous = recentCommits_.back();
         if ((now - previous.tick) <= 8000ULL && !previous.code.empty() && !previous.text.empty()) {
             const std::wstring phraseCode = previous.code + compositionCode_;
@@ -4211,7 +4304,7 @@ void TextService::RefreshCandidates(bool expandAll, bool prioritizeInput, bool u
         }
     }
 
-    if (!fastPathSatisfied && contextAssociationEnabled_ && !recentCommits_.empty() && !allCandidates_.empty()) {
+    if (!wildcardCodeQuery && !fastPathSatisfied && contextAssociationEnabled_ && !recentCommits_.empty() && !allCandidates_.empty()) {
         const CommitHistoryItem& previous = recentCommits_.back();
         if ((now - previous.tick) <= 15000ULL && !previous.text.empty()) {
             const std::wstring associationPrefix = previous.text + L"\t";
@@ -4241,57 +4334,67 @@ void TextService::RefreshCandidates(bool expandAll, bool prioritizeInput, bool u
     }
 
     if (!fastPathSatisfied && !pinyinFallbackMode && compositionCode_.size() >= 4) {
-        const auto sessionCodeIt = sessionAutoPhraseTextsByCode_.find(compositionCode_);
-        if (sessionCodeIt != sessionAutoPhraseTextsByCode_.end()) {
-            for (const std::wstring& text : sessionCodeIt->second) {
-                const auto entryIt = sessionAutoPhraseEntries_.find(text);
-                if (entryIt == sessionAutoPhraseEntries_.end()) {
-                    continue;
-                }
+        auto mergeSessionAutoPhraseByCode = [&](const std::wstring& matchCode) {
+            const auto sessionCodeIt = sessionAutoPhraseTextsByCode_.find(matchCode);
+            if (sessionCodeIt != sessionAutoPhraseTextsByCode_.end()) {
+                for (const std::wstring& text : sessionCodeIt->second) {
+                    const auto entryIt = sessionAutoPhraseEntries_.find(text);
+                    if (entryIt == sessionAutoPhraseEntries_.end()) {
+                        continue;
+                    }
 
-                const SessionAutoPhraseEntry& entry = entryIt->second;
-                if (entry.text.empty() || entry.occurrenceCount == 0) {
-                    continue;
-                }
+                    const SessionAutoPhraseEntry& entry = entryIt->second;
+                    if (entry.text.empty() || entry.occurrenceCount == 0) {
+                        continue;
+                    }
 
-                mergeCandidate(
-                    entry.text,
-                    compositionCode_,
-                    compositionCode_,
-                    0,
-                    0,
-                    true,
-                    false,
-                    false,
-                    false,
-                    false,
-                    true,
-                    false,
-                    false,
-                    compositionCode_.size());
+                    mergeCandidate(
+                        entry.text,
+                        matchCode,
+                        matchCode,
+                        0,
+                        0,
+                        true,
+                        false,
+                        false,
+                        false,
+                        false,
+                        true,
+                        false,
+                        false,
+                        compositionCode_.size());
+                }
             }
-        }
 
-        const auto helperIt = helperAutoPhraseEntriesByCode_.find(compositionCode_);
-        if (helperIt != helperAutoPhraseEntriesByCode_.end()) {
-            for (const HelperAutoPhraseEntry& entry : helperIt->second) {
-                if (entry.text.empty()) {
-                    continue;
+            const auto helperIt = helperAutoPhraseEntriesByCode_.find(matchCode);
+            if (helperIt != helperAutoPhraseEntriesByCode_.end()) {
+                for (const HelperAutoPhraseEntry& entry : helperIt->second) {
+                    if (entry.text.empty()) {
+                        continue;
+                    }
+
+                    if (findCandidateIndex(entry.text, matchCode) != static_cast<size_t>(SIZE_MAX)) {
+                        continue;
+                    }
+
+                    CandidateItem candidate;
+                    candidate.text = entry.text;
+                    candidate.code = matchCode;
+                    candidate.commitCode = matchCode;
+                    candidate.exactMatch = true;
+                    candidate.fromAutoPhrase = true;
+                    candidate.consumedLength = compositionCode_.size();
+                    allCandidates_.push_back(std::move(candidate));
                 }
-
-                if (findCandidateIndex(entry.text, compositionCode_) != static_cast<size_t>(SIZE_MAX)) {
-                    continue;
-                }
-
-                CandidateItem candidate;
-                candidate.text = entry.text;
-                candidate.code = compositionCode_;
-                candidate.commitCode = compositionCode_;
-                candidate.exactMatch = true;
-                candidate.fromAutoPhrase = true;
-                candidate.consumedLength = compositionCode_.size();
-                allCandidates_.push_back(std::move(candidate));
             }
+        };
+
+        if (wildcardCodeQuery) {
+            for (const std::wstring& expandedCode : wildcardExpandedCodes) {
+                mergeSessionAutoPhraseByCode(expandedCode);
+            }
+        } else {
+            mergeSessionAutoPhraseByCode(compositionCode_);
         }
     }
 
@@ -6219,8 +6322,13 @@ STDMETHODIMP TextService::OnTestKeyDown(ITfContext*, WPARAM wParam, LPARAM lPara
 
     const bool minusPageUpKey = IsMinusPageUpKey(key, wParam, lParam);
     const bool plusPageDownKey = IsPlusPageDownKey(key, wParam, lParam);
+    const bool acceptsWildcardAtCurrentPosition =
+        IsCompositionWildcardInput(wParam, lParam) &&
+        compositionCode_.size() < 4 &&
+        (compositionCode_.size() == 1 || compositionCode_.size() == 3);
 
     *eaten = (IsAlphaKey(key) ||
+              acceptsWildcardAtCurrentPosition ||
               (key >= L'0' && key <= L'9') ||
               (key >= L'1' && key <= L'9') ||
               (key >= VK_NUMPAD0 && key <= VK_NUMPAD9) ||
@@ -6325,8 +6433,14 @@ STDMETHODIMP TextService::OnKeyDown(ITfContext* context, WPARAM wParam, LPARAM l
         return S_OK;
     }
 
+    const bool acceptsWildcardAtCurrentPosition =
+        IsCompositionWildcardInput(wParam, lParam) &&
+        compositionCode_.size() < 4 &&
+        (compositionCode_.size() == 1 || compositionCode_.size() == 3);
+
     const bool mayNeedRuntimeInit = chineseMode_ &&
         (IsAlphaKey(key) ||
+         acceptsWildcardAtCurrentPosition ||
          !compositionCode_.empty() ||
          key == VK_BACK ||
          key == VK_DELETE ||
@@ -6649,13 +6763,15 @@ STDMETHODIMP TextService::OnKeyDown(ITfContext* context, WPARAM wParam, LPARAM l
                 committed = tryCommitFirstCandidateInCurrentWindow();
             } else {
                 const std::wstring rawCode = compositionCode_;
-                CancelDeferredCandidateExpansion();
-                if (CommitText(context, rawCode)) {
-                    ClearComposition();
-                    candidateWindow_.Hide();
-                    committed = true;
-                    if (verboseKeyTrace) {
-                        Trace(L"punctuation fallback commit raw=" + rawCode);
+                if (!IsSupportedWildcardCodePattern(rawCode)) {
+                    CancelDeferredCandidateExpansion();
+                    if (CommitText(context, rawCode)) {
+                        ClearComposition();
+                        candidateWindow_.Hide();
+                        committed = true;
+                        if (verboseKeyTrace) {
+                            Trace(L"punctuation fallback commit raw=" + rawCode);
+                        }
                     }
                 }
             }
@@ -6680,6 +6796,14 @@ STDMETHODIMP TextService::OnKeyDown(ITfContext* context, WPARAM wParam, LPARAM l
             }
             return S_OK;
         }
+    }
+
+    if (acceptsWildcardAtCurrentPosition) {
+        compositionCode_.push_back(kCodeWildcardChar);
+        RefreshCandidates();
+        *eaten = TRUE;
+        TraceLatencySample(L"keydown-wildcard code=" + compositionCode_, keyDownStartCounter, QueryPerfCounterValue());
+        return S_OK;
     }
 
     if (IsAlphaKey(key)) {
@@ -6715,13 +6839,15 @@ STDMETHODIMP TextService::OnKeyDown(ITfContext* context, WPARAM wParam, LPARAM l
 
             if (!autoCommitted) {
                 const std::wstring rawCode = compositionCode_;
-                CancelDeferredCandidateExpansion();
-                if (CommitText(context, rawCode)) {
-                    ClearComposition();
-                    candidateWindow_.Hide();
-                    autoCommitted = true;
-                    if (verboseKeyTrace) {
-                        Trace(L"auto-commit raw code on 4-code overflow=" + rawCode);
+                if (!IsSupportedWildcardCodePattern(rawCode)) {
+                    CancelDeferredCandidateExpansion();
+                    if (CommitText(context, rawCode)) {
+                        ClearComposition();
+                        candidateWindow_.Hide();
+                        autoCommitted = true;
+                        if (verboseKeyTrace) {
+                            Trace(L"auto-commit raw code on 4-code overflow=" + rawCode);
+                        }
                     }
                 }
             }
@@ -6881,17 +7007,19 @@ STDMETHODIMP TextService::OnKeyDown(ITfContext* context, WPARAM wParam, LPARAM l
         const size_t pageCandidateCount = GetCurrentPageCandidateCount();
         if (pageCandidateCount == 0) {
             const std::wstring rawCode = compositionCode_;
-            CancelDeferredCandidateExpansion();
-            if (CommitText(context, rawCode)) {
-                ClearComposition();
-                candidateWindow_.Hide();
-                *eaten = TRUE;
-                if (verboseKeyTrace) {
-                    Trace(L"commit=" + rawCode);
-                }
-            } else {
-                if (verboseKeyTrace) {
-                    Trace(L"commit failed text=" + rawCode);
+            if (!IsSupportedWildcardCodePattern(rawCode)) {
+                CancelDeferredCandidateExpansion();
+                if (CommitText(context, rawCode)) {
+                    ClearComposition();
+                    candidateWindow_.Hide();
+                    *eaten = TRUE;
+                    if (verboseKeyTrace) {
+                        Trace(L"commit=" + rawCode);
+                    }
+                } else {
+                    if (verboseKeyTrace) {
+                        Trace(L"commit failed text=" + rawCode);
+                    }
                 }
             }
         } else {
