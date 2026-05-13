@@ -1,10 +1,16 @@
 build/
+build_*/
 .vs/
 dist/
 diagnostics/
 log/
 _recover_zip/
 __pycache__/
+
+# Local build diagnostics and temporary exports
+build_log.txt
+cmake_log.txt
+vs_packages.json
 
 **/Debug/
 **/Release/
