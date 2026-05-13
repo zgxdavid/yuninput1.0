@@ -59,3 +59,10 @@ This checklist is intended for the final review before publishing yuninput to Gi
 1. Run one final full build and installation verification.
 2. Regenerate release artifacts and record hashes.
 3. Complete this checklist before making the repository public.
+
+## 10. Handoff and User-facing Docs Sync (Required)
+
+1. Before each release, update `YuninputManual.zh-CN.md` and `匀码输入法说明书.md` with the new version number, date, and this-round changes.
+2. Before each release, sync and update `对话记录.md` and `真实对话.md` to reflect major functional changes and decisions.
+3. Ensure release version strings in docs and packaging commands are consistent (for example: README, MSI output name, and release notes).
+4. Record the completion of these document updates in the current handoff note under `diagnostics/handoff_*.md`.

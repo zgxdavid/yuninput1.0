@@ -4,6 +4,7 @@ using System.Diagnostics;
 using System.Drawing;
 using System.Globalization;
 using System.IO;
+using System.IO.Compression;
 using System.Text;
 using System.Windows.Forms;
 
@@ -109,6 +110,7 @@ public class ConfigForm : Form
     private string contextAssocDryRunReportPath;
     private string manualPhraseReviewPath;
     private string roamingRoot;
+    private const string BackupFilePrefix = "yuninput_backup_";
 
     public ConfigForm()
     {
@@ -166,12 +168,16 @@ public class ConfigForm : Form
         };
         Controls.Add(bottomBar);
 
+        var btnExportBackup = new Button { Left = 16, Top = 3, Width = 156, Height = 34, Text = "导出迁移包", Anchor = AnchorStyles.Left | AnchorStyles.Bottom };
+        var btnImportBackup = new Button { Left = 182, Top = 3, Width = 156, Height = 34, Text = "导入迁移包", Anchor = AnchorStyles.Left | AnchorStyles.Bottom };
         var btnHelp = new Button { Left = 428, Top = 3, Width = 126, Height = 34, Text = "\u6253\u5f00\u8bf4\u660e\u4e66", Anchor = AnchorStyles.Right | AnchorStyles.Bottom };
         var btnSave = new Button { Left = 568, Top = 3, Width = 92, Height = 34, Text = "\u4fdd\u5b58", Anchor = AnchorStyles.Right | AnchorStyles.Bottom };
         var btnRefresh = new Button { Left = 670, Top = 3, Width = 92, Height = 34, Text = "\u5237\u65b0", Anchor = AnchorStyles.Right | AnchorStyles.Bottom };
         var btnOpenFolder = new Button { Left = 772, Top = 3, Width = 110, Height = 34, Text = "\u6253\u5f00\u76ee\u5f55", Anchor = AnchorStyles.Right | AnchorStyles.Bottom };
         var btnClose = new Button { Left = 892, Top = 3, Width = 72, Height = 34, Text = "\u5173\u95ed", Anchor = AnchorStyles.Right | AnchorStyles.Bottom, DialogResult = DialogResult.Cancel };
 
+        btnExportBackup.Click += (s, e) => ExportBackupPackage();
+        btnImportBackup.Click += (s, e) => ImportBackupPackage();
         btnHelp.Click += (s, e) => OpenManualInNotepad();
         btnSave.Click += (s, e) => SaveConfig(true);
         btnRefresh.Click += (s, e) =>
@@ -183,6 +189,8 @@ public class ConfigForm : Form
         btnOpenFolder.Click += (s, e) => Process.Start(new ProcessStartInfo { FileName = roamingRoot, UseShellExecute = true });
         btnClose.Click += (s, e) => Close();
 
+        bottomBar.Controls.Add(btnExportBackup);
+        bottomBar.Controls.Add(btnImportBackup);
         bottomBar.Controls.Add(btnHelp);
         bottomBar.Controls.Add(btnSave);
         bottomBar.Controls.Add(btnRefresh);
@@ -1507,6 +1515,194 @@ public class ConfigForm : Form
         if (showMessage)
         {
             MessageBox.Show("\u914d\u7f6e\u5df2\u4fdd\u5b58", "\u5300\u7801\u8f93\u5165\u6cd5", MessageBoxButtons.OK, MessageBoxIcon.Information);
+        }
+    }
+
+    private List<Tuple<string, string>> GetBackupFileMappings()
+    {
+        return new List<Tuple<string, string>>
+        {
+            Tuple.Create("local/settings.json", cfgPath),
+            Tuple.Create("roaming/yuninput_user.dict", userDictPath),
+            Tuple.Create("roaming/auto_phrase_runtime.dict", autoPhraseDictPath),
+            Tuple.Create("roaming/user_freq.txt", userFreqPath),
+            Tuple.Create("roaming/blocked_entries.txt", blockedPath),
+            Tuple.Create("roaming/context_assoc.txt", contextAssocPath),
+            Tuple.Create("roaming/context_assoc_blacklist.txt", contextAssocBlacklistPath),
+            Tuple.Create("roaming/manual_phrase_review.txt", manualPhraseReviewPath)
+        };
+    }
+
+    private void ExportBackupPackage()
+    {
+        string targetZipPath;
+        using (var dialog = new SaveFileDialog())
+        {
+            string timestamp = DateTime.Now.ToString("yyyyMMdd_HHmmss");
+            dialog.Title = "导出迁移包（ZIP）";
+            dialog.FileName = BackupFilePrefix + timestamp + ".zip";
+            dialog.Filter = "Zip Files (*.zip)|*.zip|All Files (*.*)|*.*";
+            dialog.InitialDirectory = Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory);
+            if (dialog.ShowDialog(this) != DialogResult.OK || string.IsNullOrWhiteSpace(dialog.FileName))
+            {
+                return;
+            }
+
+            targetZipPath = dialog.FileName;
+        }
+
+        try
+        {
+            string stageRoot = Path.Combine(Path.GetTempPath(), "yuninput_backup_stage_" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(stageRoot);
+
+            int exportedFiles = 0;
+            int missingFiles = 0;
+            var manifestLines = new List<string>();
+            manifestLines.Add("# yuninput backup manifest");
+            manifestLines.Add("created_at=" + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"));
+
+            try
+            {
+                foreach (Tuple<string, string> mapping in GetBackupFileMappings())
+                {
+                    string relativePath = mapping.Item1;
+                    string sourcePath = mapping.Item2;
+                    if (!File.Exists(sourcePath))
+                    {
+                        missingFiles++;
+                        manifestLines.Add(relativePath + "\tmissing");
+                        continue;
+                    }
+
+                    string destinationPath = Path.Combine(stageRoot, relativePath.Replace('/', Path.DirectorySeparatorChar));
+                    Directory.CreateDirectory(Path.GetDirectoryName(destinationPath));
+                    File.Copy(sourcePath, destinationPath, true);
+                    exportedFiles++;
+                    manifestLines.Add(relativePath + "\tok");
+                }
+
+                File.WriteAllLines(Path.Combine(stageRoot, "manifest.txt"), manifestLines.ToArray(), Encoding.UTF8);
+
+                if (File.Exists(targetZipPath))
+                {
+                    File.Delete(targetZipPath);
+                }
+                ZipFile.CreateFromDirectory(stageRoot, targetZipPath, CompressionLevel.Optimal, false);
+            }
+            finally
+            {
+                if (Directory.Exists(stageRoot))
+                {
+                    Directory.Delete(stageRoot, true);
+                }
+            }
+
+            MessageBox.Show(
+                "导出完成。" + Environment.NewLine +
+                "文件: " + targetZipPath + Environment.NewLine +
+                "已导出文件: " + exportedFiles + Environment.NewLine +
+                "缺失文件: " + missingFiles,
+                "匀码输入法",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Information);
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show("导出失败: " + ex.Message, "匀码输入法", MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
+    }
+
+    private void ImportBackupPackage()
+    {
+        string backupZipPath;
+        using (var dialog = new OpenFileDialog())
+        {
+            dialog.Title = "选择要导入的迁移包（ZIP）";
+            dialog.Filter = "Zip Files (*.zip)|*.zip|All Files (*.*)|*.*";
+            dialog.InitialDirectory = Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory);
+            if (dialog.ShowDialog(this) != DialogResult.OK || string.IsNullOrWhiteSpace(dialog.FileName))
+            {
+                return;
+            }
+
+            backupZipPath = dialog.FileName;
+        }
+
+        if (!File.Exists(backupZipPath))
+        {
+            MessageBox.Show("迁移包文件不存在。", "匀码输入法", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return;
+        }
+
+        if (MessageBox.Show(
+            "导入会覆盖当前本机配置和用户词学习数据。是否继续？",
+            "确认导入",
+            MessageBoxButtons.YesNo,
+            MessageBoxIcon.Question) != DialogResult.Yes)
+        {
+            return;
+        }
+
+        try
+        {
+            string stageRoot = Path.Combine(Path.GetTempPath(), "yuninput_backup_import_" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(stageRoot);
+
+            int importedFiles = 0;
+            int skippedFiles = 0;
+            try
+            {
+                ZipFile.ExtractToDirectory(backupZipPath, stageRoot);
+
+                bool hasLocal = Directory.Exists(Path.Combine(stageRoot, "local"));
+                bool hasRoaming = Directory.Exists(Path.Combine(stageRoot, "roaming"));
+                if (!hasLocal && !hasRoaming)
+                {
+                    MessageBox.Show("未检测到可导入的备份结构（需要包含 local 或 roaming 子目录）。", "匀码输入法", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    return;
+                }
+
+                foreach (Tuple<string, string> mapping in GetBackupFileMappings())
+                {
+                    string relativePath = mapping.Item1;
+                    string destinationPath = mapping.Item2;
+                    string sourcePath = Path.Combine(stageRoot, relativePath.Replace('/', Path.DirectorySeparatorChar));
+                    if (!File.Exists(sourcePath))
+                    {
+                        skippedFiles++;
+                        continue;
+                    }
+
+                    Directory.CreateDirectory(Path.GetDirectoryName(destinationPath));
+                    File.Copy(sourcePath, destinationPath, true);
+                    importedFiles++;
+                }
+            }
+            finally
+            {
+                if (Directory.Exists(stageRoot))
+                {
+                    Directory.Delete(stageRoot, true);
+                }
+            }
+
+            LoadConfig();
+            RefreshDataLists();
+            RefreshContextAssocLists();
+
+            MessageBox.Show(
+                "导入完成。" + Environment.NewLine +
+                "已导入文件: " + importedFiles + Environment.NewLine +
+                "未找到文件: " + skippedFiles + Environment.NewLine +
+                "建议切换输入法一次以确保新数据即时生效。",
+                "匀码输入法",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Information);
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show("导入失败: " + ex.Message, "匀码输入法", MessageBoxButtons.OK, MessageBoxIcon.Error);
         }
     }
 

@@ -73,6 +73,9 @@ Known notes:
 
 - The project is still evolving, and behavior, interfaces, and dictionary organization may change.
 - Distribution boundaries for third-party dictionaries are governed by the notice files in this repository.
+- For a 1.3.8 patch refresh, the release note should explicitly mention:
+	- Session auto-phrase retention now follows a rolling 2000-Han window, and recalled phrases can be promoted after one confirmed commit.
+	- Code-frequency learning for compatibility-source one/two-code single characters is restored to fix weak short-code promotion on some machines.
 
 Recommended final checks before publication:
 

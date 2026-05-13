@@ -36,6 +36,7 @@ English README: README.en.md
 ### 排序、调频与学习
 
 - 支持上屏调频，常用单字和词语会真正前移，而不只是高亮变化
+- 两码简码单字在兼容编码来源下恢复编码维度调频，确保高频简码字可持续前移
 - 支持按编码维度的用户置顶和屏蔽，并持久化到用户数据文件
 - 支持上下文联想学习与持久化，可在配置工具中查看和清理
 - 支持把正式标准郑码词条保持在较靠前位置，同时让高频真实使用项持续争先
@@ -44,6 +45,7 @@ English README: README.en.md
 ### 自动造词与用户词典
 
 - 支持连续上屏片段的自动造词和会话期短语缓存
+- 会话自动造词历史按最近 2000 汉字窗口保留，窗口内潜在词支持跨会话延续
 - 会话中生成的短语在首次被确认后可晋升为持久化词条，写入 yuninput_user.dict
 - 用户词典支持保留 auto 标签，自动造词不会在重载或切窗口后丢失
 - 配置工具可直接管理 yuninput_user.dict 中的手工词、自动词和屏蔽项
@@ -93,12 +95,12 @@ Set-ExecutionPolicy -Scope Process Bypass
 
 ```powershell
 Set-ExecutionPolicy -Scope Process Bypass
-./scripts/build_msi_wrapper.ps1 -Version 1.3.7 -OutputName Yuninput1.3.7.msi -SkipDictionaryGeneration
+./scripts/build_msi_wrapper.ps1 -Version 1.3.8 -OutputName Yuninput1.3.8.msi -SkipDictionaryGeneration
 ```
 
 默认输出：
 
-- ./Yuninput1.3.7.msi
+- ./Yuninput1.3.8.msi
 
 说明：当前 scripts/generate_user_dict.ps1 在 Extend User Dictionary Variants 阶段仍可能卡住，因此现阶段打包通常使用 -SkipDictionaryGeneration，直接复用仓库内已有词库产物。
 
@@ -158,6 +160,8 @@ Set-ExecutionPolicy -Scope Process Bypass
 
 - 学习后的候选现在会真实移动到前面，而不是只改变默认选中高亮。
 - 会话中产生的自动造词在首次确认后会进入用户词典，切窗口、重载词库后仍能保留。
+- 会话窗口内的潜在词在重启后再次上屏可稳定晋升，避免被短周期提交计数提前淘汰。
+- 兼容来源的两码简码单字恢复编码调频，避免 1.3.8 早期策略导致的前移不明显。
 
 目标是保持两个约束同时成立：
 

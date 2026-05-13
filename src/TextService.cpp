@@ -19,7 +19,7 @@
 
 namespace {
 
-constexpr const wchar_t* kBuildMarker = L"cw-r6-20260416-yuninput1-anchor-follow-fix";
+constexpr const wchar_t* kBuildMarker = L"cw-r7-20260513-compat-shortcode-freq-fix";
 constexpr ULONGLONG kAnchorReuseWindowMs = 2500ULL;
 constexpr ULONGLONG kAnchorFastReuseWindowMs = 120ULL;
 constexpr ULONGLONG kFocusStartupFastWindowMs = 220ULL;
@@ -35,9 +35,6 @@ constexpr const wchar_t* kAutoPhraseHelperWakeEventName = L"Local\\Yuninput.Auto
 constexpr size_t kSessionAutoPhraseMaxLength = 12;
 constexpr size_t kSessionAutoPhraseHistoryCharLimit = 2000;
 constexpr wchar_t kCodeWildcardChar = L'0';
-constexpr std::uint64_t kSessionAutoPhraseRetentionCommitGapSingle = 24ULL;
-constexpr std::uint64_t kSessionAutoPhraseRetentionCommitGapDouble = 48ULL;
-constexpr std::uint64_t kSessionAutoPhraseRetentionCommitGapFrequent = 96ULL;
 constexpr size_t kRoamingAutoPhraseMaxEntries = 4096;
 constexpr size_t kPrimaryCandidateQueryLimit = 96;
 constexpr size_t kPrefixCandidateQueryLimit = 16;
@@ -101,16 +98,6 @@ std::vector<std::wstring> SplitSessionAutoPhraseCodes(const std::string& codesUt
         codes.push_back(std::move(code));
     }
     return codes;
-}
-
-std::uint64_t GetSessionAutoPhraseRetentionCommitGap(std::uint32_t occurrenceCount) {
-    if (occurrenceCount <= 1) {
-        return kSessionAutoPhraseRetentionCommitGapSingle;
-    }
-    if (occurrenceCount == 2) {
-        return kSessionAutoPhraseRetentionCommitGapDouble;
-    }
-    return kSessionAutoPhraseRetentionCommitGapFrequent;
 }
 
 std::wstring BuildUserDataFilePath(const std::wstring& userDataDir, const wchar_t* fileName) {
@@ -3343,6 +3330,7 @@ bool TextService::LoadAutoPhraseSessionState() {
     }
 
     if (TrimSessionAutoPhraseEntriesToHistoryWindow()) {
+        RebuildSessionAutoPhraseEntriesFromHistory(GetTickCount64());
         changed = true;
     }
     if (CompactSessionAutoPhraseEntries()) {
@@ -3480,7 +3468,10 @@ bool TextService::IsHanCharacter(wchar_t ch) {
 void TextService::RecordSessionAutoPhraseBreak() {
     if (!autoPhraseHistoryText_.empty() && autoPhraseHistoryText_.back() != kSessionAutoPhraseBreak) {
         autoPhraseHistoryText_.push_back(kSessionAutoPhraseBreak);
-        TrimSessionAutoPhraseEntriesToHistoryWindow();
+        const bool trimmed = TrimSessionAutoPhraseEntriesToHistoryWindow();
+        if (trimmed) {
+            RebuildSessionAutoPhraseEntriesFromHistory(GetTickCount64());
+        }
         CompactSessionAutoPhraseEntries();
         QueueAutoPhraseSessionWrite();
     }
@@ -3669,12 +3660,7 @@ bool TextService::CompactSessionAutoPhraseEntries() {
     bool changed = false;
     for (auto it = sessionAutoPhraseEntries_.begin(); it != sessionAutoPhraseEntries_.end();) {
         const SessionAutoPhraseEntry& entry = it->second;
-        const std::uint64_t lastSeenCommitSeq = std::max(entry.lastSeenCommitSeq, entry.createdCommitSeq);
-        const std::uint64_t retentionGap = GetSessionAutoPhraseRetentionCommitGap(entry.occurrenceCount);
-        const bool expired =
-            sessionAutoPhraseCommitSeq_ > lastSeenCommitSeq &&
-            (sessionAutoPhraseCommitSeq_ - lastSeenCommitSeq) > retentionGap;
-        if (entry.codes.empty() || entry.occurrenceCount == 0 || expired) {
+        if (entry.codes.empty() || entry.occurrenceCount == 0) {
             RemoveSessionAutoPhraseEntryFromIndex(it->second);
             it = sessionAutoPhraseEntries_.erase(it);
             changed = true;
@@ -3737,7 +3723,10 @@ void TextService::UpdateSessionAutoPhraseHistory(const std::wstring& committedTe
 
     if (changed) {
         flushCurrentSegment();
-        TrimSessionAutoPhraseEntriesToHistoryWindow();
+        const bool trimmed = TrimSessionAutoPhraseEntriesToHistoryWindow();
+        if (trimmed) {
+            RebuildSessionAutoPhraseEntriesFromHistory(now);
+        }
         CompactSessionAutoPhraseEntries();
         QueueAutoPhraseSessionWrite();
     }
@@ -5613,7 +5602,12 @@ bool TextService::CommitCandidateByGlobalIndex(ITfContext* context, size_t globa
         }
     }
 
-    engine_.RecordCommit(freqCode, textToCommit, effectiveFreqBoost, !candidate.fromSystemCompatibility);
+    const bool allowCompatibilityCodeFrequency =
+        candidate.fromSystemCompatibility &&
+        textToCommit.size() == 1 &&
+        freqCode.size() <= 2;
+    const bool recordCodeFrequency = !candidate.fromSystemCompatibility || allowCompatibilityCodeFrequency;
+    engine_.RecordCommit(freqCode, textToCommit, effectiveFreqBoost, recordCodeFrequency);
     LearnPhraseFromRecentCommits(freqCode, textToCommit);
     MarkFrequencyDataDirty();
     FlushPendingUserDataIfNeeded(false);

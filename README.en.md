@@ -25,6 +25,7 @@ This repository provides a buildable and extensible IME framework, including the
 - Space commit, Enter exact-priority commit, Esc clear, Backspace edit
 - Continuous commit with remaining-code handling
 - Persistent frequency learning
+- Restored code-frequency learning for compatibility-source single-character short codes (one/two-code)
 - Persistent context association learning
 - Config tool for user entries, auto phrases, and context-learning management
 - Table-dict import support (Fcitx / IBus style)
@@ -65,6 +66,8 @@ Uninstall:
 - Dictionary files are under data/
 - User frequency and user dictionary are persisted
 - Auto phrase learning is independent from manual user dictionary entries
+- Session auto-phrase history is retained within a rolling 2000-Han window for cross-session continuity
+- A phrase recalled from that window can be promoted into the user dictionary after one confirmed commit
 
 ## Licensing and Notices
 

@@ -26,9 +26,9 @@ if (-not (Test-Path $csc)) {
 }
 
 if (Test-Path $iconPath) {
-    & $csc /nologo /target:winexe /platform:x64 /win32icon:$iconPath /reference:System.Windows.Forms.dll /reference:System.Drawing.dll /out:$outExe $srcPath
+    & $csc /nologo /target:winexe /platform:x64 /win32icon:$iconPath /reference:System.Windows.Forms.dll /reference:System.Drawing.dll /reference:System.IO.Compression.dll /reference:System.IO.Compression.FileSystem.dll /out:$outExe $srcPath
 } else {
-    & $csc /nologo /target:winexe /platform:x64 /reference:System.Windows.Forms.dll /reference:System.Drawing.dll /out:$outExe $srcPath
+    & $csc /nologo /target:winexe /platform:x64 /reference:System.Windows.Forms.dll /reference:System.Drawing.dll /reference:System.IO.Compression.dll /reference:System.IO.Compression.FileSystem.dll /out:$outExe $srcPath
 }
 if ($LASTEXITCODE -ne 0) {
     throw "Failed to build yuninput_config.exe"

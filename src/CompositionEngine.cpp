@@ -2090,7 +2090,14 @@ std::vector<CompositionEngine::Entry> CompositionEngine::QueryCandidateEntriesIn
             continue;
         }
         const bool textFrequencyEligible = IsFrequencyEligibleEntry(item.code, item.text);
-        const bool codeFrequencyEligible = textFrequencyEligible && !item.isAutoPhrase && !item.isCompatibilitySource;
+        const bool allowCompatibilityCodeFrequency =
+            item.isCompatibilitySource &&
+            item.text.size() == 1 &&
+            item.code.size() <= 2;
+        const bool codeFrequencyEligible =
+            textFrequencyEligible &&
+            !item.isAutoPhrase &&
+            (!item.isCompatibilitySource || allowCompatibilityCodeFrequency);
         const auto freqIt = frequency_.find(freqKey);
         const auto textFreqIt = textFrequency_.find(item.text);
         const std::uint64_t codeScore = (codeFrequencyEligible && freqIt != frequency_.end()) ? freqIt->second : 0;
