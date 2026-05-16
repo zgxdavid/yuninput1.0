@@ -14,6 +14,7 @@ add_library(yuninput SHARED
     src/DllMain.cpp
     src/Globals.cpp
     src/TextService.cpp
+    src/WildcardCode.cpp
     src/CompositionEngine.cpp
     src/CandidateWindow.cpp
     yuninput.rc
@@ -53,6 +54,35 @@ target_compile_definitions(yuninput_sort_probe PRIVATE
 add_executable(yuninput_user_dict_builder
     src/CompositionEngine.cpp
     tools/user_dict_builder.cpp
+)
+
+add_executable(yuninput_wildcard_probe
+    src/CompositionEngine.cpp
+    src/WildcardCode.cpp
+    tools/wildcard_probe.cpp
+)
+
+add_executable(yuninput_index_insert_probe
+    src/CompositionEngine.cpp
+    tools/index_insert_probe.cpp
+)
+
+target_include_directories(yuninput_wildcard_probe PRIVATE include)
+
+target_compile_definitions(yuninput_wildcard_probe PRIVATE
+    UNICODE
+    _UNICODE
+    NOMINMAX
+    WIN32_LEAN_AND_MEAN
+)
+
+target_include_directories(yuninput_index_insert_probe PRIVATE include)
+
+target_compile_definitions(yuninput_index_insert_probe PRIVATE
+    UNICODE
+    _UNICODE
+    NOMINMAX
+    WIN32_LEAN_AND_MEAN
 )
 
 target_include_directories(yuninput_user_dict_builder PRIVATE include)

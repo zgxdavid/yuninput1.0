@@ -27,6 +27,9 @@ public:
 
     void Update(
         const std::wstring& headerText,
+        const std::wstring& footerText,
+        const std::wstring& codeColumnHeader,
+        const std::wstring& emptyHintText,
         const std::wstring& code,
         const std::vector<DisplayCandidate>& candidates,
         size_t pageIndex,
@@ -53,6 +56,9 @@ private:
 
     HWND hwnd_;
     std::wstring headerText_;
+    std::wstring footerText_;
+    std::wstring codeColumnHeader_;
+    std::wstring emptyHintText_;
     std::wstring code_;
     std::vector<DisplayCandidate> candidates_;
     size_t pageIndex_;

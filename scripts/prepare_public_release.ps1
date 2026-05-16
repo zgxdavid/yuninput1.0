@@ -1,7 +1,13 @@
 param(
     [string]$VersionTag = '1.0',
     [string]$PublicRoot = '',
-    [string]$PrivateArchiveRoot = ''
+    [string]$PrivateArchiveRoot = '',
+    [switch]$RunPreflight,
+    [switch]$SkipPerfSampling,
+    [switch]$LowNoisePerfSampling,
+    [int]$PerfRepetitions = 20,
+    [int]$PerfWarmupRepetitions = 3,
+    [int]$PerfTrimFirstSamples = 1
 )
 
 $ErrorActionPreference = 'Stop'
@@ -13,6 +19,42 @@ $OutputEncoding = $utf8NoBom
 
 $projectRoot = Split-Path -Parent $PSScriptRoot
 $workspaceRoot = Split-Path -Parent $projectRoot
+$preflightScriptPath = Join-Path $projectRoot 'scripts\run_release_preflight.ps1'
+
+if ($RunPreflight) {
+    if (-not (Test-Path $preflightScriptPath)) {
+        throw "Preflight script not found: $preflightScriptPath"
+    }
+
+    $preflightArgs = @(
+        '-NoProfile',
+        '-ExecutionPolicy',
+        'Bypass',
+        '-File',
+        $preflightScriptPath,
+        '-RepoRoot',
+        $projectRoot,
+        '-PerfRepetitions',
+        $PerfRepetitions,
+        '-PerfWarmupRepetitions',
+        $PerfWarmupRepetitions,
+        '-PerfTrimFirstSamples',
+        $PerfTrimFirstSamples
+    )
+
+    if ($SkipPerfSampling) {
+        $preflightArgs += '-SkipPerfSampling'
+    }
+    if ($LowNoisePerfSampling) {
+        $preflightArgs += '-LowNoisePerfSampling'
+    }
+
+    Write-Host 'Running release preflight checks...'
+    & powershell @preflightArgs
+    if ($LASTEXITCODE -ne 0) {
+        throw "Release preflight failed, exit code: $LASTEXITCODE"
+    }
+}
 
 if ([string]::IsNullOrWhiteSpace($PublicRoot)) {
     $PublicRoot = Join-Path $workspaceRoot ("yuninput_public_" + $VersionTag)

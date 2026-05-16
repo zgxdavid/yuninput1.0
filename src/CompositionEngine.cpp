@@ -1277,6 +1277,40 @@ void CompositionEngine::RebuildPrefixRanges() {
     }
 }
 
+void CompositionEngine::UpdatePrefixRangesForInsertedEntry(size_t sortedPosition, const std::wstring& insertedCode) {
+    if (prefixRanges_.empty()) {
+        prefixRanges_.reserve(26 + (26 * 26));
+    }
+
+    for (auto& pair : prefixRanges_) {
+        PrefixRange& range = pair.second;
+        if (range.begin >= sortedPosition) {
+            ++range.begin;
+        }
+        if (range.end >= sortedPosition) {
+            ++range.end;
+        }
+    }
+
+    if (insertedCode.empty()) {
+        return;
+    }
+
+    const size_t maxPrefixLength = std::min<size_t>(2, insertedCode.size());
+    for (size_t prefixLength = 1; prefixLength <= maxPrefixLength; ++prefixLength) {
+        const std::wstring prefix = insertedCode.substr(0, prefixLength);
+        auto it = prefixRanges_.find(prefix);
+        if (it == prefixRanges_.end()) {
+            prefixRanges_.emplace(prefix, PrefixRange{sortedPosition, sortedPosition + 1});
+            continue;
+        }
+
+        PrefixRange& range = it->second;
+        range.begin = std::min(range.begin, sortedPosition);
+        range.end = std::max(range.end, sortedPosition + 1);
+    }
+}
+
 void CompositionEngine::RebuildSingleCharEntryIndices() {
     singleCharEntryIndices_.clear();
     singleCharEntryIndices_.reserve(4096);
@@ -1309,8 +1343,9 @@ void CompositionEngine::InsertEntryIntoIndices(size_t index) {
         [this](size_t existing, size_t inserted) {
             return EntryIndexLess(existing, inserted);
         });
+    const size_t insertedPosition = static_cast<size_t>(std::distance(sortedIndices_.begin(), insertIt));
     sortedIndices_.insert(insertIt, index);
-    RebuildPrefixRanges();
+    UpdatePrefixRangesForInsertedEntry(insertedPosition, entry.code);
     InvalidateQueryCache();
 }
 

@@ -28,6 +28,9 @@ constexpr int kWorkAreaBottomMarginPx = 14;
 constexpr int kHeaderTopPaddingPx = 6;
 constexpr int kHeaderHeightPx = 18;
 constexpr int kHeaderBottomGapPx = 6;
+constexpr int kCodeHeaderHeightPx = 12;
+constexpr int kFooterTopGapPx = 4;
+constexpr int kFooterHeightPx = 16;
 constexpr int kBodyBottomPaddingPx = 8;
 constexpr int kEmptyBodyHeightPx = 24;
 
@@ -318,6 +321,9 @@ void CandidateWindow::Destroy() {
 
 void CandidateWindow::Update(
     const std::wstring& headerText,
+    const std::wstring& footerText,
+    const std::wstring& codeColumnHeader,
+    const std::wstring& emptyHintText,
     const std::wstring& code,
     const std::vector<DisplayCandidate>& candidates,
     size_t pageIndex,
@@ -335,6 +341,9 @@ void CandidateWindow::Update(
 
     const bool cheapStateChanged =
         headerText_ != headerText ||
+        footerText_ != footerText ||
+        codeColumnHeader_ != codeColumnHeader ||
+        emptyHintText_ != emptyHintText ||
         code_ != code ||
         pageIndex_ != pageIndex ||
         totalPages_ != totalPages ||
@@ -349,6 +358,9 @@ void CandidateWindow::Update(
 
     if (contentChanged) {
         headerText_ = headerText;
+        footerText_ = footerText;
+        codeColumnHeader_ = codeColumnHeader;
+        emptyHintText_ = emptyHintText;
         code_ = code;
         candidates_ = candidates;
         pageIndex_ = pageIndex;
@@ -362,6 +374,10 @@ void CandidateWindow::Update(
 
     const size_t visibleRowCount = std::min(candidates_.size(), kMaxVisibleRows);
     const int rowHeight = 34;
+    const bool hasCodeColumnHeader = !codeColumnHeader_.empty();
+    const int codeHeaderHeight = hasCodeColumnHeader ? kCodeHeaderHeightPx : 0;
+    const bool hasFooterText = !footerText_.empty();
+    const int footerHeight = hasFooterText ? (kFooterTopGapPx + kFooterHeightPx) : 0;
     int width = kWindowMinWidthPx;
     const int bodyHeight = visibleRowCount == 0
         ? kEmptyBodyHeightPx
@@ -370,7 +386,9 @@ void CandidateWindow::Update(
         kHeaderTopPaddingPx +
         kHeaderHeightPx +
         kHeaderBottomGapPx +
+        codeHeaderHeight +
         bodyHeight +
+        footerHeight +
         kBodyBottomPaddingPx;
     int measuredWidth = 256;
     for (size_t i = 0; i < visibleRowCount; ++i) {
@@ -593,9 +611,22 @@ void CandidateWindow::PaintContent(HDC hdc, const RECT& rc) const {
     }
 
     int y = headerRc.bottom + kHeaderBottomGapPx;
-    const int rowHeight = 34;
     const int rowLeft = rc.left + 8;
     const int rowRight = rc.right - 8;
+    if (!codeColumnHeader_.empty()) {
+        RECT codeHeaderRc = {rowRight - codeColumnWidth, y, rowRight - 2, y + kCodeHeaderHeightPx};
+        SetTextColor(hdc, metaText);
+        SelectObject(hdc, smallFont_ != nullptr ? smallFont_ : static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT)));
+        DrawTextW(
+            hdc,
+            codeColumnHeader_.c_str(),
+            static_cast<int>(codeColumnHeader_.size()),
+            &codeHeaderRc,
+            DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+        y += kCodeHeaderHeightPx;
+    }
+
+    const int rowHeight = 34;
     const size_t rowCount = std::min(candidates_.size(), kMaxVisibleRows);
 
     if (rowCount == 0) {
@@ -605,7 +636,7 @@ void CandidateWindow::PaintContent(HDC hdc, const RECT& rc) const {
         emptyRc.top = y;
         emptyRc.bottom = emptyRc.top + 24;
         SetTextColor(hdc, metaText);
-        const std::wstring empty = L"\u6ca1\u6709\u53ef\u7528\u5019\u9009";
+        const std::wstring empty = emptyHintText_.empty() ? L"\u6ca1\u6709\u53ef\u7528\u5019\u9009" : emptyHintText_;
         DrawTextW(hdc, empty.c_str(), static_cast<int>(empty.size()), &emptyRc, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
     } else {
         for (size_t i = 0; i < rowCount; ++i) {
@@ -640,6 +671,18 @@ void CandidateWindow::PaintContent(HDC hdc, const RECT& rc) const {
 
             y += rowHeight;
         }
+    }
+
+    if (!footerText_.empty()) {
+        RECT footerRc = {rc.left + 10, rc.bottom - kBodyBottomPaddingPx - kFooterHeightPx, rc.right - 10, rc.bottom - kBodyBottomPaddingPx};
+        SetTextColor(hdc, metaText);
+        SelectObject(hdc, smallFont_ != nullptr ? smallFont_ : static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT)));
+        DrawTextW(
+            hdc,
+            footerText_.c_str(),
+            static_cast<int>(footerText_.size()),
+            &footerRc,
+            DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
     }
 
     SelectObject(hdc, oldFont);

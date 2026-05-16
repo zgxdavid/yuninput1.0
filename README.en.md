@@ -9,6 +9,7 @@ This repository provides a buildable and extensible IME framework, including the
 - Stage: In active development
 - Target platform: Windows 11 x64
 - Stack: C++ TSF Text Service + PowerShell installer scripts + Windows config tool
+- Default dictionary profile: zhengma-all
 - Positioning: Engineering-grade IME framework, not a finalized commercial product yet
 
 ## Current Features
@@ -20,13 +21,18 @@ This repository provides a buildable and extensible IME framework, including the
 - Candidate selection with keys 1-9
 - Candidate pinning: Ctrl+1-9
 - Candidate blocking: Ctrl+Delete
-- Paging: - / =, plus [ / ], PgUp / PgDn
+- Paging: - / =, [ / ], , / ., PgUp / PgDn
 - Tab / Shift+Tab candidate navigation
+- Left Shift tap toggles Chinese/English mode
+- F10 toggles full-shape / half-shape character mode
+- F2 or APPS opens the status menu (F2 falls back to config launch when menu is unavailable)
 - Space commit, Enter exact-priority commit, Esc clear, Backspace edit
 - Continuous commit with remaining-code handling
+- Wildcard input uses '0' in 4-code patterns (only position 2 and/or 4)
 - Persistent frequency learning
 - Restored code-frequency learning for compatibility-source single-character short codes (one/two-code)
 - Persistent context association learning
+- zhengma-large-pinyin profile supports pinyin single-character query with Zhengma code hints
 - Config tool for user entries, auto phrases, and context-learning management
 - Table-dict import support (Fcitx / IBus style)
 - EXE and MSI package generation

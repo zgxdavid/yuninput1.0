@@ -1,6 +1,6 @@
 # 匀码输入法功能与文档总索引
 
-更新时间：2026-05-13
+更新时间：2026-05-16
 
 ## 1. 功能总览
 
@@ -23,7 +23,7 @@
 - 自造词管理入口（配置工具）
 
 ### 1.3 词库与模式
-- zhengma-large（大字符集郑码）
+- zhengma-all（默认主模式，大字符集郑码）
 - zhengma-large-pinyin（拼音单字输入，候选右侧显示郑码提示）
 - `data/zhengma.dict` 保留为导入参考词表，不再作为配置工具中的独立运行模式
 - 词库导入链路（Fcitx/IBus table -> .dict）
@@ -39,6 +39,7 @@
 
 ### 2.1 项目入口
 - README.md：项目总说明、构建与安装入口
+- README.en.md：英文版项目总说明
 
 ### 2.2 需求与策略
 - docs/requirements-audit.md：需求对账与完成度分级
@@ -65,6 +66,7 @@
 - scripts/install_enable.ps1：本机安装启用
 - scripts/uninstall_clean.ps1：卸载与注册表残留清理
 - scripts/inspect_ime_state.ps1：IME 状态诊断
+- scripts/run_textservice_behavior_regression.ps1：TextService 关键行为回归（自动顶屏、编码+标点、页边界双击、Tab 跨页、拼音查郑码、通配符、session auto phrase fast path）
 
 ## 4. 现场保留原则
 

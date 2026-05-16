@@ -6,7 +6,7 @@
 - 工程此前缺的不是“中文显示”本身，而是“真正的郑码基础表”和“可复用的导入链路”。
 - Linux 生态里可以找到开源的郑码表，至少已经确认 Fcitx 额外码表仓库包含以下表名：
   - `zhengma`
-  - `zhengma-large`
+  - `zhengma-large`（上游表名；本项目运行时主 profile 对应 `zhengma-all`）
   - `zhengma-pinyin`
 
 ## 现阶段采用的工程策略
@@ -70,6 +70,12 @@ rm 人民
 ```powershell
 Set-ExecutionPolicy -Scope Process Bypass
 ./scripts/import_table_dict.ps1 -SourcePath C:\temp\zhengma-large.txt -OutputPath ./data/zhengma-large.dict
+```
+
+若用于当前默认主 profile，可直接导入为：
+
+```powershell
+./scripts/import_table_dict.ps1 -SourcePath C:\temp\zhengma-large.txt -OutputPath ./data/zhengma-all.dict
 ```
 
 导入完成后，重新运行安装脚本即可把所有 `.dict` 一并部署到：

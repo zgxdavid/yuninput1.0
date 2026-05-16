@@ -69,6 +69,13 @@ internal sealed class PhraseReviewLogItem
     }
 }
 
+internal enum PhraseReviewSourceFilter
+{
+    All,
+    Auto,
+    Manual
+}
+
 public class ConfigForm : Form
 {
     private static readonly Color PanelBackColor = Color.FromArgb(247, 248, 250);
@@ -541,9 +548,9 @@ public class ConfigForm : Form
             Top = 216,
             Width = 186,
             Height = 30,
-            Text = "打开造词审阅日志"
+            Text = "手工造词日志"
         };
-        btnOpenPhraseReviewFromGeneral.Click += (s, e) => OpenPhraseReviewDialog();
+        btnOpenPhraseReviewFromGeneral.Click += (s, e) => OpenPhraseReviewDialog(PhraseReviewSourceFilter.Manual);
         profileGroup.Controls.Add(btnOpenAutoPhraseFromGeneral);
         profileGroup.Controls.Add(btnOpenPhraseReviewFromGeneral);
 
@@ -606,14 +613,14 @@ public class ConfigForm : Form
         var btnManageAutoPhrase = new Button { Left = 20, Top = 490, Width = 168, Height = 32, Text = "管理用户词典", Anchor = AnchorStyles.Left | AnchorStyles.Bottom };
         var btnOpenAutoPhraseFolder = new Button { Left = 198, Top = 490, Width = 168, Height = 32, Text = "打开用户词典目录" };
         btnOpenAutoPhraseFolder.Anchor = AnchorStyles.Left | AnchorStyles.Bottom;
-        var btnOpenPhraseReview = new Button { Left = 376, Top = 490, Width = 156, Height = 32, Text = "打开造词审阅日志", Anchor = AnchorStyles.Left | AnchorStyles.Bottom };
+        var btnOpenPhraseReview = new Button { Left = 376, Top = 490, Width = 156, Height = 32, Text = "手工造词日志", Anchor = AnchorStyles.Left | AnchorStyles.Bottom };
         btnManageAutoPhrase.Click += (s, e) => OpenAutoPhraseManagerDialog();
         btnOpenAutoPhraseFolder.Click += (s, e) =>
         {
             string autoPhrasePath = ResolveAutoPhrasePath();
             Process.Start(new ProcessStartInfo { FileName = Path.GetDirectoryName(autoPhrasePath), UseShellExecute = true });
         };
-        btnOpenPhraseReview.Click += (s, e) => OpenPhraseReviewDialog();
+        btnOpenPhraseReview.Click += (s, e) => OpenPhraseReviewDialog(PhraseReviewSourceFilter.Manual);
         tab.Controls.Add(btnManageAutoPhrase);
         tab.Controls.Add(btnOpenAutoPhraseFolder);
         tab.Controls.Add(btnOpenPhraseReview);
@@ -1109,7 +1116,31 @@ public class ConfigForm : Form
         return DateTime.MinValue;
     }
 
-    private void OpenPhraseReviewDialog()
+    private static bool IsManualPhraseReviewSource(string source)
+    {
+        if (string.IsNullOrWhiteSpace(source))
+        {
+            return false;
+        }
+
+        string normalized = source.Trim();
+        return string.Equals(normalized, "manual", StringComparison.OrdinalIgnoreCase) ||
+               string.Equals(normalized, "manual_hotkey", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool IsAutoPhraseReviewSource(string source)
+    {
+        if (string.IsNullOrWhiteSpace(source))
+        {
+            return false;
+        }
+
+        string normalized = source.Trim();
+        return string.Equals(normalized, "auto-commit", StringComparison.OrdinalIgnoreCase) ||
+               string.Equals(normalized, "auto_phrase", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private void OpenPhraseReviewDialog(PhraseReviewSourceFilter initialFilter = PhraseReviewSourceFilter.All)
     {
         string autoPhrasePath = ResolveAutoPhrasePath();
         Directory.CreateDirectory(Path.GetDirectoryName(autoPhrasePath));
@@ -1145,10 +1176,12 @@ public class ConfigForm : Form
         var chkSortNewestFirst = new CheckBox { Left = 210, Top = 28, Width = 216, Text = "按时间倒序（最新在前）" };
         var lstManual = CreateStyledListBox(14, 58, 448, 368);
         lstManual.Anchor = AnchorStyles.Top | AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right;
-        cmbSourceFilter.Items.Add("\u5168\u90e8\u6765\u6e90");
-        cmbSourceFilter.Items.Add("\u4ec5\u81ea\u52a8\u9020\u8bcd");
-        cmbSourceFilter.Items.Add("\u4ec5\u624b\u5de5\u9020\u8bcd");
-        cmbSourceFilter.SelectedIndex = 0;
+        cmbSourceFilter.Items.Add("全部来源");
+        cmbSourceFilter.Items.Add("仅自动造词");
+        cmbSourceFilter.Items.Add("仅手工造词");
+        cmbSourceFilter.SelectedIndex = initialFilter == PhraseReviewSourceFilter.Auto
+            ? 1
+            : (initialFilter == PhraseReviewSourceFilter.Manual ? 2 : 0);
         chkSortNewestFirst.Checked = true;
         grpAuto.Controls.Add(lstAuto);
         grpManual.Controls.Add(lblSourceFilter);
@@ -1197,20 +1230,25 @@ public class ConfigForm : Form
             lstManual.BeginUpdate();
             lstManual.Items.Clear();
 
-            string selectedSource = string.Empty;
+            PhraseReviewSourceFilter selectedFilter = PhraseReviewSourceFilter.All;
             if (cmbSourceFilter.SelectedIndex == 1)
             {
-                selectedSource = "auto_phrase";
+                selectedFilter = PhraseReviewSourceFilter.Auto;
             }
             else if (cmbSourceFilter.SelectedIndex == 2)
             {
-                selectedSource = "manual_hotkey";
+                selectedFilter = PhraseReviewSourceFilter.Manual;
             }
 
             var manualItems = new List<PhraseReviewLogItem>();
             foreach (PhraseReviewLogItem item in ReadPhraseReviewLogFile(manualPhraseReviewPath))
             {
-                if (!string.IsNullOrEmpty(selectedSource) && !string.Equals(item.Source, selectedSource, StringComparison.OrdinalIgnoreCase))
+                if (selectedFilter == PhraseReviewSourceFilter.Auto && !IsAutoPhraseReviewSource(item.Source))
+                {
+                    continue;
+                }
+
+                if (selectedFilter == PhraseReviewSourceFilter.Manual && !IsManualPhraseReviewSource(item.Source))
                 {
                     continue;
                 }

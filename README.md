@@ -22,13 +22,15 @@ English README: README.en.md
 - 候选窗已加入轻微位移吸附与双缓冲绘制，用于减轻连续输入时的轻微抖动和闪烁
 - 支持数字键 1-9 选词、空格上屏、回车优先精确候选、Esc 清空、Backspace 回退
 - 支持 Tab/Shift+Tab 导航候选，支持 [ ]、, .、PgUp、PgDn 等翻页
+- 支持左 Shift 轻触中英文切换、F10 全角/半角字符切换、F2/APPS 状态菜单
+- 支持四码位置 0 通配符（仅第 2/4 位）与通配候选展开
 - 支持 Ctrl+1-9 按当前编码置顶候选，支持 Ctrl+Delete 屏蔽当前候选
 - 候选窗支持单字郑码提示、页脚提示和模式切换后的即时刷新
 
 ### 词库模式与编码数据
 
 - 默认加载 zhengma-all.dict，兼顾常用郑码输入与较合理的默认词序
-- 支持 zhengma-large-pinyin 模式，用于拼音单字输入并附带郑码提示
+- 支持 zhengma-large-pinyin 模式，可按拼音检索单字并附带郑码提示
 - 支持通过配置工具或运行时热键即时切换词库模式并重载用户学习数据
 - 支持从外部 Fcitx / IBus Table 风格源表导入 .dict 词库
 - 支持 zhengma-single.dict 作为自动造词与郑码提示的单字编码来源
@@ -63,7 +65,7 @@ English README: README.en.md
 
 - 支持 CMake + MSVC 全量构建 yuninput.dll、sort_probe、user_dict_builder 等 C++ 产物
 - 支持单独构建 C# 配置工具 yuninput_config.exe
-- 支持 WiX v4 生成 MSI，产物默认输出到仓库根目录的 Yuninput1.2.msi
+- 支持 WiX v4 生成 MSI，产物默认输出到仓库根目录的 Yuninput1.3.9.msi
 - MSI 已打包主 DLL、配置工具、安装/卸载脚本、默认词库、用户词库模板和规则文件
 
 ## 快速开始
@@ -95,12 +97,12 @@ Set-ExecutionPolicy -Scope Process Bypass
 
 ```powershell
 Set-ExecutionPolicy -Scope Process Bypass
-./scripts/build_msi_wrapper.ps1 -Version 1.3.8 -OutputName Yuninput1.3.8.msi -SkipDictionaryGeneration
+./scripts/build_msi_wrapper.ps1 -Version 1.3.9 -OutputName Yuninput1.3.9.msi -SkipDictionaryGeneration
 ```
 
 默认输出：
 
-- ./Yuninput1.3.8.msi
+- ./Yuninput1.3.9.msi
 
 说明：当前 scripts/generate_user_dict.ps1 在 Extend User Dictionary Variants 阶段仍可能卡住，因此现阶段打包通常使用 -SkipDictionaryGeneration，直接复用仓库内已有词库产物。
 
@@ -121,11 +123,18 @@ Set-ExecutionPolicy -Scope Process Bypass
 
 - Ctrl+F2 可直接打开配置工具；Ctrl+Shift+F2 也会命中同一入口
 - F2 或 APPS 可打开状态菜单
+- 左 Shift 轻触可在中英文模式间切换
+- F10 可切换全角/半角字符模式
 - Ctrl+Shift+F3 切到 zhengma-large-pinyin 模式
 - Ctrl+Shift+F4 切回 zhengma-all 模式
 - Ctrl+Shift+M 可将当前选中候选提升为手工词条
 - Ctrl+1-9 置顶当前候选；Ctrl+Delete 屏蔽当前候选
 - [ ]、, .、PgUp、PgDn 可翻页；Tab/Shift+Tab 可切换高亮候选
+
+通配符规则：
+
+- 0 通配符仅在四码输入时可用。
+- 0 只能出现在第 2 位或第 4 位（可同时出现）。
 
 状态菜单与语言栏按钮当前可直接打开：
 
@@ -161,7 +170,7 @@ Set-ExecutionPolicy -Scope Process Bypass
 - 学习后的候选现在会真实移动到前面，而不是只改变默认选中高亮。
 - 会话中产生的自动造词在首次确认后会进入用户词典，切窗口、重载词库后仍能保留。
 - 会话窗口内的潜在词在重启后再次上屏可稳定晋升，避免被短周期提交计数提前淘汰。
-- 兼容来源的两码简码单字恢复编码调频，避免 1.3.8 早期策略导致的前移不明显。
+- 兼容来源的两码简码单字恢复编码调频，避免早期策略导致的前移不明显。
 
 目标是保持两个约束同时成立：
 

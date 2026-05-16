@@ -4,7 +4,8 @@ param(
     [string]$PhraseSourceRelativePath = 'data/zhengma-all.dict',
     [string]$OutputRelativePath = 'diagnostics/twochar_phrase_regression_latest.tsv',
     [int]$SampleSize = 200,
-    [string[]]$FocusPhrases = @('新泾', '华益')
+    [string[]]$FocusPhrases = @('新泾', '华益'),
+    [switch]$AllowProbeErrors
 )
 
 $ErrorActionPreference = 'Stop'
@@ -158,16 +159,17 @@ function Get-ExpectedTwoCharCodes([string[]]$firstCodes, [string[]]$secondCodes)
 }
 
 function Invoke-PhraseProbe([string]$probePath, [string]$dictPath, [string]$phrase) {
-    $escapedProbe = '"' + $probePath + '"'
-    $escapedDict = '"' + $dictPath + '"'
-    $escapedPhrase = '"' + $phrase + '"'
-    $command = "$escapedProbe $escapedDict --phrase $escapedPhrase 2>nul"
-    $lines = @(cmd.exe /d /c $command)
-    if ($LASTEXITCODE -ne 0) {
-        return @()
-    }
+    $rawOutput = @(& $probePath $dictPath --phrase $phrase 2>&1)
+    $exitCode = $LASTEXITCODE
+    $lines = @($rawOutput | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | ForEach-Object { $_.ToString().Trim() })
+    $codes = @($lines | Where-Object { $_ -cmatch '^[a-z]+$' })
+    $nonCodeLines = @($lines | Where-Object { $_ -cnotmatch '^[a-z]+$' })
 
-    return @($lines | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | ForEach-Object { $_.Trim() })
+    return [PSCustomObject]@{
+        ExitCode = $exitCode
+        Codes = $codes
+        NonCodeLines = $nonCodeLines
+    }
 }
 
 $repo = [System.IO.Path]::GetFullPath($RepoRoot)
@@ -257,7 +259,7 @@ foreach ($line in Get-Content -Path $phraseSourcePath -Encoding UTF8) {
 $rows = New-Object System.Collections.Generic.List[string]
 $rows.Add('phrase`tstatus`tchar1_codes`tchar2_codes`texpected_count`tactual_count`tmissing_codes')
 $failures = New-Object System.Collections.Generic.List[object]
-$skippedNoBuild = New-Object System.Collections.Generic.List[object]
+$probeErrors = New-Object System.Collections.Generic.List[object]
 
 foreach ($phrase in $phrases) {
     $firstChar = $phrase.Substring(0, 1)
@@ -265,21 +267,51 @@ foreach ($phrase in $phrases) {
     $firstCodes = @($compatibleCharCodeMap[$firstChar])
     $secondCodes = @($compatibleCharCodeMap[$secondChar])
     $expectedCodes = @(Get-ExpectedTwoCharCodes $firstCodes $secondCodes)
-    $actualCodes = @(Invoke-PhraseProbe $probePath $singleDictPath $phrase | Sort-Object -Unique)
+    $probeResult = Invoke-PhraseProbe $probePath $singleDictPath $phrase
+    if ($probeResult.ExitCode -ne 0) {
+        $rows.Add(
+            ($phrase + "`t" +
+            ('probe-error' + "`t") +
+            (($firstCodes -join ',') + "`t") +
+            (($secondCodes -join ',') + "`t") +
+            ($expectedCodes.Count.ToString() + "`t") +
+            ('0' + "`t") +
+            ("exit=" + $probeResult.ExitCode.ToString())))
+        $probeErrors.Add([PSCustomObject]@{
+            Phrase = $phrase
+            ExitCode = $probeResult.ExitCode
+            ProbeOutput = (($probeResult.Codes + $probeResult.NonCodeLines) -join ' | ')
+        }) | Out-Null
+        continue
+    }
+
+    if ($probeResult.NonCodeLines.Count -gt 0) {
+        $rows.Add(
+            ($phrase + "`t" +
+            ('probe-error' + "`t") +
+            (($firstCodes -join ',') + "`t") +
+            (($secondCodes -join ',') + "`t") +
+            ($expectedCodes.Count.ToString() + "`t") +
+            ('0' + "`t") +
+            ('unexpected-output')))
+        $probeErrors.Add([PSCustomObject]@{
+            Phrase = $phrase
+            ExitCode = 0
+            ProbeOutput = ($probeResult.NonCodeLines -join ' | ')
+        }) | Out-Null
+        continue
+    }
+
+    $actualCodes = @($probeResult.Codes | Sort-Object -Unique)
 
     if ($actualCodes.Count -eq 0) {
         $rows.Add(
             ($phrase + "`t" +
-            ('no-build' + "`t") +
+            ('no-match' + "`t") +
             (($firstCodes -join ',') + "`t") +
             (($secondCodes -join ',') + "`t") +
             ($expectedCodes.Count.ToString() + "`t") +
             ('0' + "`t")))
-        $skippedNoBuild.Add([PSCustomObject]@{
-            Phrase = $phrase
-            FirstCodes = $firstCodes -join ','
-            SecondCodes = $secondCodes -join ','
-        }) | Out-Null
         continue
     }
 
@@ -317,7 +349,19 @@ foreach ($phrase in $phrases) {
 Set-Content -Path $outputPath -Value $rows -Encoding UTF8
 Write-Host "Two-char regression snapshot written: $outputPath"
 Write-Host ("Phrases checked: {0}" -f $phrases.Count)
-Write-Host ("No-build samples skipped: {0}" -f $skippedNoBuild.Count)
+Write-Host ("Probe errors: {0}" -f $probeErrors.Count)
+
+if ($probeErrors.Count -gt 0 -and -not $AllowProbeErrors) {
+    Write-Host ("Two-char regression aborted: {0} probe execution errors." -f $probeErrors.Count)
+    $previewProbeErrors = $probeErrors | Select-Object -First 20
+    foreach ($probeError in $previewProbeErrors) {
+        Write-Host ("PROBE-ERROR {0} exit={1} output={2}" -f $probeError.Phrase, $probeError.ExitCode, $probeError.ProbeOutput)
+    }
+    if ($probeErrors.Count -gt $previewProbeErrors.Count) {
+        Write-Host ("... truncated, remaining probe errors: {0}" -f ($probeErrors.Count - $previewProbeErrors.Count))
+    }
+    exit 2
+}
 
 if ($failures.Count -eq 0) {
     Write-Host 'Two-char regression check passed.'

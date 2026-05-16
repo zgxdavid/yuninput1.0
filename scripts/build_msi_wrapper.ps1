@@ -1,6 +1,6 @@
 param(
-    [string]$Version = '1.3.8',
-    [string]$OutputName = 'Yuninput1.3.8.msi',
+    [string]$Version = '1.3.9',
+    [string]$OutputName = 'Yuninput1.3.9.msi',
     [switch]$SkipDictionaryGeneration
 )
 
@@ -36,8 +36,11 @@ function Invoke-TimedStep {
 $requiredFiles = @(
     (Join-Path $projectRoot 'build\Release\yuninput.dll'),
     (Join-Path $projectRoot 'build\Release\yuninput_user_dict_builder.exe'),
+    (Join-Path $projectRoot 'tools\yuninput_config.exe'),
     (Join-Path $projectRoot 'assets\icon_yun.ico'),
     (Join-Path $projectRoot 'YuninputManual.zh-CN.md'),
+    (Join-Path $projectRoot 'LICENSE'),
+    (Join-Path $projectRoot 'LICENSE.zh-CN.md'),
     (Join-Path $projectRoot 'scripts\install_enable.ps1'),
     (Join-Path $projectRoot 'scripts\register_ime.ps1'),
     (Join-Path $projectRoot 'scripts\unregister_ime.ps1'),
@@ -61,10 +64,20 @@ if (-not (Test-Path (Join-Path $projectRoot 'build\Release\yuninput.dll'))) {
     }
 }
 
-if (-not (Test-Path (Join-Path $projectRoot 'tools\yuninput_config.exe'))) {
+${configExePath} = Join-Path $projectRoot 'tools\yuninput_config.exe'
+${configSourcePath} = Join-Path $projectRoot 'tools\YuninputConfig.cs'
+$shouldBuildConfigTool = -not (Test-Path $configExePath)
+if (-not $shouldBuildConfigTool -and (Test-Path $configSourcePath)) {
+    $shouldBuildConfigTool = (Get-Item $configSourcePath).LastWriteTimeUtc -gt (Get-Item $configExePath).LastWriteTimeUtc
+}
+
+if ($shouldBuildConfigTool) {
     Invoke-TimedStep -Name 'Build Config Tool' -Action {
         & $configBuildScript
     }
+}
+else {
+    Write-Host 'Config tool is up to date; skip rebuild.'
 }
 
 if ($SkipDictionaryGeneration) {

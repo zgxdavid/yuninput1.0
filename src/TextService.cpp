@@ -1,6 +1,7 @@
 #include "TextService.h"
 
 #include "Globals.h"
+#include "WildcardCode.h"
 
 #include <Windows.h>
 #include <objerror.h>
@@ -19,7 +20,7 @@
 
 namespace {
 
-constexpr const wchar_t* kBuildMarker = L"cw-r7-20260513-compat-shortcode-freq-fix";
+constexpr const wchar_t* kBuildMarker = L"cw-r8-20260514-manual-phrase-ui-and-session-load";
 constexpr ULONGLONG kAnchorReuseWindowMs = 2500ULL;
 constexpr ULONGLONG kAnchorFastReuseWindowMs = 120ULL;
 constexpr ULONGLONG kFocusStartupFastWindowMs = 220ULL;
@@ -34,12 +35,17 @@ constexpr ULONGLONG kAutoPhraseBuilderLaunchMinIntervalMs = 2000ULL;
 constexpr const wchar_t* kAutoPhraseHelperWakeEventName = L"Local\\Yuninput.AutoPhraseHelper.Wake";
 constexpr size_t kSessionAutoPhraseMaxLength = 12;
 constexpr size_t kSessionAutoPhraseHistoryCharLimit = 2000;
-constexpr wchar_t kCodeWildcardChar = L'0';
 constexpr size_t kRoamingAutoPhraseMaxEntries = 4096;
 constexpr size_t kPrimaryCandidateQueryLimit = 96;
 constexpr size_t kPrefixCandidateQueryLimit = 16;
 constexpr size_t kPhraseCandidateQueryLimit = 24;
 constexpr size_t kRefreshTargetCandidateCount = 18;
+constexpr size_t kWildcardFastExpandedCodeLimit = 96;
+constexpr size_t kWildcardFastPerCodeQueryLimit = 4;
+constexpr size_t kWildcardFullPerCodeQueryLimit = 8;
+constexpr size_t kWildcardFastTotalQueryBudget = 160;
+constexpr size_t kWildcardFullTotalQueryBudget = 640;
+constexpr size_t kWildcardExpansionCacheLimit = 48;
 constexpr size_t kFastQueryScanBudgetOneChar = 384;
 constexpr size_t kFastQueryScanBudgetTwoChar = 256;
 constexpr size_t kFastQueryScanBudgetRecentCommitOneChar = 128;
@@ -1020,61 +1026,40 @@ bool TryGetTypedChar(WPARAM wParam, LPARAM lParam, wchar_t& outChar) {
     return false;
 }
 
-bool IsCompositionWildcardInput(WPARAM wParam, LPARAM lParam) {
-    wchar_t input = 0;
-    return TryGetTypedChar(wParam, lParam, input) && input == kCodeWildcardChar;
+bool TryGetTypedCharFromKeyEvent(WPARAM normalizedKey, WPARAM rawKey, LPARAM lParam, wchar_t& outChar) {
+    if (TryGetTypedChar(rawKey, lParam, outChar)) {
+        return true;
+    }
+
+    if (normalizedKey != rawKey && TryGetTypedChar(normalizedKey, lParam, outChar)) {
+        return true;
+    }
+
+    return false;
 }
 
-bool IsSupportedWildcardCodePattern(const std::wstring& code) {
-    if (code.size() != 4) {
+bool IsCompositionWildcardInput(WPARAM normalizedKey, WPARAM rawKey, LPARAM lParam) {
+    wchar_t input = 0;
+    return TryGetTypedCharFromKeyEvent(normalizedKey, rawKey, lParam, input) && input == yuninput::kWildcardCodeChar;
+}
+
+bool IsDigitVirtualKey(WPARAM key) {
+    return (key >= L'0' && key <= L'9') || (key >= VK_NUMPAD0 && key <= VK_NUMPAD9);
+}
+
+bool IsDigitSymbolInput(WPARAM normalizedKey, WPARAM rawKey, LPARAM lParam) {
+    if (!IsDigitVirtualKey(normalizedKey)) {
         return false;
     }
 
-    bool hasWildcard = false;
-    for (size_t index = 0; index < code.size(); ++index) {
-        const wchar_t ch = code[index];
-        if (ch == kCodeWildcardChar) {
-            if (index != 1 && index != 3) {
-                return false;
-            }
-            hasWildcard = true;
-            continue;
-        }
-
-        if (ch < L'a' || ch > L'z') {
-            return false;
-        }
+    wchar_t input = 0;
+    if (!TryGetTypedCharFromKeyEvent(normalizedKey, rawKey, lParam, input)) {
+        return false;
     }
 
-    return hasWildcard;
-}
-
-void ExpandWildcardCodePattern(const std::wstring& pattern, std::vector<std::wstring>& outCodes) {
-    outCodes.clear();
-    if (!IsSupportedWildcardCodePattern(pattern)) {
-        return;
-    }
-
-    std::wstring building = pattern;
-    std::function<void(size_t)> dfs = [&](size_t index) {
-        if (index >= building.size()) {
-            outCodes.push_back(building);
-            return;
-        }
-
-        if (building[index] != kCodeWildcardChar) {
-            dfs(index + 1);
-            return;
-        }
-
-        for (wchar_t ch = L'a'; ch <= L'z'; ++ch) {
-            building[index] = ch;
-            dfs(index + 1);
-        }
-        building[index] = kCodeWildcardChar;
-    };
-
-    dfs(0);
+    return std::iswalpha(static_cast<wint_t>(input)) == 0 &&
+           std::iswdigit(static_cast<wint_t>(input)) == 0 &&
+           std::iswspace(static_cast<wint_t>(input)) == 0;
 }
 
 bool IsAsciiAlphaVirtualKey(WPARAM wParam) {
@@ -1310,6 +1295,8 @@ constexpr UINT kMenuHelp = 1003;
 constexpr UINT kMenuOpenConfig = 1004;
 constexpr UINT kMenuOpenSystemSettings = 1005;
 constexpr UINT kMenuOpenRuntimeLog = 1006;
+constexpr UINT kMenuProfileZhengma = 1007;
+constexpr UINT kMenuProfilePinyinQuery = 1008;
 
 std::filesystem::path ResolveDataRootFromModule(const std::wstring& modulePath);
 
@@ -2625,6 +2612,8 @@ bool TextService::EnsureRuntimeReady() {
         LoadContextAssociationBlacklistFromFile(contextAssocBlacklistPath_);
         SyncUserDataFilesStamp();
         helperAutoPhraseStamp_ = QueryFileStampToken(autoPhraseHelperPath_);
+        const bool loadedSessionAutoPhrase = LoadAutoPhraseSessionState();
+        Trace(L"runtime eager session auto phrase load=" + std::to_wstring(loadedSessionAutoPhrase ? 1 : 0));
         deferredRuntimeWarmupPending_ = true;
         ScheduleDeferredMaintenance();
     }
@@ -3829,6 +3818,9 @@ void TextService::ShowModeSwitchHint() {
     candidateWindow_.Update(
         L"Mode switched",
         L"",
+        L"",
+        L"",
+        L"",
         hintCandidates,
         0,
         1,
@@ -3902,11 +3894,38 @@ void TextService::RefreshCandidates(bool expandAll, bool prioritizeInput, bool u
     }
 
     const bool pinyinFallbackMode = dictionaryProfile_ == DictionaryProfile::ZhengmaLargePinyin;
-    const bool wildcardCodeQuery = IsSupportedWildcardCodePattern(compositionCode_);
-    std::vector<std::wstring> wildcardExpandedCodes;
+    const bool wildcardCodeQuery = yuninput::IsSupportedWildcardCodePattern(compositionCode_);
+    const std::vector<std::wstring>* wildcardExpandedCodes = nullptr;
     if (wildcardCodeQuery) {
-        ExpandWildcardCodePattern(compositionCode_, wildcardExpandedCodes);
+        auto cacheIt = wildcardExpansionCache_.find(compositionCode_);
+        if (cacheIt == wildcardExpansionCache_.end()) {
+            std::vector<std::wstring> expandedCodes;
+            yuninput::ExpandWildcardCodePattern(compositionCode_, expandedCodes);
+            cacheIt = wildcardExpansionCache_.emplace(compositionCode_, std::move(expandedCodes)).first;
+            wildcardExpansionCacheOrder_.push_back(compositionCode_);
+            while (wildcardExpansionCacheOrder_.size() > kWildcardExpansionCacheLimit) {
+                const std::wstring oldestCode = wildcardExpansionCacheOrder_.front();
+                wildcardExpansionCacheOrder_.pop_front();
+                wildcardExpansionCache_.erase(oldestCode);
+            }
+        }
+        wildcardExpandedCodes = &cacheIt->second;
     }
+
+    const size_t wildcardCodeLimit = wildcardCodeQuery
+        ? (expandAll
+               ? wildcardExpandedCodes->size()
+               : std::min(wildcardExpandedCodes->size(), kWildcardFastExpandedCodeLimit))
+        : 0;
+    const size_t wildcardPerCodeLimit = wildcardCodeQuery
+        ? std::min(
+              primaryQueryLimit,
+              expandAll ? kWildcardFullPerCodeQueryLimit : kWildcardFastPerCodeQueryLimit)
+        : 0;
+    size_t wildcardTotalBudget = wildcardCodeQuery
+        ? (expandAll ? kWildcardFullTotalQueryBudget : kWildcardFastTotalQueryBudget)
+        : 0;
+
     const bool allowIncrementalPrefixCache = !expandAll && !pinyinFallbackMode && !wildcardCodeQuery && compositionCode_.size() > 1;
 
     auto buildDisplayCode = [this, pinyinFallbackMode](const std::wstring& text, const std::wstring& rawCode) {
@@ -4117,9 +4136,15 @@ void TextService::RefreshCandidates(bool expandAll, bool prioritizeInput, bool u
     }
 
     if (wildcardCodeQuery) {
-        const size_t wildcardPerCodeLimit = std::min(primaryQueryLimit, static_cast<size_t>(8));
-        for (const std::wstring& expandedCode : wildcardExpandedCodes) {
-            const std::vector<CompositionEngine::Entry> exactMatches = engine_.QueryExactCandidateEntries(expandedCode, wildcardPerCodeLimit);
+        for (size_t wildcardIndex = 0; wildcardIndex < wildcardCodeLimit; ++wildcardIndex) {
+            if (wildcardTotalBudget == 0) {
+                break;
+            }
+
+            const std::wstring& expandedCode = (*wildcardExpandedCodes)[wildcardIndex];
+            const size_t perCodeBudget = std::min(wildcardPerCodeLimit, wildcardTotalBudget);
+            const std::vector<CompositionEngine::Entry> exactMatches = engine_.QueryExactCandidateEntries(expandedCode, perCodeBudget);
+            wildcardTotalBudget -= std::min(wildcardTotalBudget, exactMatches.size());
             for (const auto& item : exactMatches) {
                 if (pinyinFallbackMode && item.text.size() != 1) {
                     continue;
@@ -4141,6 +4166,10 @@ void TextService::RefreshCandidates(bool expandAll, bool prioritizeInput, bool u
                     !item.isUser,
                     item.isCompatibilitySource,
                     compositionCode_.size());
+            }
+
+            if (!expandAll && allCandidates_.size() >= targetCandidateCount) {
+                break;
             }
         }
         hasExactCurrentCode = !allCandidates_.empty();
@@ -4322,7 +4351,10 @@ void TextService::RefreshCandidates(bool expandAll, bool prioritizeInput, bool u
         }
     }
 
-    if (!fastPathSatisfied && !pinyinFallbackMode && compositionCode_.size() >= 4) {
+    // Session/helper auto phrases must still be merged on fast-path refreshes.
+    // Otherwise, valid history-window phrases can disappear whenever exact-code
+    // system candidates are already enough to satisfy page-size heuristics.
+    if (!pinyinFallbackMode && compositionCode_.size() >= 4) {
         auto mergeSessionAutoPhraseByCode = [&](const std::wstring& matchCode) {
             const auto sessionCodeIt = sessionAutoPhraseTextsByCode_.find(matchCode);
             if (sessionCodeIt != sessionAutoPhraseTextsByCode_.end()) {
@@ -4379,7 +4411,8 @@ void TextService::RefreshCandidates(bool expandAll, bool prioritizeInput, bool u
         };
 
         if (wildcardCodeQuery) {
-            for (const std::wstring& expandedCode : wildcardExpandedCodes) {
+            for (size_t wildcardIndex = 0; wildcardIndex < wildcardCodeLimit; ++wildcardIndex) {
+                const std::wstring& expandedCode = (*wildcardExpandedCodes)[wildcardIndex];
                 mergeSessionAutoPhraseByCode(expandedCode);
             }
         } else {
@@ -4395,8 +4428,9 @@ void TextService::RefreshCandidates(bool expandAll, bool prioritizeInput, bool u
     const size_t repeatKeyDelimiterPos = repeatBoostActive
         ? lastAutoPhraseSelectedKey_.find(L'\t')
         : std::wstring::npos;
+    const size_t queryCodeLength = compositionCode_.size();
 
-    auto fillSortHints = [this](CandidateItem& candidate) {
+    auto fillSortHints = [this, pinyinFallbackMode, queryCodeLength](CandidateItem& candidate) {
         candidate.sortTemporaryAutoPhrase = candidate.fromSessionAutoPhrase || candidate.fromAutoPhrase;
         candidate.sortAutoOnly = candidate.sortTemporaryAutoPhrase;
         candidate.sortSingleChar = candidate.text.size() == 1;
@@ -4471,6 +4505,29 @@ void TextService::RefreshCandidates(bool expandAll, bool prioritizeInput, bool u
             tier = 8;
         }
         candidate.sortPrimaryTier = tier;
+
+        const std::uint64_t tempGroup = candidate.sortTemporaryAutoPhrase
+            ? 1ULL
+            : (candidate.sortNonGB2312Single ? 2ULL : 0ULL);
+        candidate.sortKey = {
+            pinyinFallbackMode ? (candidate.sortSingleChar ? 0ULL : 1ULL) : 0ULL,
+            tempGroup,
+            candidate.exactMatch ? 0ULL : 1ULL,
+            candidate.boostedUser ? 0ULL : 1ULL,
+            candidate.boostedLearned ? 0ULL : 1ULL,
+            UINT64_MAX - candidate.learnedScore,
+            candidate.fromSessionAutoPhrase ? 0ULL : 1ULL,
+            candidate.sortPreferredPhrase ? 0ULL : 1ULL,
+            static_cast<std::uint64_t>(candidate.sortPrimaryTier),
+            queryCodeLength <= 2 ? static_cast<std::uint64_t>(candidate.sortShortCodeTier) : 0ULL,
+            candidate.sortGB2312Text ? 0ULL : 1ULL,
+            UINT64_MAX - candidate.contextScore,
+            candidate.boostedContext ? 0ULL : 1ULL,
+            candidate.boostedAutoRepeat ? 0ULL : 1ULL,
+            candidate.sortSystemFiveCodePhrase ? 1ULL : 0ULL,
+            candidate.sortNonGB2312Single ? 1ULL : 0ULL,
+            candidate.sortAutoOnly ? 1ULL : 0ULL,
+            UINT64_MAX - static_cast<std::uint64_t>(candidate.consumedLength)};
     };
 
     for (CandidateItem& candidate : allCandidates_) {
@@ -4485,76 +4542,14 @@ void TextService::RefreshCandidates(bool expandAll, bool prioritizeInput, bool u
         fillSortHints(candidate);
     }
 
-    const size_t queryCodeLength = compositionCode_.size();
     std::stable_sort(
         allCandidates_.begin(),
         allCandidates_.end(),
-        [pinyinFallbackMode, queryCodeLength](const CandidateItem& left, const CandidateItem& right) {
-            if (pinyinFallbackMode) {
-                if (left.sortSingleChar != right.sortSingleChar) {
-                    return left.sortSingleChar > right.sortSingleChar;
+        [](const CandidateItem& left, const CandidateItem& right) {
+            for (size_t keyIndex = 0; keyIndex < left.sortKey.size(); ++keyIndex) {
+                if (left.sortKey[keyIndex] != right.sortKey[keyIndex]) {
+                    return left.sortKey[keyIndex] < right.sortKey[keyIndex];
                 }
-            }
-            if (left.sortTemporaryAutoPhrase != right.sortTemporaryAutoPhrase) {
-                const bool leftIsNonGbSingle = !left.sortTemporaryAutoPhrase && left.sortNonGB2312Single;
-                const bool rightIsNonGbSingle = !right.sortTemporaryAutoPhrase && right.sortNonGB2312Single;
-                if (left.sortTemporaryAutoPhrase && rightIsNonGbSingle) {
-                    return true;
-                }
-                if (right.sortTemporaryAutoPhrase && leftIsNonGbSingle) {
-                    return false;
-                }
-                return right.sortTemporaryAutoPhrase;
-            }
-            if (left.exactMatch != right.exactMatch) {
-                return left.exactMatch > right.exactMatch;
-            }
-            if (left.boostedUser != right.boostedUser) {
-                return left.boostedUser > right.boostedUser;
-            }
-            if (left.boostedLearned != right.boostedLearned) {
-                return left.boostedLearned > right.boostedLearned;
-            }
-            if (left.learnedScore != right.learnedScore) {
-                return left.learnedScore > right.learnedScore;
-            }
-            if (left.fromSessionAutoPhrase != right.fromSessionAutoPhrase) {
-                return left.fromSessionAutoPhrase > right.fromSessionAutoPhrase;
-            }
-            if (left.sortPreferredPhrase != right.sortPreferredPhrase) {
-                return left.sortPreferredPhrase > right.sortPreferredPhrase;
-            }
-            if (left.sortPrimaryTier != right.sortPrimaryTier) {
-                return left.sortPrimaryTier < right.sortPrimaryTier;
-            }
-            if (queryCodeLength <= 2) {
-                if (left.sortShortCodeTier != right.sortShortCodeTier) {
-                    return left.sortShortCodeTier < right.sortShortCodeTier;
-                }
-            }
-            if (left.sortGB2312Text != right.sortGB2312Text) {
-                return left.sortGB2312Text > right.sortGB2312Text;
-            }
-            if (left.contextScore != right.contextScore) {
-                return left.contextScore > right.contextScore;
-            }
-            if (left.boostedContext != right.boostedContext) {
-                return left.boostedContext > right.boostedContext;
-            }
-            if (left.boostedAutoRepeat != right.boostedAutoRepeat) {
-                return left.boostedAutoRepeat > right.boostedAutoRepeat;
-            }
-            if (left.sortSystemFiveCodePhrase != right.sortSystemFiveCodePhrase) {
-                return left.sortSystemFiveCodePhrase < right.sortSystemFiveCodePhrase;
-            }
-            if (left.sortNonGB2312Single != right.sortNonGB2312Single) {
-                return left.sortNonGB2312Single < right.sortNonGB2312Single;
-            }
-            if (left.sortAutoOnly != right.sortAutoOnly) {
-                return left.sortAutoOnly < right.sortAutoOnly;
-            }
-            if (left.consumedLength != right.consumedLength) {
-                return left.consumedLength > right.consumedLength;
             }
             return false;
         });
@@ -4592,6 +4587,16 @@ const wchar_t* TextService::GetDictionaryProfileName(DictionaryProfile profile) 
     case DictionaryProfile::ZhengmaLarge:
     default:
         return L"zhengma-all";
+    }
+}
+
+const wchar_t* TextService::GetDictionaryProfileDisplayLabel(DictionaryProfile profile) {
+    switch (profile) {
+    case DictionaryProfile::ZhengmaLargePinyin:
+        return L"拼音查郑码模式";
+    case DictionaryProfile::ZhengmaLarge:
+    default:
+        return L"郑码输入模式";
     }
 }
 
@@ -5158,8 +5163,22 @@ void TextService::UpdateCandidateWindow() {
 
     const auto& pageCandidates = GetCurrentPageCandidates();
     const std::wstring headerText = compositionCode_;
+    const bool wildcardPatternValid = yuninput::IsSupportedWildcardCodePattern(compositionCode_);
+    const bool hasWildcardChar = compositionCode_.find(yuninput::kWildcardCodeChar) != std::wstring::npos;
+    std::wstring footerText = std::wstring(L"当前模式：") + GetDictionaryProfileDisplayLabel(dictionaryProfile_);
+    if (wildcardPatternValid) {
+        footerText += L" | 0 = 忘码位";
+    }
+    const std::wstring codeColumnHeader = dictionaryProfile_ == DictionaryProfile::ZhengmaLargePinyin ? L"郑码" : L"";
+    const std::wstring emptyHintText =
+        pageCandidates.empty() && hasWildcardChar
+            ? L"通配符合法格式：a0cd / abc0 / a0c0"
+            : L"";
     candidateWindow_.Update(
         headerText,
+        footerText,
+        codeColumnHeader,
+        emptyHintText,
         compositionCode_,
         pageCandidates,
         pageIndex_,
@@ -5398,7 +5417,7 @@ void TextService::RunDeferredRuntimeWarmup() {
     }
 
     deferredRuntimeWarmupPending_ = false;
-    LoadAutoPhraseSessionState();
+    ReloadAutoPhraseSessionStateIfChanged(false);
     autoPhraseBuilderPending_ = true;
     LaunchAutoPhraseBuilderProcess();
     if (FileContainsLegacyFrequencyNoise(userFreqPath_)) {
@@ -5698,6 +5717,17 @@ bool TextService::ShowStatusMenu() {
 
     AppendMenuW(menu, MF_STRING | (chineseMode_ ? MF_CHECKED : 0), kMenuToggleChinese, L"Chinese Mode (Ctrl+Space)");
     AppendMenuW(menu, MF_STRING | (fullShapeMode_ ? MF_CHECKED : 0), kMenuToggleShape, L"Full Shape (F10)");
+    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(
+        menu,
+        MF_STRING | (dictionaryProfile_ == DictionaryProfile::ZhengmaLarge ? MF_CHECKED : 0),
+        kMenuProfileZhengma,
+        L"郑码输入模式");
+    AppendMenuW(
+        menu,
+        MF_STRING | (dictionaryProfile_ == DictionaryProfile::ZhengmaLargePinyin ? MF_CHECKED : 0),
+        kMenuProfilePinyinQuery,
+        L"拼音查郑码模式");
     AppendMenuW(menu, MF_STRING, kMenuOpenConfig, L"Open Config...");
     AppendMenuW(menu, MF_STRING, kMenuOpenSystemSettings, L"Open System Input Settings...");
     AppendMenuW(menu, MF_STRING, kMenuOpenRuntimeLog, L"Open Runtime Log...");
@@ -5747,6 +5777,18 @@ bool TextService::ShowStatusMenu() {
     if (cmd == kMenuOpenConfig) {
         const bool launched = LaunchConfigExecutable();
         Trace(std::wstring(L"menu open config=") + (launched ? L"1" : L"0"));
+        return true;
+    }
+
+    if (cmd == kMenuProfileZhengma) {
+        SwitchDictionaryProfile(DictionaryProfile::ZhengmaLarge);
+        UpdateCandidateWindow();
+        return true;
+    }
+
+    if (cmd == kMenuProfilePinyinQuery) {
+        SwitchDictionaryProfile(DictionaryProfile::ZhengmaLargePinyin);
+        UpdateCandidateWindow();
         return true;
     }
 
@@ -6313,19 +6355,21 @@ STDMETHODIMP TextService::OnTestKeyDown(ITfContext*, WPARAM wParam, LPARAM lPara
     }
 
     const bool hasComposition = !compositionCode_.empty();
+    size_t plainSelectionOffset = 0;
+    const bool plainDigitSelectionKey = hasComposition && TryMapSelectionInputToIndex(key, lParam, plainSelectionOffset);
+    const bool digitProducesSymbol = IsDigitSymbolInput(key, wParam, lParam);
 
     const bool minusPageUpKey = IsMinusPageUpKey(key, wParam, lParam);
     const bool plusPageDownKey = IsPlusPageDownKey(key, wParam, lParam);
     const bool acceptsWildcardAtCurrentPosition =
-        IsCompositionWildcardInput(wParam, lParam) &&
+        IsCompositionWildcardInput(key, wParam, lParam) &&
         compositionCode_.size() < 4 &&
         (compositionCode_.size() == 1 || compositionCode_.size() == 3);
 
     *eaten = (IsAlphaKey(key) ||
               acceptsWildcardAtCurrentPosition ||
-              (key >= L'0' && key <= L'9') ||
-              (key >= L'1' && key <= L'9') ||
-              (key >= VK_NUMPAD0 && key <= VK_NUMPAD9) ||
+              plainDigitSelectionKey ||
+              digitProducesSymbol ||
               (tabNavigation_ && key == VK_TAB) ||
               (key == VK_BACK && hasComposition) ||
               (key == VK_DELETE && hasComposition) ||
@@ -6428,7 +6472,7 @@ STDMETHODIMP TextService::OnKeyDown(ITfContext* context, WPARAM wParam, LPARAM l
     }
 
     const bool acceptsWildcardAtCurrentPosition =
-        IsCompositionWildcardInput(wParam, lParam) &&
+        IsCompositionWildcardInput(key, wParam, lParam) &&
         compositionCode_.size() < 4 &&
         (compositionCode_.size() == 1 || compositionCode_.size() == 3);
 
@@ -6729,17 +6773,7 @@ STDMETHODIMP TextService::OnKeyDown(ITfContext* context, WPARAM wParam, LPARAM l
         return S_OK;
     }
 
-    const bool digitProducesSymbol =
-        (key >= L'0' && key <= L'9') &&
-        [&]() {
-            wchar_t input = 0;
-            if (!TryGetTypedChar(wParam, lParam, input)) {
-                return false;
-            }
-            return std::iswalpha(static_cast<wint_t>(input)) == 0 &&
-                   std::iswdigit(static_cast<wint_t>(input)) == 0 &&
-                   std::iswspace(static_cast<wint_t>(input)) == 0;
-        }();
+    const bool digitProducesSymbol = IsDigitSymbolInput(key, wParam, lParam);
 
     if (IsPunctuationVirtualKey(key) || digitProducesSymbol) {
         const bool hasPunctuation = TryBuildPunctuationCommitText(
@@ -6757,7 +6791,7 @@ STDMETHODIMP TextService::OnKeyDown(ITfContext* context, WPARAM wParam, LPARAM l
                 committed = tryCommitFirstCandidateInCurrentWindow();
             } else {
                 const std::wstring rawCode = compositionCode_;
-                if (!IsSupportedWildcardCodePattern(rawCode)) {
+                if (!yuninput::IsSupportedWildcardCodePattern(rawCode)) {
                     CancelDeferredCandidateExpansion();
                     if (CommitText(context, rawCode)) {
                         ClearComposition();
@@ -6793,7 +6827,7 @@ STDMETHODIMP TextService::OnKeyDown(ITfContext* context, WPARAM wParam, LPARAM l
     }
 
     if (acceptsWildcardAtCurrentPosition) {
-        compositionCode_.push_back(kCodeWildcardChar);
+        compositionCode_.push_back(yuninput::kWildcardCodeChar);
         RefreshCandidates();
         *eaten = TRUE;
         TraceLatencySample(L"keydown-wildcard code=" + compositionCode_, keyDownStartCounter, QueryPerfCounterValue());
@@ -6833,7 +6867,7 @@ STDMETHODIMP TextService::OnKeyDown(ITfContext* context, WPARAM wParam, LPARAM l
 
             if (!autoCommitted) {
                 const std::wstring rawCode = compositionCode_;
-                if (!IsSupportedWildcardCodePattern(rawCode)) {
+                if (!yuninput::IsSupportedWildcardCodePattern(rawCode)) {
                     CancelDeferredCandidateExpansion();
                     if (CommitText(context, rawCode)) {
                         ClearComposition();
@@ -7001,7 +7035,7 @@ STDMETHODIMP TextService::OnKeyDown(ITfContext* context, WPARAM wParam, LPARAM l
         const size_t pageCandidateCount = GetCurrentPageCandidateCount();
         if (pageCandidateCount == 0) {
             const std::wstring rawCode = compositionCode_;
-            if (!IsSupportedWildcardCodePattern(rawCode)) {
+            if (!yuninput::IsSupportedWildcardCodePattern(rawCode)) {
                 CancelDeferredCandidateExpansion();
                 if (CommitText(context, rawCode)) {
                     ClearComposition();

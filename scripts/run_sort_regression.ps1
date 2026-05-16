@@ -10,7 +10,8 @@ param(
         'j','jj','jjj','jjjd','jm',
         'ni','nih','nihk',
         'z','zh','zhi'
-    )
+    ),
+    [switch]$AllowProbeErrors
 )
 
 $ErrorActionPreference = 'Stop'
@@ -69,6 +70,17 @@ function Copy-ToLocalStage([string]$sourcePath, [string]$stageRoot) {
     return $targetPath
 }
 
+function Invoke-SortProbe([string]$probePath, [string]$dictPath, [string]$code, [int]$topN) {
+    $rawOutput = @(& $probePath $dictPath $code $topN 2>&1)
+    $exitCode = $LASTEXITCODE
+    $lines = @($rawOutput | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | ForEach-Object { $_.ToString().Trim() })
+
+    return [PSCustomObject]@{
+        ExitCode = $exitCode
+        Lines = $lines
+    }
+}
+
 $repo = [System.IO.Path]::GetFullPath($RepoRoot)
 $probePath = Resolve-RepoPath $repo 'build/Release/yuninput_sort_probe.exe'
 $dictPath = Resolve-RepoPath $repo $DictRelativePath
@@ -93,9 +105,20 @@ if (-not (Test-Path $latestDir)) { New-Item -ItemType Directory -Path $latestDir
 
 $rows = New-Object System.Collections.Generic.List[string]
 $rows.Add('input_code`trank`tentry_code`ttext')
+$probeErrors = New-Object System.Collections.Generic.List[object]
 
 foreach ($code in $Codes) {
-    $probeLines = & $probePath $dictPath $code $TopN 2>$null
+    $probeResult = Invoke-SortProbe $probePath $dictPath $code $TopN
+    if ($probeResult.ExitCode -ne 0) {
+        $probeErrors.Add([PSCustomObject]@{
+            Code = $code
+            ExitCode = $probeResult.ExitCode
+            Output = ($probeResult.Lines -join ' | ')
+        }) | Out-Null
+        continue
+    }
+
+    $probeLines = $probeResult.Lines
     if ($null -eq $probeLines -or $probeLines.Count -eq 0) {
         $rows.Add("$code`t0`t<none>`t<none>")
         continue
@@ -118,6 +141,19 @@ foreach ($code in $Codes) {
 
 Set-Content -Path $latestPath -Value $rows -Encoding UTF8
 Write-Host "Latest snapshot written: $latestPath"
+Write-Host ("Probe errors: {0}" -f $probeErrors.Count)
+
+if ($probeErrors.Count -gt 0 -and -not $AllowProbeErrors) {
+    Write-Host ("Sort regression aborted: {0} probe execution errors." -f $probeErrors.Count)
+    $previewProbeErrors = $probeErrors | Select-Object -First 30
+    foreach ($probeError in $previewProbeErrors) {
+        Write-Host ("PROBE-ERROR code={0} exit={1} output={2}" -f $probeError.Code, $probeError.ExitCode, $probeError.Output)
+    }
+    if ($probeErrors.Count -gt $previewProbeErrors.Count) {
+        Write-Host ("... truncated, remaining probe errors: {0}" -f ($probeErrors.Count - $previewProbeErrors.Count))
+    }
+    exit 3
+}
 
 if ($UpdateBaseline) {
     Set-Content -Path $baselinePath -Value $rows -Encoding UTF8

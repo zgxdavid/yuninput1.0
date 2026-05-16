@@ -47,6 +47,7 @@ This checklist is intended for the final review before publishing yuninput to Gi
 1. Confirm that the source release, EXE, and MSI match the repository notices.
 2. Confirm that installer packages include the required license and notice files.
 3. Confirm that no installer package contains dictionaries, assets, or resources with unclear redistribution rights.
+4. Confirm that the version text in `tools/msi/license.rtf` matches the MSI version of this release.
 
 ## 8. GitHub Release Page
 

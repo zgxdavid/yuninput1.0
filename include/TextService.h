@@ -6,6 +6,7 @@
 #include "CandidateWindow.h"
 #include "CompositionEngine.h"
 
+#include <array>
 #include <condition_variable>
 #include <deque>
 #include <filesystem>
@@ -74,6 +75,7 @@ private:
         bool sortPreferredPhrase = false;
         std::uint8_t sortPrimaryTier = 7;
         std::uint8_t sortShortCodeTier = 3;
+        std::array<std::uint64_t, 18> sortKey = {};
         size_t consumedLength = 0;
     };
 
@@ -137,6 +139,7 @@ private:
     bool LoadConfiguredDictionaries();
     bool SwitchDictionaryProfile(DictionaryProfile profile);
     static const wchar_t* GetDictionaryProfileName(DictionaryProfile profile);
+    static const wchar_t* GetDictionaryProfileDisplayLabel(DictionaryProfile profile);
     void UpdateCandidateWindow();
     const std::vector<CandidateWindow::DisplayCandidate>& GetCurrentPageCandidates() const;
     size_t GetCurrentPageCandidateCount() const;
@@ -332,6 +335,8 @@ private:
     bool candidatesFullyExpanded_;
     std::unordered_map<std::wstring, CachedCandidateState> compositionCandidateCache_;
     std::deque<std::wstring> compositionCandidateCacheOrder_;
+    std::unordered_map<std::wstring, std::vector<std::wstring>> wildcardExpansionCache_;
+    std::deque<std::wstring> wildcardExpansionCacheOrder_;
     std::wstring deferredExpansionCode_;
     ULONGLONG deferredExpansionDueTick_;
     ULONGLONG deferredAnchorRefreshDueTick_;

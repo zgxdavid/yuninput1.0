@@ -136,6 +136,7 @@ private:
     void InvalidateQueryCache() const;
     bool EntryIndexLess(size_t left, size_t right) const;
     void RebuildPrefixRanges();
+    void UpdatePrefixRangesForInsertedEntry(size_t sortedPosition, const std::wstring& insertedCode);
     void RebuildSingleCharEntryIndices();
     void InsertEntryIntoIndices(size_t index);
 
